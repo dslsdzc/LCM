@@ -318,7 +318,7 @@ def train(args):
             qp = "checkpoints/qwen_model/qwen_params.npz"
             shp = args.shape or (args.data.replace('.dat', '_shape.json') if args.data else None)
             train_cog(cfg=LCMConfig(), output_dir=args.save_dir or "checkpoints/cog_qwen",
-                       steps=args.steps or args.memory_steps or 50000, lr=args.lr_stage2 or 3e-4,
+                       steps=args.steps or args.memory_steps or 50000, lr=args.lr or args.lr_stage2 or 3e-4,
                        batch_size=args.batch_size or 12, seq_len=args.seq_len or 256,
                        log_every=100, save_every=args.save or 1000,
                        data_path=args.data, shape_path=shp, lang_ckpt=qp)
