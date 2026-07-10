@@ -2329,18 +2329,21 @@ def main():
             try:
                 gpu = jax.devices()[0]
                 free_mb = gpu.memory_stats()["bytes_limit"] // (1024*1024)
-                # Qwen2.5-0.5B BF16: ~1GB, FP32: ~2GB
-                qwen_mb = 2000 if args.use_qwen else 0
-                # Per sample: d_model * seq_len * 8layers * 2bytes * overhead ≈ 8MB for d=256,N=512
-                overhead = 1500  # codebooks + encoder + misc
-                per_sample = cfg.d_model * 512 * 8 * 2 * 5 // (1024*1024)  # ~10MB
-                avail = free_mb - qwen_mb - overhead
-                max_batch = max(1, min(128, avail // per_sample))
-                max_seq = min(1024, 256 * max(1, avail // (per_sample * 4)))
-                if args.cog_batch == 4 and max_batch != 4:
-                    args.cog_batch = max_batch
-                if args.cog_seq == 256 and max_seq != 256:
-                    args.cog_seq = max_seq
+                if args.use_qwen:
+                    # Qwen2.5-0.5B FP32: ~80MB/layer * 24 + embed = ~3GB
+                    # Activations per sample (B*N): hidden + attn + intermediates
+                    # For d=896, 24 layers: ~10GB base + B*N*0.5MB
+                    # Conservative: B=4,N=512 is safe, scale from there
+                    factor = max(1, (free_mb - 6000) // 6000)  # per 6GB over base
+                    args.cog_batch = min(16, 4 * factor)
+                    args.cog_seq = min(512, 256 * factor)
+                else:
+                    # No Qwen: encoder + codebooks + 8L decoder
+                    overhead = 1500
+                    per = cfg.d_model * 512 * 8 * 4 // (1024*1024)
+                    max_b = max(1, min(128, (free_mb - overhead) // per))
+                    args.cog_batch = max_b
+                    args.cog_seq = min(1024, 256 * max(1, (free_mb - overhead) // (per * 4)))
                 print(f"[AUTO] GPU: {free_mb}MB free → B={args.cog_batch}, N={args.cog_seq}")
             except Exception as e:
                 print(f"[AUTO] Probe failed ({e}), using defaults B={args.cog_batch}, N={args.cog_seq}")
