@@ -2316,67 +2316,39 @@ def main():
         return
     elif args.show_arch:
         LCMInferEngine.print_architecture()
+
         return
     elif args.compile:
         _require_jax()
         os.environ.setdefault("JAX_PERSISTENT_CACHE_DIR", args.cache_dir)
         os.makedirs(args.cache_dir, exist_ok=True)
-
         from train.config import LCMConfig
         from train.cog_train import make_train_step, init_cog_params
         import optax
-
-        # ── Auto-batch ────────────────────────────────────────────────
-        if args.auto_batch or args.use_qwen:
+        if (args.auto_batch or args.use_qwen) and args.cog_batch == 4:
             try:
                 gpu = jax.devices()[0]
                 free_mb = gpu.memory_stats()["bytes_limit"] // (1024*1024)
                 print(f"[AUTO] GPU: {free_mb}MB free")
                 if args.use_qwen:
-                    args.cog_batch = max(4, min(16, (free_mb - 6000) // 1500))
-                    args.cog_seq = 256
-                else:
-                    c = max(1, (free_mb - 1500) // 2000)
-                    args.cog_batch = max(4, min(128, 16 * c))
-                    args.cog_seq = min(1024, 256 * c)
-                print(f"[AUTO] → B={args.cog_batch}, N={args.cog_seq}")
-            except Exception as e:
-                print(f"[AUTO] Probe failed ({e}), defaults B=4,N=128")
-
-        B, N = args.cog_batch or 4, args.cog_seq or 128
-        print(f"[COMPILE] Cache: {args.cache_dir}, B={B}, N={N}")
-
+                    args.cog_batch = max(2, min(8, (free_mb - 8000) // 2000))
+                    args.cog_seq = 128
+                print(f"[AUTO] -> B={args.cog_batch}, N={args.cog_seq}")
+            except: pass
+        B, N = args.cog_batch or 2, args.cog_seq or 128
+        print(f"[COMPILE] B={B}, N={N}, cache={args.cache_dir}")
         cfg = LCMConfig()
         rng = jax.random.PRNGKey(42)
-        lang_ckpt = "checkpoints/qwen_model/qwen_params.npz" if args.use_qwen else None
-        params, self_state = init_cog_params(cfg, jax.random.split(rng)[1], lang_ckpt=lang_ckpt)
+        lck = "checkpoints/qwen_model/qwen_params.npz" if args.use_qwen else None
+        p, ss = init_cog_params(cfg, jax.random.split(rng)[1], lang_ckpt=lck)
         opt = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(3e-4, weight_decay=0.01))
-        train_step = make_train_step(cfg, opt)
-        dummy = (jnp.zeros((B, N), dtype=jnp.int32),
-                 jnp.ones((B, N), dtype=jnp.int32))
-
-        print(f"[COMPILE] JIT compiling training graph (B={B}, N={N})...")
-        print(f"[COMPILE] This may take 5-10 minutes, cache saved to {args.cache_dir}")
-        import time as _time, threading, itertools, sys as _sys
-        _stop_spinner = threading.Event()
-        def _spinner():
-            for c in itertools.cycle(['⡿','⢿','⣻','⣽','⣾','⣷','⣯','⣟']):
-                if _stop_spinner.is_set(): break
-                elapsed = int(_time.time() - t0)
-                _sys.stdout.write(f'\r[COMPILE] {c} Compiling... {elapsed}s')
-                _sys.stdout.flush()
-                _stop_spinner.wait(0.1)
-        t0 = _time.time()
-        s = threading.Thread(target=_spinner, daemon=True)
-        s.start()
-        opt_state = opt.init(params)
-        result = train_step(params, opt_state, dummy, 3e-4,
-                            jax.random.split(rng)[1], self_state)
-        _stop_spinner.set()
-        t = _time.time() - t0
-        loss_val = float(result[2]) if isinstance(result, tuple) else float(result)
-        print(f"\r[COMPILE] Done in {t:.1f}s, loss={loss_val:.4f}            ")
-        print(f"[COMPILE] Cache saved to {args.cache_dir}")
+        ts = make_train_step(cfg, opt)
+        os = opt.init(p)
+        d = (jnp.zeros((B, N), dtype=jnp.int32), jnp.ones((B, N), dtype=jnp.int32))
+        import time as tm
+        t0 = tm.time()
+        r = ts(p, os, d, 3e-4, jax.random.split(rng)[1], ss)
+        print(f"[COMPILE] Done in {tm.time()-t0:.0f}s, loss={float(r[2]):.4f}")
         return
     elif args.cog_train:
         _require_jax()
@@ -2393,7 +2365,7 @@ def main():
             resume = _prompt_resume(out_dir, "CogTrain", args.yes)
 
         # ── Auto-batch (auto if --use-qwen) ──────────────────────────
-        if args.auto_batch or args.use_qwen:
+        if (args.auto_batch or args.use_qwen) and args.cog_batch == 4:
             try:
                 gpu = jax.devices()[0]
                 free_mb = gpu.memory_stats()["bytes_limit"] // (1024*1024)
