@@ -2333,8 +2333,8 @@ def main():
                 free_mb = gpu.memory_stats()["bytes_limit"] // (1024*1024)
                 print(f"[AUTO] GPU: {free_mb}MB free")
                 if args.use_qwen:
-                    args.cog_batch = min(4, max(1, (free_mb - 10000) // 5000))
-                    args.cog_seq = 128
+                    args.cog_batch = max(4, min(16, (free_mb - 6000) // 1500))
+                    args.cog_seq = 256
                 else:
                     c = max(1, (free_mb - 1500) // 2000)
                     args.cog_batch = max(4, min(128, 16 * c))
@@ -2398,8 +2398,8 @@ def main():
                 gpu = jax.devices()[0]
                 free_mb = gpu.memory_stats()["bytes_limit"] // (1024*1024)
                 if args.use_qwen:
-                    args.cog_batch = min(4, max(1, (free_mb - 10000) // 5000))
-                    args.cog_seq = 128
+                    args.cog_batch = max(4, min(16, (free_mb - 6000) // 1500))
+                    args.cog_seq = 256
                 else:
                     # No Qwen: encoder + codebooks + 8L decoder
                     overhead = 1500
