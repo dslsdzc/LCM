@@ -2094,7 +2094,10 @@ def main():
     p.add_argument("--from-lang-ckpt", default=None, help="Load Stage 1 Language LCM for cog training")
     p.add_argument("--use-qwen", action="store_true",
                    help="Use frozen Qwen2.5-0.5B as active channel (auto-loads weights)")
-    p.add_argument("--auto-batch", action="store_true",
+    p.add_argument("--compile", action="store_true",
+                   help="Pre-compile training graph (run once before --cog-train)")
+    p.add_argument("--cache-dir", default="/root/autodl-tmp/jax_cache",
+                   help="JAX persistent compilation cache dir (default /root/autodl-tmp/jax_cache)")
                    help="Auto-calc optimal batch/seq based on GPU memory")
     p.add_argument("--prompt", default=None, help="Prompt text for --lang-infer")
     # ── subcommands ─────────────────────────────────────────────────────
@@ -2313,8 +2316,54 @@ def main():
     elif args.show_arch:
         LCMInferEngine.print_architecture()
         return
+    elif args.compile:
+        _require_jax()
+        os.environ.setdefault("JAX_PERSISTENT_CACHE_DIR", args.cache_dir)
+        os.makedirs(args.cache_dir, exist_ok=True)
+        print(f"[COMPILE] JAX cache dir: {args.cache_dir}")
+
+        from train.config import LCMConfig
+        from train.cog_train import make_train_step, init_cog_params, pack_codebooks_for_c
+        import optax
+        cfg = LCMConfig()
+        rng = jax.random.PRNGKey(42)
+        rng, init_rng = jax.random.split(rng)
+
+        # Load Qwen or lang model
+        lang_ckpt = None
+        if args.use_qwen:
+            qp = "checkpoints/qwen_model/qwen_params.npz"
+            if not os.path.exists(qp):
+                from huggingface_hub import hf_hub_download
+                qp = hf_hub_download("Qwen/Qwen2.5-0.5B", "model.safetensors")
+            lang_ckpt = qp
+
+        params, self_state = init_cog_params(cfg, init_rng, lang_ckpt=lang_ckpt)
+        optimizer = optax.chain(optax.clip_by_global_norm(1.0),
+                                 optax.adamw(learning_rate=3e-4,
+                                              weight_decay=0.01))
+        opt_state = optimizer.init(params)
+
+        train_step = make_train_step(cfg, optimizer)
+        B, N = 4, 128
+        dummy_batch = (jnp.zeros((B, N), dtype=jnp.int32),
+                       jnp.ones((B, N), dtype=jnp.int32))
+
+        print(f"[COMPILE] JIT compiling training graph (B={B}, N={N})...")
+        import time as _time
+        t0 = _time.time()
+        result = train_step(params, opt_state, dummy_batch, 3e-4,
+                            jax.random.split(rng)[1], self_state)
+        t = _time.time() - t0
+        loss_val = float(result[2]) if isinstance(result, tuple) else float(result)
+        print(f"[COMPILE] Done in {t:.1f}s, loss={loss_val:.4f}")
+        print(f"[COMPILE] Cache saved to {args.cache_dir}")
+        return
     elif args.cog_train:
         _require_jax()
+        if args.cache_dir:
+            os.environ.setdefault("JAX_PERSISTENT_CACHE_DIR", args.cache_dir)
+            os.makedirs(args.cache_dir, exist_ok=True)
         from train.config import LCMConfig
         from train.cog_train import train_cog
         cfg = LCMConfig()

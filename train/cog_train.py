@@ -374,7 +374,7 @@ def make_train_step(cfg, optimizer, joint=False):
                 z_proj = p['z_proj']  # trainable projection
                 a_logits = qwen_forward(qwen_params, inputs,
                                          z_q=z_final, z_proj=z_proj,
-                                         n_layers=4)  # use 4/24 for memory (JIT limit)
+                                         n_layers=8)
                 a_loss = active_loss(a_logits, targets)
             elif p.get('lang_lcm') is not None:
                 lang_params = jax.lax.stop_gradient(p['lang_lcm'])
