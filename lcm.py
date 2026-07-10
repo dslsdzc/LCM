@@ -2351,13 +2351,25 @@ def main():
                        jnp.ones((B, N), dtype=jnp.int32))
 
         print(f"[COMPILE] JIT compiling training graph (B={B}, N={N})...")
-        import time as _time
+        print(f"[COMPILE] This may take 5-10 minutes, cache saved to {args.cache_dir}")
+        import time as _time, threading, itertools, sys as _sys
+        _stop_spinner = threading.Event()
+        def _spinner():
+            for c in itertools.cycle(['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏']):
+                if _stop_spinner.is_set(): break
+                elapsed = int(_time.time() - t0)
+                _sys.stdout.write(f'\r[COMPILE] {c} Compiling... {elapsed}s')
+                _sys.stdout.flush()
+                _stop_spinner.wait(0.1)
         t0 = _time.time()
+        s = threading.Thread(target=_spinner, daemon=True)
+        s.start()
         result = train_step(params, opt_state, dummy_batch, 3e-4,
                             jax.random.split(rng)[1], self_state)
+        _stop_spinner.set()
         t = _time.time() - t0
         loss_val = float(result[2]) if isinstance(result, tuple) else float(result)
-        print(f"[COMPILE] Done in {t:.1f}s, loss={loss_val:.4f}")
+        print(f"\r[COMPILE] Done in {t:.1f}s, loss={loss_val:.4f}            ")
         print(f"[COMPILE] Cache saved to {args.cache_dir}")
         return
     elif args.cog_train:
