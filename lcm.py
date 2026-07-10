@@ -313,25 +313,27 @@ def train(args):
     # ── Stage 2: train memory (encoder + codebooks) ──────────────────────
     if args.stage == 2:
         print("\nStage 2: encoder + codebook training")
-        from train.train_memory import train_memory
-        resume = args.resume
-        if not resume:
-            out_dir = args.save_dir or "checkpoints"
-            resume = _prompt_resume(out_dir, "Stage 2", args.yes)
-        train_memory(
-            cfg=LCMConfig(),
-            data_path=args.data,
-            shape_path=args.shape or _make_shape_path(args.data),
-            output_dir=args.save_dir or "checkpoints",
-            lm_checkpoint=args.load_lm,
-            steps=args.memory_steps,
-            lr=args.lr_stage2,
-            batch_size=args.batch_size,
-            seq_len=args.seq_len,
-            log_every=100,
-            save_every=args.save,
-            resume_from=resume,
-        )
+        if args.use_qwen:
+            from train.cog_train import train_cog
+            qp = "checkpoints/qwen_model/qwen_params.npz"
+            train_cog(cfg=LCMConfig(), output_dir=args.save_dir or "checkpoints/cog_qwen",
+                       steps=args.memory_steps or 50000, lr=args.lr_stage2 or 3e-4,
+                       batch_size=args.batch_size or 12, seq_len=args.seq_len or 256,
+                       log_every=100, save_every=args.save or 1000,
+                       data_path=args.data, lang_ckpt=qp)
+        else:
+            from train.train_memory import train_memory
+            resume = args.resume
+            if not resume:
+                out_dir = args.save_dir or "checkpoints"
+                resume = _prompt_resume(out_dir, "Stage 2", args.yes)
+            train_memory(cfg=LCMConfig(), data_path=args.data,
+                         shape_path=args.shape or _make_shape_path(args.data),
+                         output_dir=args.save_dir or "checkpoints",
+                         lm_checkpoint=args.load_lm, steps=args.memory_steps,
+                         lr=args.lr_stage2, batch_size=args.batch_size,
+                         seq_len=args.seq_len, log_every=100,
+                         save_every=args.save, resume_from=resume)
         return
 
     # ── Stage 3: joint fine-tuning ──
@@ -2153,6 +2155,7 @@ def main():
     ptr.add_argument("-y", "--yes", action="store_true")
     ptr.add_argument("--auto", action="store_true", help="Auto mode: monitor + auto-recover")
     ptr.add_argument("-F", "--from-lm-ckpt", default=None)
+    ptr.add_argument("--use-qwen", action="store_true", help="Use frozen Qwen2.5-0.5B as active channel")
     ptr.add_argument("-C", "--cog-steps", type=int, default=50000)
     ptr.add_argument("-R", "--cog-lr", type=float, default=3e-4)
     ptr.add_argument("-J", "--cog-batch", type=int, default=4)
