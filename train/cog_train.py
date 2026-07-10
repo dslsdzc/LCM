@@ -498,7 +498,7 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
 
     running_loss = 0.0
     start_time = time.time()
-    pbar = tqdm(total=steps, desc="cog training", unit="step")
+    pbar = tqdm(total=steps, desc="cog training", unit="step", mininterval=0.2, miniters=1)
 
     import signal as _signal
 
