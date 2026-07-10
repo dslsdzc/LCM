@@ -33,6 +33,9 @@ class LCMConfig:
     # V4: Muon optimizer (disabled — unsuitable for small models, see train_lang_lcm.py note)
     use_muon: bool = False          # Muon optimizer for matrix params (default: AdamW)
 
+    # Precision
+    use_bf16: bool = True           # BF16 training (FP32 on no-BF16 GPUs, auto-converted)
+
     # Lattice sizes
     n_lattices: int = 6
     M_route: int = 6

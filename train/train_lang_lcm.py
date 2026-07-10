@@ -25,6 +25,23 @@ from train.data import WikiDataIter, MMAP_PATH, MMAP_SHAPE_PATH
 from train.lang_lcm import init_lang_lcm_params, lang_lcm_forward
 
 
+# ─── Precision (BF16) ─────────────────────────────────────────────────────────
+
+def maybe_cast_to_bf16(params, cfg):
+    """Convert all params to BF16 when enabled (FP32 fallback on no-BF16 GPUs)."""
+    if getattr(cfg, 'use_bf16', False):
+        try:
+            import jax
+            import jax.numpy as jnp
+            params = jax.tree_util.tree_map(
+                lambda x: x.astype(jnp.bfloat16) if x.dtype == jnp.float32 and x.ndim > 0 else x,
+                params)
+            print(f"[PREC] BF16 enabled: params converted to bfloat16")
+        except Exception as e:
+            print(f"[PREC] BF16 not supported ({e}), falling back to float32")
+    return params
+
+
 # ─── MTP Loss ─────────────────────────────────────────────────────────────────
 
 def lang_lm_loss(logits, targets, aux=None, mtp_weight=0.3):
@@ -290,6 +307,7 @@ def train_lang_lcm(cfg, output_dir, steps=100000, lr=3e-4, batch_size=16,
 
     n_params = sum(p.size for p in jax.tree_util.tree_leaves(params)
                    if hasattr(p, 'size'))
+    params = maybe_cast_to_bf16(params, cfg)
     rng_init = jax.random.PRNGKey(0)
     _test_x = jnp.zeros((1, 4), dtype=jnp.int32)
     _logits, _z_qs, _aux = lang_lcm_forward(params, _test_x, cfg, rng=rng_init)
