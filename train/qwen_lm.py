@@ -176,7 +176,7 @@ def qwen_forward(qwen_params, input_ids, z_q=None, z_proj=None, n_layers=24):
         h = h.at[:, 0, :].set(z_projected)
 
     # Precompute RoPE
-    cos, sin = precompute_freqs(d // 14, 512, theta=1000000.0)
+    cos, sin = precompute_freqs(d // 14, 2048, theta=1000000.0)
     cos_n = cos[:N]
     sin_n = sin[:N]
 
