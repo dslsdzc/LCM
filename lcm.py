@@ -2343,11 +2343,11 @@ def main():
         p, ss = init_cog_params(cfg, jax.random.split(rng)[1], lang_ckpt=lck)
         opt = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(3e-4, weight_decay=0.01))
         ts = make_train_step(cfg, opt)
-        os = opt.init(p)
+        opt_st = opt.init(p)
         d = (jnp.zeros((B, N), dtype=jnp.int32), jnp.ones((B, N), dtype=jnp.int32))
         import time as tm
         t0 = tm.time()
-        r = ts(p, os, d, 3e-4, jax.random.split(rng)[1], ss)
+        r = ts(p, opt_st, d, 3e-4, jax.random.split(rng)[1], ss)
         print(f"[COMPILE] Done in {tm.time()-t0:.0f}s, loss={float(r[2]):.4f}")
         return
     elif args.cog_train:
