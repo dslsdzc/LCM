@@ -498,7 +498,7 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
 
     running_loss = 0.0
     start_time = time.time()
-    pbar = tqdm(total=steps, desc="cog training", unit="step", mininterval=0.2, miniters=1)
+    pbar = tqdm(total=steps, desc="cog training", unit="step", file=sys.stderr, mininterval=0.5)
 
     import signal as _signal
 
@@ -563,6 +563,7 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
         pbar.update(1)
 
     pbar.close()
+    pbar.refresh()
     final_dir = os.path.join(output_dir, f"step_{steps:06d}")
     save_cog_checkpoint(params, final_dir, steps, self_state=self_state)
     if sup and sup.best_params is not None:
