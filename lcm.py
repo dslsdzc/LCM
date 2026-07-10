@@ -2333,15 +2333,8 @@ def main():
                 free_mb = gpu.memory_stats()["bytes_limit"] // (1024*1024)
                 print(f"[AUTO] GPU: {free_mb}MB free")
                 if args.use_qwen:
-                    # Qwen model + our encoder: ~4GB base
-                    # Per sample (B*N * d=896 * 4layers * overhead): ~B*N*2KB
-                    # For 24GB free: B*N ~ 4M, pick B=32,N=1024 or similar
-                    # Scale from safe (B=4,N=256 needs ~12GB) up with free memory
-                    base_gb = (free_mb - 4000) / 1000  # available GB
-                    b = max(4, int(4 * base_gb / 4))
-                    n = max(256, int(256 * base_gb / 4))
-                    args.cog_batch = min(32, b)
-                    args.cog_seq = min(1024, n)
+                    args.cog_batch = min(4, max(1, (free_mb - 10000) // 5000))
+                    args.cog_seq = 128
                 else:
                     c = max(1, (free_mb - 1500) // 2000)
                     args.cog_batch = max(4, min(128, 16 * c))
@@ -2405,9 +2398,8 @@ def main():
                 gpu = jax.devices()[0]
                 free_mb = gpu.memory_stats()["bytes_limit"] // (1024*1024)
                 if args.use_qwen:
-                    base_gb = (free_mb - 4000) / 1000
-                    args.cog_batch = min(32, max(4, int(4 * base_gb / 4)))
-                    args.cog_seq = min(1024, max(256, int(256 * base_gb / 4)))
+                    args.cog_batch = min(4, max(1, (free_mb - 10000) // 5000))
+                    args.cog_seq = 128
                 else:
                     # No Qwen: encoder + codebooks + 8L decoder
                     overhead = 1500
