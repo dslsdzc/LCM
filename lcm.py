@@ -2367,7 +2367,7 @@ def main():
         import time as _time, threading, itertools, sys as _sys
         _stop_spinner = threading.Event()
         def _spinner():
-            for c in itertools.cycle(['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏']):
+            for c in itertools.cycle(['⡿','⢿','⣻','⣽','⣾','⣷','⣯','⣟']):
                 if _stop_spinner.is_set(): break
                 elapsed = int(_time.time() - t0)
                 _sys.stdout.write(f'\r[COMPILE] {c} Compiling... {elapsed}s')
