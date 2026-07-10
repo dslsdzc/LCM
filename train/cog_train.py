@@ -535,6 +535,12 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
             self_state = aux_out['self_state']
 
         loss_f = float(loss_val)
+
+        # Save checkpoint before NaN check (always save on schedule)
+        if save_every > 0 and step % save_every == 0 and step > 0:
+            ckpt_dir = os.path.join(output_dir, f"step_{step:06d}")
+            save_cog_checkpoint(params, ckpt_dir, step, self_state=self_state)
+
         if np.isnan(loss_f) or np.isinf(loss_f):
             pbar.update(1)
             continue
@@ -556,10 +562,6 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
                 sup.report(step)
             running_loss = 0.0
             start_time = time.time()
-
-        if save_every > 0 and step % save_every == 0 and step > 0:
-            ckpt_dir = os.path.join(output_dir, f"step_{step:06d}")
-            save_cog_checkpoint(params, ckpt_dir, step, self_state=self_state)
 
         pbar.update(1)
 
