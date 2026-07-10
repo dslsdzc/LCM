@@ -536,6 +536,7 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
 
         loss_f = float(loss_val)
         if np.isnan(loss_f) or np.isinf(loss_f):
+            pbar.update(1)
             continue
 
         running_loss += loss_f
