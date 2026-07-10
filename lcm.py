@@ -2333,9 +2333,15 @@ def main():
                 free_mb = gpu.memory_stats()["bytes_limit"] // (1024*1024)
                 print(f"[AUTO] GPU: {free_mb}MB free")
                 if args.use_qwen:
-                    c = max(1, (free_mb - 6000) // 12000)
-                    args.cog_batch = min(16, 4 * c)
-                    args.cog_seq = min(512, 256 * c)
+                    # Qwen model + our encoder: ~4GB base
+                    # Per sample (B*N * d=896 * 4layers * overhead): ~B*N*2KB
+                    # For 24GB free: B*N ~ 4M, pick B=32,N=1024 or similar
+                    # Scale from safe (B=4,N=256 needs ~12GB) up with free memory
+                    base_gb = (free_mb - 4000) / 1000  # available GB
+                    b = max(4, int(4 * base_gb / 4))
+                    n = max(256, int(256 * base_gb / 4))
+                    args.cog_batch = min(32, b)
+                    args.cog_seq = min(1024, n)
                 else:
                     c = max(1, (free_mb - 1500) // 2000)
                     args.cog_batch = max(4, min(128, 16 * c))
@@ -2399,13 +2405,9 @@ def main():
                 gpu = jax.devices()[0]
                 free_mb = gpu.memory_stats()["bytes_limit"] // (1024*1024)
                 if args.use_qwen:
-                    # Qwen2.5-0.5B FP32: ~80MB/layer * 24 + embed = ~3GB
-                    # Activations per sample (B*N): hidden + attn + intermediates
-                    # For d=896, 24 layers: ~10GB base + B*N*0.5MB
-                    # Conservative: B=4,N=512 is safe, scale from there
-                    factor = max(1, (free_mb - 6000) // 6000)  # per 6GB over base
-                    args.cog_batch = min(16, 4 * factor)
-                    args.cog_seq = min(512, 256 * factor)
+                    base_gb = (free_mb - 4000) / 1000
+                    args.cog_batch = min(32, max(4, int(4 * base_gb / 4)))
+                    args.cog_seq = min(1024, max(256, int(256 * base_gb / 4)))
                 else:
                     # No Qwen: encoder + codebooks + 8L decoder
                     overhead = 1500
