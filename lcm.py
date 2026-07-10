@@ -2321,34 +2321,40 @@ def main():
         _require_jax()
         os.environ.setdefault("JAX_PERSISTENT_CACHE_DIR", args.cache_dir)
         os.makedirs(args.cache_dir, exist_ok=True)
-        print(f"[COMPILE] JAX cache dir: {args.cache_dir}")
 
         from train.config import LCMConfig
-        from train.cog_train import make_train_step, init_cog_params, pack_codebooks_for_c
+        from train.cog_train import make_train_step, init_cog_params
         import optax
+
+        # ── Auto-batch ────────────────────────────────────────────────
+        if args.auto_batch or args.use_qwen:
+            try:
+                gpu = jax.devices()[0]
+                free_mb = gpu.memory_stats()["bytes_limit"] // (1024*1024)
+                print(f"[AUTO] GPU: {free_mb}MB free")
+                if args.use_qwen:
+                    c = max(1, (free_mb - 6000) // 12000)
+                    args.cog_batch = min(16, 4 * c)
+                    args.cog_seq = min(512, 256 * c)
+                else:
+                    c = max(1, (free_mb - 1500) // 2000)
+                    args.cog_batch = max(4, min(128, 16 * c))
+                    args.cog_seq = min(1024, 256 * c)
+                print(f"[AUTO] → B={args.cog_batch}, N={args.cog_seq}")
+            except Exception as e:
+                print(f"[AUTO] Probe failed ({e}), defaults B=4,N=128")
+
+        B, N = args.cog_batch or 4, args.cog_seq or 128
+        print(f"[COMPILE] Cache: {args.cache_dir}, B={B}, N={N}")
+
         cfg = LCMConfig()
         rng = jax.random.PRNGKey(42)
-        rng, init_rng = jax.random.split(rng)
-
-        # Load Qwen or lang model
-        lang_ckpt = None
-        if args.use_qwen:
-            qp = "checkpoints/qwen_model/qwen_params.npz"
-            if not os.path.exists(qp):
-                from huggingface_hub import hf_hub_download
-                qp = hf_hub_download("Qwen/Qwen2.5-0.5B", "model.safetensors")
-            lang_ckpt = qp
-
-        params, self_state = init_cog_params(cfg, init_rng, lang_ckpt=lang_ckpt)
-        optimizer = optax.chain(optax.clip_by_global_norm(1.0),
-                                 optax.adamw(learning_rate=3e-4,
-                                              weight_decay=0.01))
-        opt_state = optimizer.init(params)
-
-        train_step = make_train_step(cfg, optimizer)
-        B, N = 4, 128
-        dummy_batch = (jnp.zeros((B, N), dtype=jnp.int32),
-                       jnp.ones((B, N), dtype=jnp.int32))
+        lang_ckpt = "checkpoints/qwen_model/qwen_params.npz" if args.use_qwen else None
+        params, self_state = init_cog_params(cfg, jax.random.split(rng)[1], lang_ckpt=lang_ckpt)
+        opt = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(3e-4, weight_decay=0.01))
+        train_step = make_train_step(cfg, opt)
+        dummy = (jnp.zeros((B, N), dtype=jnp.int32),
+                 jnp.ones((B, N), dtype=jnp.int32))
 
         print(f"[COMPILE] JIT compiling training graph (B={B}, N={N})...")
         print(f"[COMPILE] This may take 5-10 minutes, cache saved to {args.cache_dir}")
@@ -2364,7 +2370,8 @@ def main():
         t0 = _time.time()
         s = threading.Thread(target=_spinner, daemon=True)
         s.start()
-        result = train_step(params, opt_state, dummy_batch, 3e-4,
+        opt_state = opt.init(params)
+        result = train_step(params, opt_state, dummy, 3e-4,
                             jax.random.split(rng)[1], self_state)
         _stop_spinner.set()
         t = _time.time() - t0
@@ -2386,8 +2393,8 @@ def main():
         if not resume:
             resume = _prompt_resume(out_dir, "CogTrain", args.yes)
 
-        # ── Auto-batch: probe GPU memory, calc optimal B/N ────────────
-        if args.auto_batch:
+        # ── Auto-batch (auto if --use-qwen) ──────────────────────────
+        if args.auto_batch or args.use_qwen:
             try:
                 gpu = jax.devices()[0]
                 free_mb = gpu.memory_stats()["bytes_limit"] // (1024*1024)
