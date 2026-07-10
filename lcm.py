@@ -2092,6 +2092,8 @@ def main():
     p.add_argument("--lang-seq", type=int, default=512, help="Lang LCM seq len (default 512)")
     p.add_argument("--lang-save", type=int, default=10000, help="Lang LCM save interval (default 10000)")
     p.add_argument("--from-lang-ckpt", default=None, help="Load Stage 1 Language LCM for cog training")
+    p.add_argument("--use-qwen", action="store_true",
+                   help="Use frozen Qwen2.5-0.5B as active channel (auto-loads weights)")
     p.add_argument("--prompt", default=None, help="Prompt text for --lang-infer")
     # ── subcommands ─────────────────────────────────────────────────────
     sub = p.add_subparsers(dest="mode")
@@ -2319,6 +2321,14 @@ def main():
         resume = args.resume
         if not resume:
             resume = _prompt_resume(out_dir, "CogTrain", args.yes)
+        qwen_ckpt = None
+        if args.use_qwen:
+            qwen_ckpt = "checkpoints/qwen_model/qwen_params.npz"
+            if not os.path.exists(qwen_ckpt):
+                print(f"[QWEN] Weights not found at {qwen_ckpt}, downloading...")
+                from huggingface_hub import hf_hub_download
+                qwen_ckpt = hf_hub_download("Qwen/Qwen2.5-0.5B", "model.safetensors")
+            print(f"[QWEN] Using frozen Qwen2.5-0.5B as active channel")
         train_cog(
             cfg=cfg,
             output_dir=out_dir,
@@ -2330,7 +2340,7 @@ def main():
             save_every=args.cog_save,
             data_path=args.data,
             shape_path=shape,
-            lang_ckpt=args.from_lang_ckpt or args.from_lm_ckpt,
+            lang_ckpt=qwen_ckpt or args.from_lang_ckpt or args.from_lm_ckpt,
             resume=resume,
             joint=(args.stage == 3),
             auto_mode=args.auto,
