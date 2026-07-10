@@ -2098,6 +2098,7 @@ def main():
                    help="Pre-compile training graph (run once before --cog-train)")
     p.add_argument("--cache-dir", default="/root/autodl-tmp/jax_cache",
                    help="JAX persistent compilation cache dir (default /root/autodl-tmp/jax_cache)")
+    p.add_argument("--auto-batch", action="store_true",
                    help="Auto-calc optimal batch/seq based on GPU memory")
     p.add_argument("--prompt", default=None, help="Prompt text for --lang-infer")
     # ── subcommands ─────────────────────────────────────────────────────
