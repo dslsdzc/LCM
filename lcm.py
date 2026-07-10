@@ -2094,6 +2094,8 @@ def main():
     p.add_argument("--from-lang-ckpt", default=None, help="Load Stage 1 Language LCM for cog training")
     p.add_argument("--use-qwen", action="store_true",
                    help="Use frozen Qwen2.5-0.5B as active channel (auto-loads weights)")
+    p.add_argument("--auto-batch", action="store_true",
+                   help="Auto-calc optimal batch/seq based on GPU memory")
     p.add_argument("--prompt", default=None, help="Prompt text for --lang-infer")
     # ── subcommands ─────────────────────────────────────────────────────
     sub = p.add_subparsers(dest="mode")
@@ -2321,6 +2323,28 @@ def main():
         resume = args.resume
         if not resume:
             resume = _prompt_resume(out_dir, "CogTrain", args.yes)
+
+        # ── Auto-batch: probe GPU memory, calc optimal B/N ────────────
+        if args.auto_batch:
+            try:
+                gpu = jax.devices()[0]
+                free_mb = gpu.memory_stats()["bytes_limit"] // (1024*1024)
+                # Qwen2.5-0.5B BF16: ~1GB, FP32: ~2GB
+                qwen_mb = 2000 if args.use_qwen else 0
+                # Per sample: d_model * seq_len * 8layers * 2bytes * overhead ≈ 8MB for d=256,N=512
+                overhead = 1500  # codebooks + encoder + misc
+                per_sample = cfg.d_model * 512 * 8 * 2 * 5 // (1024*1024)  # ~10MB
+                avail = free_mb - qwen_mb - overhead
+                max_batch = max(1, min(128, avail // per_sample))
+                max_seq = min(1024, 256 * max(1, avail // (per_sample * 4)))
+                if args.cog_batch == 4 and max_batch != 4:
+                    args.cog_batch = max_batch
+                if args.cog_seq == 256 and max_seq != 256:
+                    args.cog_seq = max_seq
+                print(f"[AUTO] GPU: {free_mb}MB free → B={args.cog_batch}, N={args.cog_seq}")
+            except Exception as e:
+                print(f"[AUTO] Probe failed ({e}), using defaults B={args.cog_batch}, N={args.cog_seq}")
+
         qwen_ckpt = None
         if args.use_qwen:
             qwen_ckpt = "checkpoints/qwen_model/qwen_params.npz"
