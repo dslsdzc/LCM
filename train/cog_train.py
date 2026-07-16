@@ -462,7 +462,11 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
                      b2=cfg.adam_beta2, eps=cfg.adam_eps,
                      weight_decay=cfg.weight_decay),
     )
+    # Separate frozen Qwen from trainable params (Qwen must NOT be in optimizer)
+    frozen_qwen = params.pop('qwen', None)
     opt_state = optimizer.init(params)
+    if frozen_qwen is not None:
+        params['qwen'] = frozen_qwen
 
     data_iter = WikiDataIter(data_path, shape_path, B=batch_size, N=seq_len)
     train_step = make_train_step(cfg, optimizer, joint=joint)
@@ -522,6 +526,8 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
         current_lr = schedule(step)
         rng, step_rng = jax.random.split(rng)
 
+        # Remove Qwen from trainable params (optimizer must not touch it)
+        frozen_qwen = params.pop('qwen', None)
         if sup:
             params, opt_state, loss_val, aux_out = sup.step(
                 train_step, params, opt_state, batch, step_rng,
@@ -529,6 +535,8 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
         else:
             params, opt_state, loss_val, aux_out = train_step(
                 params, opt_state, batch, current_lr, step_rng, self_state=self_state)
+        if frozen_qwen is not None:
+            params['qwen'] = frozen_qwen
 
         # Update self state from forward pass
         if self_state is not None and aux_out.get('self_state') is not None:
