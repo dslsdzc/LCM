@@ -33,7 +33,7 @@ In LCM, **System 1 is implemented by the multi-lattice memory**—vast amounts o
 
 Dual-channel output:
 - **Passive channel** `z_q @ W_out`: honest, transparent direct readout
-- **Active channel** (Language LCM): retrieves semantic-syntactic primitives from cognitive state to generate fluent, rich expression
+- **Active channel** (Frozen LLM): retrieves semantic-syntactic primitives from cognitive state to generate fluent, rich expression
 
 ### 2.2 Mathematical Advantages of Lattice Quantization
 A mathematical lattice is a discrete set of points with translational invariance. Building learnable lattice codebooks provides:
@@ -49,7 +49,7 @@ Standard VQ-VAE uses a straight-through estimator (STE) to pass gradients: `z_q 
 
 ## 3. System Architecture Overview
 
-LCM consists of four major modules connected end-to-end, forming a cognitive loop: **Perceptual Frontend, Multi-Lattice Memory, Zero-Parameter Inference Engine, Language LCM (Active Channel)**. The Language LCM shares token embedding and output projection `W_out` with the Cognitive LCM, with independent codebooks storing different types of knowledge.
+LCM consists of four major modules connected end-to-end, forming a cognitive loop: **Perceptual Frontend, Multi-Lattice Memory, Zero-Parameter Inference Engine, Frozen LLM (Active Channel)**. The Frozen LLM shares token embedding and output projection `W_out` with the Cognitive LCM, with independent codebooks storing different types of knowledge.
 
 ```mermaid
 graph TD
@@ -78,7 +78,7 @@ graph TD
         M --> N[Inference Result z_final]
     end
 
-    subgraph Active Channel: Language LCM
+    subgraph Active Channel: Frozen LLM
         N --> O[encoder → 6 codebook retrieval-fusion → W_out]
         O --> P[Rich Language Output]
     end
@@ -288,9 +288,9 @@ z_q = Σ_i w_i · α_i · o_i
 
 `β_val` controls the strength of the value constraint. Finally, LayerNorm stabilizes the distribution. The gradient is fully differentiable throughout.
 
-### 4.3 Language LCM: Memory-Driven Language Generation
+### 4.3 Frozen LLM: Memory-Driven Language Generation
 
-The Language LCM (LangLCM) replaces the old lightweight generation head (single-layer linear attention + GLU). It is **a complete LCM instance structurally identical to the Cognitive LCM**. Its codebooks do not store cognitive concepts, but **semantic-syntactic primitives**—sentence skeletons, argument roles, common collocations, tone/style registers at different granularities.
+The Frozen LLM (LangLCM) replaces the old lightweight generation head (single-layer linear attention + GLU). It is **a complete LCM instance structurally identical to the Cognitive LCM**. Its codebooks do not store cognitive concepts, but **semantic-syntactic primitives**—sentence skeletons, argument roles, common collocations, tone/style registers at different granularities.
 
 - **Architecture**: encoder → 6 codebooks (HRQ/sparse/lowrank/manifold/binding/contrast) → fusion → W_out → logits
 - **Input (standalone)**: token sequence; **Input (integrated)**: cognitive state `z_q` + previous token
@@ -312,26 +312,26 @@ Core characteristics:
 
 ## 5. Total Training Loss and Update Mechanism
 
-### 5.1 Stage 1: Language LCM Training (Pure Language Model)
+### 5.1 Stage 1: Frozen LLM Training (Pure Language Model)
 
-The Language LCM trains as a standalone language model: `encoder → codebook retrieval-fusion → W_out`. Pure CE loss:
+The Frozen LLM trains as a standalone language model: `encoder → codebook retrieval-fusion → W_out`. Pure CE loss:
 
 ```
 L_lang = cross_entropy(z_q @ W_out, targets)
 ```
 
-Goal: codebook entries converge to stable semantic-syntactic primitives, enabling the Language LCM to generate fluent text independently.
+Goal: codebook entries converge to stable semantic-syntactic primitives, enabling the Frozen LLM to generate fluent text independently.
 
 ### 5.2 Stage 2: Dual LCM Joint Training
 
-Load the trained Language LCM as the active channel; the Cognitive LCM begins training:
+Load the trained Frozen LLM as the active channel; the Cognitive LCM begins training:
 
 ```
 Total loss:
 L_total = L_passive + L_active + Σ_i L_VQ_i + L_contrast + L_orth
 ```
 - `L_passive`: CE loss from passive channel `z_q @ W_out` (honest direct readout).
-- `L_active`: CE loss from active channel (Language LCM retrieves primitives, fuses, outputs — rich expression).
+- `L_active`: CE loss from active channel (Frozen LLM retrieves primitives, fuses, outputs — rich expression).
 - `L_VQ_i`: Commitment loss `β ‖sg[z_gate] - o_i‖²` for each lattice, with `β` configurable. Each lattice loss already encompasses multi-layer structure: the commitment loss for multi-layer lattices is the sum across all residual layers.
 - Sparsity is achieved through EMA + soft threshold shrinkage (`λ_sparse`) + feature bank dead point reset, with no separate `L_sparse`.
 - `L_contrast`: Dual-codebook InfoNCE (multi-layer sum, cross-codebook negative sampling), weight `λ_contrast`.
