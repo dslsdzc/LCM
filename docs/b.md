@@ -1,6 +1,6 @@
 # Lattice Cognitive Model (LCM) Technical Specification and Implementation Guide v3.0
 
-> **Version Notes**: This technical document provides a comprehensive mathematical refinement of the core modules of the "Lattice Cognitive Model (LCM)" project book, covering complete engineering implementation details from discrete memory lattices, generation head, to training losses. v3.0 completely rewrites the codebook update mechanism (hybrid EMA/gradient management), the binding lattice unbinding method (conjugate multiplication), routing gating (Gumbel-Softmax), contrast lattice collapse prevention (feature bank), low-rank lattice parameterization (pure gradient), and linear attention normalization, abolishes the FSP module, and separates the inference process into an independent zero-parameter inference engine (see c.md). **v4.0 new**: Generation head (single-layer linear attention+GLU) replaced by **Language LCM** — a complete LCM instance structurally identical to the Cognitive LCM, with codebooks storing semantic-syntactic primitives, constructing linguistic expressions via retrieval and fusion.
+> **Version Notes**: This technical document provides a comprehensive mathematical refinement of the core modules of the "Lattice Cognitive Model (LCM)" project book, covering complete engineering implementation details from discrete memory lattices, generation head, to training losses. v3.0 completely rewrites the codebook update mechanism (hybrid EMA/gradient management), the binding lattice unbinding method (conjugate multiplication), routing gating (Gumbel-Softmax), contrast lattice collapse prevention (feature bank), low-rank lattice parameterization (pure gradient), and linear attention normalization, abolishes the FSP module, and separates the inference process into an independent zero-parameter inference engine (see c.md). **v4.0 new**: Generation head (single-layer linear attention+GLU) replaced by **Active Channel (pretrained LLM)** — a complete LCM instance structurally identical to the Cognitive LCM, with codebooks storing semantic-syntactic primitives, constructing linguistic expressions via retrieval and fusion.
 
 ---
 
@@ -553,11 +553,11 @@ class GValueCodebook:
 
 ---
 
-## 5. Language LCM and Dual-Channel Output
+## 5. Active Channel (pretrained LLM) and Dual-Channel Output
 
-### 5.1 Language LCM: Memory-Driven Language Generation
+### 5.1 Active Channel (pretrained LLM): Memory-Driven Language Generation
 
-The Language LCM (LangLCM) replaces the old lightweight generation head (single-layer causal linear attention + GLU). It is a **complete LCM instance structurally identical to the Cognitive LCM**. Its codebooks store semantic-syntactic primitives (sentence skeletons, argument roles, common collocations, tone/style), constructing expressions via retrieval and fusion of primitives, rather than re-learning language modeling through neural networks.
+The Active Channel (pretrained LLM) (LangLCM) replaces the old lightweight generation head (single-layer causal linear attention + GLU). It is a **complete LCM instance structurally identical to the Cognitive LCM**. Its codebooks store semantic-syntactic primitives (sentence skeletons, argument roles, common collocations, tone/style), constructing expressions via retrieval and fusion of primitives, rather than re-learning language modeling through neural networks.
 
 - **Architecture**: encoder → 6 codebooks (HRQ/sparse/lowrank/manifold/binding/contrast) → fusion → W_out → logits
 - **Shared parameters**: token embedding and `W_out` are shared with the Cognitive LCM (same matrix, vocabulary knowledge interoperation)
@@ -582,15 +582,15 @@ After the inference engine outputs `z_q`, two paths diverge:
 | Channel | Path | Characteristic |
 |---------|------|----------------|
 | **Passive channel** | `z_q @ W_out` | Honest direct readout, transparent, no deception gap |
-| **Active channel** | `z_q → Language LCM retrieves primitives → fusion → W_out` | Rich expression, strong language ability |
+| **Active channel** | `z_q → Active Channel (pretrained LLM) retrieves primitives → fusion → W_out` | Rich expression, strong language ability |
 
 ### 5.2 Zero-Parameter Inference Engine
 
-The inference process is completed by the zero-parameter inference engine; see `c.md` for detailed specifications. The Language LCM runs after the inference engine outputs `z_q`, and does not participate in the inference loop.
+The inference process is completed by the zero-parameter inference engine; see `c.md` for detailed specifications. The Active Channel (pretrained LLM) runs after the inference engine outputs `z_q`, and does not participate in the inference loop.
 
 Core interface:
 - **Input**: `z_q ∈ R^{B×d}` (multi-lattice memory fusion output), optionally receives `z` (encoder raw output).
-- **Output**: `z_q` is dispatched to the passive channel and the active channel (Language LCM).
+- **Output**: `z_q` is dispatched to the passive channel and the active channel (Active Channel (pretrained LLM)).
 - **Operation mode**: The inference engine's C implementation executes in gradient-free mode (no automatic differentiation involved). The macroscopic scheduler's maximum steps, convergence threshold, and fusion weight entropy threshold are declared in `c.md`.
 - All intermediate graph topologies and execution traces of each primitive produced during the **inference process** can be externally accessed (for interpretability).
 
@@ -604,16 +604,16 @@ The dual LCM architecture has two training stages:
 
 | Stage | Training Target | Loss | Goal |
 |-------|---------------|------|------|
-| **Stage 1** | Language LCM standalone (pure LM) | `L_lang = CE` | Codebooks converge to semantic-syntactic primitives, generate fluent text independently |
-| **Stage 2** | Cognitive LCM + Language LCM joint | `L_total = L_passive + L_active + L_VQ + L_contrast + L_orth` | Cognitive state z_q outputs via dual channels, distills fluent expression |
+| **Stage 1** | Active Channel (pretrained LLM) standalone (pure LM) | `L_lang = CE` | Codebooks converge to semantic-syntactic primitives, generate fluent text independently |
+| **Stage 2** | Cognitive LCM + Active Channel (pretrained LLM) joint | `L_total = L_passive + L_active + L_VQ + L_contrast + L_orth` | Cognitive state z_q outputs via dual channels, distills fluent expression |
 
-### 6.2 Stage 1: Language LCM Loss
+### 6.2 Stage 1: Active Channel (pretrained LLM) Loss
 
-The Language LCM trains as a standalone language model. At each forward pass, each token position independently retrieves codebook primitives and fuses them:
+The Active Channel (pretrained LLM) trains as a standalone language model. At each forward pass, each token position independently retrieves codebook primitives and fuses them:
 ```
 L_lang = cross_entropy(z_q @ W_out, targets)
 ```
-All Language LCM parameters (encoder + 6 codebooks + fusion + W_out) participate in training with pure gradient updates. No cognitive loop, introspection, or safety modules at this stage.
+All Active Channel (pretrained LLM) parameters (encoder + 6 codebooks + fusion + W_out) participate in training with pure gradient updates. No cognitive loop, introspection, or safety modules at this stage.
 
 ### 6.3 Stage 2: Dual LCM Joint Loss
 
@@ -623,8 +623,8 @@ L_total = L_passive + L_active + L_VQ + L_contrast + L_orth
 ```
 
 - **Passive channel loss** `L_passive`: CE loss from `z_q @ W_out` direct readout, honest and transparent.
-- **Active channel loss** `L_active`: CE loss from Language LCM retrieving primitives conditioned on `z_q`, rich expression.
-- **Distillation mechanism**: The passive channel's gradient simultaneously optimizes the Cognitive LCM's codebooks, gradually teaching them the Language LCM's expressive ability.
+- **Active channel loss** `L_active`: CE loss from Active Channel (pretrained LLM) retrieving primitives conditioned on `z_q`, rich expression.
+- **Distillation mechanism**: The passive channel's gradient simultaneously optimizes the Cognitive LCM's codebooks, gradually teaching them the Active Channel (pretrained LLM)'s expressive ability.
 - `L_VQ`: Sum of commitment losses for all lattices (including routing).
   Unified form: `L_VQ = Σ_{g∈G} β_g · ‖sg[z_g] − o_g‖²`
   Where `z_g` is the vector input to that lattice (typically `z` or after splitting/projection), and `o_g` is the lattice output. Multi-layer lattice losses already include all residual layers: the number of commitment loss terms is determined by `n_layers` and the lattice structure.
@@ -658,7 +658,7 @@ L_total = L_passive + L_active + L_VQ + L_contrast + L_orth
 - Cognitive LCM: routing lattice codebook `C_route` and projection `W_route`
 - Cognitive LCM: scaling factors `α_i`
 - Cognitive LCM: binding lattice key-value projection matrices `A_k`, `A_v` (reusing low-rank lattice shared basis `V`)
-- **Language LCM**: all parameters (encoder + 6 codebooks + fusion + W_out) — Stage 1 independent training, Stage 2 optionally frozen or fine-tuned
+- **Active Channel (pretrained LLM)**: all parameters (encoder + 6 codebooks + fusion + W_out) — Stage 1 independent training, Stage 2 optionally frozen or fine-tuned
 
 **EMA updated** codebooks:
 - Sparse lattice codebook (γ_sparse)
