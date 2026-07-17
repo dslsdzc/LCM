@@ -60,3 +60,4 @@ be/
 # --- Environment / secrets ---
 .env
 .env.*
+zhwiki_tokens_shape.json
