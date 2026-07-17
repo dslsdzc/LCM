@@ -402,3 +402,9 @@ params = contrast_lattice.maybe_reset_dead(params, step)
 ## 8. Conclusion
 
 LCM establishes a self-consistent cognitive architecture in terms of mathematical rigor, memory unity, and training feasibility. By strictly maintaining the discrete/semi-discrete output of all lattices, unifying the STE retrieval paradigm, and decoupling training through hybrid EMA/gradient management, LCM pushes memory capacity, resistance to forgetting, and reasoning interpretability to levels unattainable by traditional LLMs, all within a lightweight parameter budget. Its theoretical upper limit awaits experimental validation—it is a cognitive architecture direction worthy of deep exploration.
+
+---
+
+## 9. Training Reports
+
+V1 (2026-06 to 2026-07): [Training Experiment Report V1 (English)](training_report_v1_en.md)
