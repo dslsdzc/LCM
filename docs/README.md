@@ -13,8 +13,7 @@ This directory contains design documents and specifications in both Chinese and 
 | `c.md` / `c_cn.md` | **Zero-Parameter Inference Engine Specification** — Dynamic dataflow graph architecture, operation primitives, DAG construction and execution flow, external interface definitions | Inference engine developers |
 | `d.md` / `d_cn.md` | **Safety Subsystem Specification** — Danger lattice detection mechanism, external verifier, self-lattice activation preconditions, conflict abort protocol | Security auditors |
 | `e.md` / `e_cn.md` | **Self-Awareness Research** — Self-observation stack, black box recorder, narrative memory, reflection loop, causal subject, self lattice, behavior exploration, hierarchical model | Cognitive science researchers |
-
----
+| `training_report_v1_en.md` / `training_report_v1_cn.md` | **V1 Training Experiment Report** — Full experimental records from GTX 1650 to RTX 5090, training curves, key findings | Developers, researchers |
 
 ## Reading Guide
 
