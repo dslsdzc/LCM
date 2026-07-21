@@ -263,7 +263,7 @@ LCM/
 
 ## Dreiphasiges Training
 
-**Hinweis: Das aktuelle Training umfasst zwei unabhängige Prozesse — kognitives Training (`cog_train.py`, trainiert das kognitive System zur Konvergenz von z_q durch die DAG-Schleife) und Gedächtnistraining (`train_memory.py`, kontinuierliche Aktualisierung der Codebücher). Sie sind unterschiedlich und ersetzen einander nicht.**
+**Aktuelle Trainingsprozesse: Kognitives Training (`cog_train.py`) ist der Hauptprozess — trainiert das gesamte kognitive System (Encoder + 6 Codebücher + W_out + kognitive Schleife), einschließlich der Aktualisierung der Codebücher. Gedächtnistraining (`train_memory.py`) ist ein Hilfsprozess zur unabhängigen Aktualisierung der Codebücher nach dem Deployment (kontinuierliches Lernen). Sie sind komplementär, nicht gegenseitig ausschließend.**
 
 Tabelle des alten dreiphasigen Schemas, nur Phase 1 ist veraltet:
 

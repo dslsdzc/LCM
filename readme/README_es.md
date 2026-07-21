@@ -263,7 +263,7 @@ LCM/
 
 ## Entrenamiento en tres etapas
 
-**Nota: El entrenamiento actual consta de dos procesos independientes — entrenamiento cognitivo (`cog_train.py`, entrena el sistema cognitivo para converger z_q mediante el bucle DAG) y entrenamiento de memoria (`train_memory.py`, actualización continua de los codebooks). Son diferentes y no se reemplazan mutuamente.**
+**Procesos de entrenamiento actuales: el entrenamiento cognitivo (`cog_train.py`) es el proceso principal — entrena todo el sistema cognitivo (codificador + 6 codebooks + W_out + bucle cognitivo), incluyendo la actualización de los codebooks. El entrenamiento de memoria (`train_memory.py`) es un proceso auxiliar dedicado a la actualización independiente de los codebooks después del despliegue (aprendizaje continuo). Son complementarios, no mutuamente excluyentes.**
 
 Tabla del antiguo esquema de tres etapas, solo la Etapa 1 está obsoleta:
 

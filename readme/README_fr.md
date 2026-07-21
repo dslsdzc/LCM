@@ -263,7 +263,7 @@ LCM/
 
 ## Entraînement en trois phases
 
-**Note : L'entraînement actuel comprend deux processus indépendants — l'entraînement cognitif (`cog_train.py`, entraîne le système cognitif pour faire converger z_q via la boucle DAG) et l'entraînement mémoire (`train_memory.py`, mise à jour continue des codebooks). Ils sont différents et ne se remplacent pas mutuellement.**
+**Processus d'entraînement actuel : l'entraînement cognitif (`cog_train.py`) est le processus principal — entraîne l'ensemble du système cognitif (encoder + 6 codebooks + W_out + boucle cognitive), incluant la mise à jour des codebooks. L'entraînement mémoire (`train_memory.py`) est un processus auxiliaire dédié à la mise à jour indépendante des codebooks après déploiement (apprentissage continu). Ils sont complémentaires, pas mutuellement exclusifs.**
 
 Tableau de l'ancien schéma en trois phases, seule la Phase 1 est obsolète :
 

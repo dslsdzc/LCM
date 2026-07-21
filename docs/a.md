@@ -312,6 +312,16 @@ Core characteristics:
 
 ## 5. Total Training Loss and Update Mechanism
 
+Training consists of **two current processes** and **one historical process**:
+
+| Process | Module | Trains | Relationship |
+|---------|--------|--------|-------------|
+| **Cognitive Training** (`cog_train.py`) | encoder + 6 codebooks + W_out + cognitive loop | Full params incl. codebooks | Main process, trains cognitive system convergence |
+| **Memory Training** (`train_memory.py`) | 6 codebooks | Codebooks only | Auxiliary process, can run independently after deployment |
+| **(Historical) LM Pretraining** (`train_lm.py`) | gen_head decoder | Decoder only | Deprecated |
+
+Cognitive training and memory training are **complementary, not mutually exclusive**: cognitive training is the main process training the entire system including codebooks; memory training is a specialized continual learning process that can update codebooks independently after deployment.
+
 ### 5.1 Stage 1 (Historical): Frozen LLM Training (Pure Language Model)
 
 > This scheme is deprecated. LangLCM is a transitional concept. The current active channel uses Qwen as a temporary bridge. Code remains in `train/train_lang_lcm.py`.
