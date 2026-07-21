@@ -553,15 +553,15 @@ class GValueCodebook:
 
 ---
 
-## 五、冻结LLM 与双通道输出
+## 五、主动通道与双通道输出
 
-### 5.1 冻结LLM：记忆驱动的语言生成
+### 5.1 主动通道：从认知状态到语言
 
-冻结LLM（LangLCM）取代了旧版本的轻量生成头（单层因果线性注意力+GLU），是一个**与认知LCM同构的完整LCM实例**。其 codebook 存储语义-句法基元（句式骨架、论元角色、常用搭配、语气风格），通过检索和融合基元来构造表达，而非由神经网络重新学习语言建模。
+主动通道负责将认知状态 `z_q` 转换为流畅的自然语言。**尚未形成**——当前由 Qwen2.5-0.5B 临时桥接（z_q 经 z_proj 投影到 Qwen 隐藏空间，Qwen 前 4 层 decoder 生成输出）。
 
-- **架构**：encoder → 6种codebook（HRQ/稀疏/低秩/流形/绑定/对比）→ 融合 → W_out → logits
-- **共享参数**：token embedding 和 `W_out` 与认知LCM 共享（同一矩阵，词汇知识互通）
-- **训练**：Stage 1 独立训练（纯 CE loss），Stage 2 接入认知LCM 作为主动通道
+此前尝试过 LangLCM（与认知LCM 同构的完整 LCM 实例，codebook 存储语义-句法基元）作为主动通道，已淘汰。**LangLCM 是过渡概念，不存在于最终架构**。代码保留在 `train/lang_lcm.py` 中。
+
+共享参数：token embedding 和 `W_out` 与认知LCM 共享（同一矩阵，词汇知识互通）。
 
 #### 5.1.1 前向传播（训练模式，teacher forcing）
 
@@ -604,10 +604,10 @@ tokens (B, N)
 
 | 阶段 | 训练内容 | 损失 | 目标 |
 |------|---------|------|------|
-| **Stage 1** | 冻结LLM 独立训练（纯语言模型） | `L_lang = CE` | codebook 收敛为语义-句法基元，能独立生成流畅文本 |
-| **Stage 2** | 认知LCM + 冻结LLM 联合 | `L_total = L_passive + L_active + L_VQ + L_contrast + L_orth` | 认知状态 z_q 通过双通道输出，蒸馏流畅表达能力 |
+| **Stage 1（历史）** | 冻结LLM 独立训练——已淘汰，LangLCM 是过渡概念 | `L_lang = CE` | codebook 收敛为语义-句法基元 |
+| **Stage 2** | 认知LCM + Qwen 桥接联合 | `L_total = L_passive + L_active + L_VQ + L_contrast + L_orth` | 认知状态 z_q 通过双通道输出 |
 
-### 6.2 Stage 1：冻结LLM 损失
+### 6.2 Stage 1（历史）：冻结LLM 损失
 
 冻结LLM 作为独立语言模型训练，每次前向的每个token位置独立检索codebook基元并融合：
 ```

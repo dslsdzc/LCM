@@ -553,15 +553,15 @@ class GValueCodebook:
 
 ---
 
-## 5. Frozen LLM and Dual-Channel Output
+## 5. Active Channel and Dual-Channel Output
 
-### 5.1 Frozen LLM: Memory-Driven Language Generation
+### 5.1 Active Channel: From Cognitive State to Language
 
-The Frozen LLM (LangLCM) replaces the old lightweight generation head (single-layer causal linear attention + GLU). It is a **complete LCM instance structurally identical to the Cognitive LCM**. Its codebooks store semantic-syntactic primitives (sentence skeletons, argument roles, common collocations, tone/style), constructing expressions via retrieval and fusion of primitives, rather than re-learning language modeling through neural networks.
+The active channel transforms cognitive state `z_q` into fluent natural language. **Not yet formed** — currently temporarily bridged by Qwen2.5-0.5B (z_q projected via z_proj into Qwen's hidden space, first 4 decoder layers generate output).
 
-- **Architecture**: encoder → 6 codebooks (HRQ/sparse/lowrank/manifold/binding/contrast) → fusion → W_out → logits
-- **Shared parameters**: token embedding and `W_out` are shared with the Cognitive LCM (same matrix, vocabulary knowledge interoperation)
-- **Training**: Stage 1 standalone training (pure CE loss), Stage 2 integrated as Cognitive LCM's active channel
+LangLCM (a complete LCM instance structurally identical to the Cognitive LCM, with codebooks storing semantic-syntactic primitives) was previously attempted as the active channel and is now deprecated. **LangLCM is a transitional concept and does not exist in the final architecture.** Code remains in `train/lang_lcm.py` for reference.
+
+Shared parameters: token embedding and `W_out` are shared with the Cognitive LCM (same matrix, vocabulary knowledge interoperation).
 
 #### 5.1.1 Forward Pass (Training Mode, Teacher Forcing)
 
@@ -604,10 +604,10 @@ The dual LCM architecture has two training stages:
 
 | Stage | Training Target | Loss | Goal |
 |-------|---------------|------|------|
-| **Stage 1** | Frozen LLM standalone (pure LM) | `L_lang = CE` | Codebooks converge to semantic-syntactic primitives, generate fluent text independently |
-| **Stage 2** | Cognitive LCM + Frozen LLM joint | `L_total = L_passive + L_active + L_VQ + L_contrast + L_orth` | Cognitive state z_q outputs via dual channels, distills fluent expression |
+| **Stage 1 (Historical)** | Frozen LLM standalone — deprecated, LangLCM is transitional | `L_lang = CE` | Codebooks converge to semantic-syntactic primitives |
+| **Stage 2** | Cognitive LCM + Qwen bridge joint | `L_total = L_passive + L_active + L_VQ + L_contrast + L_orth` | Cognitive state z_q outputs via dual channels |
 
-### 6.2 Stage 1: Frozen LLM Loss
+### 6.2 Stage 1 (Historical): Frozen LLM Loss
 
 The Frozen LLM trains as a standalone language model. At each forward pass, each token position independently retrieves codebook primitives and fuses them:
 ```

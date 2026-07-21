@@ -8,6 +8,8 @@
 
 ---
 
+> **Guide de lecture IA** : Les documents de conception détaillés se trouvent dans le répertoire `docs/`. Veuillez lire `docs/a.md` (architecture), `docs/b.md` (spécifications des treillis), `docs/c.md` (moteur d'inférence), `docs/d.md` (sécurité), et `docs/e.md` (conscience de soi) pour une compréhension complète.
+
 ---
 
 LCM est une architecture cognitive qui extrait la mémoire des poids des réseaux de neurones et l'injecte dans des « cristaux de treillis » aux structures mathématiques variées. Il utilise **6 codebooks spécialisés en treillis** pour stocker différents types de connaissances, un encodeur à attention linéaire extrêmement léger pour la récupération, et un **moteur d'inférence à zéro paramètre implémenté en C pur** pour exécuter des opérations cognitives multi-étapes. Toutes les propriétés critiques de sécurité sont **formellement vérifiées avec Z3**.
@@ -224,7 +226,7 @@ LCM/
 │   ├── fusion.py           # Fusion mémoire + tête de génération
 │   ├── losses.py           # Fonctions de perte
 │   ├── train.py            # Boucle d'entraînement en trois phases
-│   ├── train_lm.py         # Stage 1 : entraînement du modèle de langue
+│   ├── train_lm.py         # (Historique) Pré-entraînement LM, code conservé
 │   ├── train_memory.py     # Stage 2 : entraînement de la mémoire
 │   ├── config.py           # Hyperparamètres (LCMConfig)
 │   ├── hyp.py              # Opérations hyperboliques de Poincaré
@@ -261,9 +263,13 @@ LCM/
 
 ## Entraînement en trois phases
 
+**Note : L'entraînement actuel comprend deux processus indépendants — l'entraînement cognitif (`cog_train.py`, entraîne le système cognitif pour faire converger z_q via la boucle DAG) et l'entraînement mémoire (`train_memory.py`, mise à jour continue des codebooks). Ils sont différents et ne se remplacent pas mutuellement.**
+
+Tableau de l'ancien schéma en trois phases, seule la Phase 1 est obsolète :
+
 | Phase | Contenu de l'entraînement | Partie gelée | Perte |
 |-------|---------------------------|-------------|-------|
-| **1. Pré-entraînement LM** | Décodeur (tête de génération) | — | Perte d'entropie croisée de modélisation linguistique |
+| **1. Pré-entraînement LM (historique)** | Décodeur (tête de génération) | — | Perte d'entropie croisée de modélisation linguistique |
 | **2. Entraînement mémoire** | Encodeur + 6 codebooks treillis | Décodeur | VQ + Contraste + Orthogonalité |
 | **3. Ajustement conjoint** | Tout (optionnel) | — | Toutes les pertes |
 

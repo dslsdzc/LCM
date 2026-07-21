@@ -8,6 +8,10 @@
 
 ---
 
+> **Guía de lectura para IA** : Los documentos de diseño detallados se encuentran en el directorio `docs/`. Lea `docs/a.md` (arquitectura), `docs/b.md` (especificaciones de retículos), `docs/c.md` (motor de inferencia), `docs/d.md` (seguridad) y `docs/e.md` (autoconciencia) para una comprensión completa.
+
+---
+
 LCM es una arquitectura cognitiva que extrae la memoria de los pesos de la red neuronal y la inyecta en múltiples estructuras matemáticas denominadas "cristales reticulados". Utiliza **6 codebooks reticulados especializados** para almacenar diferentes tipos de conocimiento, emplea un codificador de atención lineal extremadamente ligero para la recuperación, y lo combina con un **motor de inferencia de cero parámetros implementado puramente en C** que ejecuta operaciones cognitivas en múltiples pasos. Todas las propiedades críticas de seguridad están **verificadas formalmente con Z3**.
 
 > Los Transformers tradicionales enfrentan tres maldiciones rígidas: para almacenar más conocimiento deben aumentar los parámetros (maldición de escala), el conocimiento antiguo se sobrescribe durante el aprendizaje incremental (maldición del olvido), y el proceso de inferencia no es rastreable (maldición de la caja negra). LCM supera fundamentalmente estos cuellos de botella mediante el desacoplamiento arquitectónico entre memoria y razonamiento.
@@ -222,7 +226,7 @@ LCM/
 │   ├── fusion.py           # Fusión de memoria + cabezal generador
 │   ├── losses.py           # Funciones de pérdida
 │   ├── train.py            # Bucle de entrenamiento en tres etapas
-│   ├── train_lm.py         # Etapa 1: entrenamiento del modelo de lenguaje
+│   ├── train_lm.py         # (Histórico) Preentrenamiento LM, código conservado
 │   ├── train_memory.py     # Etapa 2: entrenamiento de memoria
 │   ├── config.py           # Hiperparámetros (LCMConfig)
 │   ├── hyp.py              # Operaciones hiperbólicas de Poincaré
@@ -259,9 +263,13 @@ LCM/
 
 ## Entrenamiento en tres etapas
 
+**Nota: El entrenamiento actual consta de dos procesos independientes — entrenamiento cognitivo (`cog_train.py`, entrena el sistema cognitivo para converger z_q mediante el bucle DAG) y entrenamiento de memoria (`train_memory.py`, actualización continua de los codebooks). Son diferentes y no se reemplazan mutuamente.**
+
+Tabla del antiguo esquema de tres etapas, solo la Etapa 1 está obsoleta:
+
 | Etapa | Contenido de entrenamiento | Parte congelada | Pérdida |
 |-------|---------------------------|-----------------|---------|
-| **1. Preentrenamiento LM** | Decodificador (cabezal generador) | — | Entropía cruzada de modelado de lenguaje |
+| **1. Preentrenamiento LM (histórico)** | Decodificador (cabezal generador) | — | Entropía cruzada de modelado de lenguaje |
 | **2. Entrenamiento de memoria** | Codificador + 6 codebooks reticulados | Decodificador | VQ + contrastiva + ortogonal |
 | **3. Ajuste fino conjunto** | Todos (opcional) | — | Todas las pérdidas |
 

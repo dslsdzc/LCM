@@ -320,7 +320,7 @@ Each layer can only read the outputs of lower layers; there is no reverse interf
 
 3. **Metacognitive training**: In a small number of training steps, let the system learn to use its own self-state signals to improve inference quality (for example, adjusting convergence tolerance to reduce average inference steps).
 
-4. **Internal language**: Let the system output natural language descriptions of its self-state through standard inference channels (encoder -> cognitive loop -> gen_head), without modifying the inference engine itself.
+4. **Internal language**: Let the system output natural language descriptions of its self-state through standard inference channels (encoder -> cognitive loop -> W_out), without modifying the inference engine itself.
 
 5. **Gradient-based curiosity**: Use prediction error as a differentiable auxiliary loss signal, allowing intrinsic motivation to directly influence encoder and codebook training.
 

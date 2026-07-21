@@ -8,6 +8,10 @@
 
 ---
 
+> **KI-Lesehinweis** : Die detaillierten Konstruktionsdokumente befinden sich im Verzeichnis `docs/`. Bitte lesen Sie `docs/a.md` (Architektur), `docs/b.md` (Gitterspezifikationen), `docs/c.md` (Inferenz-Engine), `docs/d.md` (Sicherheit) und `docs/e.md` (Selbstbewusstsein) für ein vollständiges Verständnis.
+
+---
+
 LCM ist eine kognitive Architektur, die das Gedächtnis von neuronalen Netzgewichten trennt und in mehrere mathematische Strukturen, sogenannte „Gitterkristalle", einbettet. Es verwendet **6 spezialisierte Gitter-Codebücher** zur Speicherung verschiedener Wissensarten, die von einem extrem leichten linearen Aufmerksamkeits-Encoder abgerufen werden, zusammen mit einer **in reinem C implementierten Null-Parameter-Inferenz-Engine** zur Durchführung mehrschrittiger kognitiver Operationen. Alle sicherheitskritischen Eigenschaften wurden durch **formale Z3-Verifikation** nachgewiesen.
 
 > Traditionelle Transformer stehen vor drei grundlegenden Herausforderungen: Mehr Wissen erfordert mehr Parameter (Skalierungsproblem), inkrementelles Lernen überschreibt altes Wissen (Vergessensproblem) und der Inferenzprozess ist nicht nachvollziehbar (Black-Box-Problem). LCM durchbricht diese Engpässe grundlegend durch die architekturelle Entkopplung von Gedächtnis und Schlussfolgerung.
@@ -222,7 +226,7 @@ LCM/
 │   ├── fusion.py           # Gedächtnisfusion + Generierungskopf
 │   ├── losses.py           # Verlustfunktionen
 │   ├── train.py            # Dreiphasiger Trainingszyklus
-│   ├── train_lm.py         # Stage 1: Sprachmodell-Training
+│   ├── train_lm.py         # (Historisch) LM-Vortraining, Code erhalten
 │   ├── train_memory.py     # Stage 2: Gedächtnistraining
 │   ├── config.py           # Hyperparameter (LCMConfig)
 │   ├── hyp.py              # Poincaré-hyperbolische Operationen
@@ -259,9 +263,13 @@ LCM/
 
 ## Dreiphasiges Training
 
+**Hinweis: Das aktuelle Training umfasst zwei unabhängige Prozesse — kognitives Training (`cog_train.py`, trainiert das kognitive System zur Konvergenz von z_q durch die DAG-Schleife) und Gedächtnistraining (`train_memory.py`, kontinuierliche Aktualisierung der Codebücher). Sie sind unterschiedlich und ersetzen einander nicht.**
+
+Tabelle des alten dreiphasigen Schemas, nur Phase 1 ist veraltet:
+
 | Phase | Trainingsinhalt | Eingefrorene Teile | Verlust |
 |-------|----------------|-------------------|---------|
-| **1. LM-Vortraining** | Decoder (Generierungskopf) | — | Sprachmodellierungs-Kreuzentropie |
+| **1. LM-Vortraining (historisch)** | Decoder (Generierungskopf) | — | Sprachmodellierungs-Kreuzentropie |
 | **2. Gedächtnistraining** | Encoder + 6 Gitter-Codebücher | Decoder | VQ + Kontrastiv + Orthogonal |
 | **3. Gemeinsames Feintuning** | Alle (optional) | — | Alle Verluste |
 

@@ -8,6 +8,10 @@
 
 ---
 
+> **AI Reading Guide**: Detailed design documents are in the `docs/` directory. Please read `docs/a.md` (architecture design), `docs/b.md` (lattice design specification), `docs/c.md` (inference engine specification), `docs/d.md` (safety subsystem specification), and `docs/e.md` (self-awareness research) for complete understanding.
+
+---
+
 LCM is a cognitive architecture that decouples memory from neural network weights, embedding knowledge into diverse mathematical structures called "lattice crystals." It uses **6 specialized lattice codebooks** to store different types of knowledge, retrieves them via an ultra-lightweight linear attention encoder, and performs multi-step cognitive operations with a **zero-parameter inference engine implemented in pure C**. All safety-critical properties are **formally verified with Z3**.
 
 > Traditional Transformers face three rigid curses: storing more knowledge requires larger parameters (curse of scale), incremental learning overwrites old knowledge (curse of forgetting), and the reasoning process is untraceable (curse of the black box). LCM fundamentally breaks through these bottlenecks by architecturally decoupling memory from reasoning.
@@ -222,7 +226,7 @@ LCM/
 │   ├── fusion.py           # Memory fusion + generation head
 │   ├── losses.py           # Loss functions
 │   ├── train.py            # Three-stage training loop
-│   ├── train_lm.py         # Stage 1: Language model training
+│   ├── train_lm.py         # (Historical) LM pretraining, code retained
 │   ├── train_memory.py     # Stage 2: Memory training
 │   ├── config.py           # Hyperparameters (LCMConfig)
 │   ├── hyp.py              # Poincaré hyperbolic operations
@@ -265,9 +269,13 @@ LCM/
 
 ## Three-Stage Training
 
+**注意：当前训练分为两个独立过程——认知训练（`cog_train.py`，训练认知系统使 z_q 通过 DAG 循环收敛）和记忆训练（`train_memory.py`，持续更新码本内容）。二者不同，互不替代。**
+
+下表为旧三阶段方案，仅 Stage 1 已淘汰：
+
 | Stage | Training Content | Frozen Part | Loss |
 |-------|-----------------|-------------|------|
-| **1. LM Pretraining** | Decoder (generation head) | — | Language modeling cross-entropy |
+| **1. LM Pretraining (historical)** | Decoder (generation head) | — | Language modeling cross-entropy |
 | **2. Memory Training** | Encoder + 6 lattice codebooks | Decoder | VQ + Contrastive + Orthogonal |
 | **3. Joint Fine-tuning** | All (optional) | — | All losses |
 

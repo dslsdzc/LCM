@@ -49,7 +49,7 @@ Standard VQ-VAE uses a straight-through estimator (STE) to pass gradients: `z_q 
 
 ## 3. System Architecture Overview
 
-LCM consists of four major modules connected end-to-end, forming a cognitive loop: **Perceptual Frontend, Multi-Lattice Memory, Zero-Parameter Inference Engine, Frozen LLM (Active Channel)**. The Frozen LLM shares token embedding and output projection `W_out` with the Cognitive LCM, with independent codebooks storing different types of knowledge.
+LCM consists of four major modules connected end-to-end, forming a cognitive loop: **Perceptual Frontend, Multi-Lattice Memory, Zero-Parameter Inference Engine, Active Channel**. The active channel has **not yet formed** — currently bridged by Qwen2.5-0.5B. The previously attempted LangLCM was a transitional concept and does not exist in the final architecture.
 
 ```mermaid
 graph TD
@@ -288,15 +288,15 @@ z_q = Σ_i w_i · α_i · o_i
 
 `β_val` controls the strength of the value constraint. Finally, LayerNorm stabilizes the distribution. The gradient is fully differentiable throughout.
 
-### 4.3 Frozen LLM: Memory-Driven Language Generation
+### 4.3 Active Channel: From Cognitive State to Language
 
-The Frozen LLM (LangLCM) replaces the old lightweight generation head (single-layer linear attention + GLU). It is **a complete LCM instance structurally identical to the Cognitive LCM**. Its codebooks do not store cognitive concepts, but **semantic-syntactic primitives**—sentence skeletons, argument roles, common collocations, tone/style registers at different granularities.
+The active channel transforms cognitive state `z_q` into fluent natural language. **Not yet formed** — but the formation process has begun.
 
-- **Architecture**: encoder → 6 codebooks (HRQ/sparse/lowrank/manifold/binding/contrast) → fusion → W_out → logits
-- **Input (standalone)**: token sequence; **Input (integrated)**: cognitive state `z_q` + previous token
-- **Codebook content**: primitive composition constructs linguistic expressions, rather than a separate language model re-learning attention
-- **Shared parameters**: token embedding and W_out are shared with the Cognitive LCM
-- **Training**: Stage 1 standalone training, pure CE loss
+**Mechanism: Qwen reverse-forms the active channel.** During cognitive training, the Qwen bridge gradient (`L_active`) backpropagates through the cognitive system, forcing z_q to converge in directions useful for language generation. This reverse process is essentially training the active channel — Qwen's output supervision signal is "teaching" the cognitive system how to decode language from its own state. Over time, the cognitive system learns to bypass Qwen and generate accurate semantic output directly from z_q.
+
+Current implementation: z_q (256d) is projected to Qwen's 896d hidden space via a trainable `z_proj`, Qwen's first 4 decoder layers generate logits, and the CE loss gradient flows back through Qwen (frozen) to z_q.
+
+LangLCM (a separate 4-layer transformer decoder + 6 codebook soft-read) was previously attempted — a complete LCM instance structurally identical to the Cognitive LCM, with codebooks storing semantic-syntactic primitives. It was abandoned due to insufficient capacity and missing position encoding. **LangLCM is a transitional concept and does not exist in the final architecture.** Code remains in `train/lang_lcm.py` for reference.
 
 ### 4.4 Zero-Parameter Inference Engine
 
@@ -312,7 +312,9 @@ Core characteristics:
 
 ## 5. Total Training Loss and Update Mechanism
 
-### 5.1 Stage 1: Frozen LLM Training (Pure Language Model)
+### 5.1 Stage 1 (Historical): Frozen LLM Training (Pure Language Model)
+
+> This scheme is deprecated. LangLCM is a transitional concept. The current active channel uses Qwen as a temporary bridge. Code remains in `train/train_lang_lcm.py`.
 
 The Frozen LLM trains as a standalone language model: `encoder → codebook retrieval-fusion → W_out`. Pure CE loss:
 
@@ -322,9 +324,9 @@ L_lang = cross_entropy(z_q @ W_out, targets)
 
 Goal: codebook entries converge to stable semantic-syntactic primitives, enabling the Frozen LLM to generate fluent text independently.
 
-### 5.2 Stage 2: Dual LCM Joint Training
+### 5.2 Stage 2: Cognitive Training
 
-Load the trained Frozen LLM as the active channel; the Cognitive LCM begins training:
+Cognitive system training with dual channels: passive (`z_q @ W_out`) and active (Qwen bridge):
 
 ```
 Total loss:
