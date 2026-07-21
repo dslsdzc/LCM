@@ -1,7 +1,5 @@
 # Lattice Cognitive Model (LCM)
 
-**Memory-Decoupled Reasoning · Infinitely Scalable Knowledge · Zero-Parameter Inference Engine · Formally Guaranteed Safety**
-
 ---
 
 **[English](README.md) · [Français](readme/README_fr.md) · [Deutsch](readme/README_de.md) · [Español](readme/README_es.md) · [日本語](readme/README_ja.md) · [中文](readme/README_cn.md)**

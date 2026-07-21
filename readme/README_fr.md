@@ -1,7 +1,5 @@
 # Modèle Cognitif en Treillis (Lattice Cognitive Model, LCM)
 
-**Mémoire et raisonnement découplés · Expansion infinie des connaissances · Moteur d'inférence à zéro paramètre · Garanties de sécurité formelles**
-
 ---
 
 **[English](../README.md) · [Français](README_fr.md) · [Deutsch](README_de.md) · [Español](README_es.md) · [日本語](README_ja.md) · [中文](README_cn.md)**

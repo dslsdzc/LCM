@@ -1,7 +1,5 @@
 # Gitter-Kognitionsmodell (Lattice Cognitive Model, LCM)
 
-**Gedächtnis und Schlussfolgerung entkoppelt · Unbegrenzte Wissenserweiterung · Null-Parameter-Inferenz-Engine · Formale Sicherheitsgarantien**
-
 ---
 
 [English](../README.md) · [Français](README_fr.md) · [Deutsch](README_de.md) · [Español](README_es.md) · [日本語](README_ja.md) · [中文](README_cn.md)

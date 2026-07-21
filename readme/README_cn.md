@@ -1,7 +1,5 @@
 # 晶格认知模型 (Lattice Cognitive Model, LCM)
 
-**记忆与推理解耦 · 知识无限扩容 · 零参数推理引擎 · 形式化安全保障**
-
 ---
 
 **[English](../README.md) · [Français](README_fr.md) · [Deutsch](README_de.md) · [Español](README_es.md) · [日本語](README_ja.md) · [中文](README_cn.md)**

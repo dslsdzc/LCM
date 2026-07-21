@@ -1,7 +1,5 @@
 # 格子認知モデル (Lattice Cognitive Model, LCM)
 
-**記憶と推論の分離 · 知識の無限拡大 · ゼロパラメータ推論エンジン · 形式的な安全性保証**
-
 ---
 
 **[English](../README.md) · [Français](README_fr.md) · [Deutsch](README_de.md) · [Español](README_es.md) · [日本語](README_ja.md) · [中文](README_cn.md)**

@@ -1,7 +1,5 @@
 # Modelo Cognitivo Reticular (Lattice Cognitive Model, LCM)
 
-**Memoria y razonamiento desacoplados · Conocimiento escalable infinitamente · Motor de inferencia de cero parámetros · Garantías de seguridad formales**
-
 ---
 
 **[English](../README.md) · [Français](README_fr.md) · [Deutsch](README_de.md) · Español · [日本語](README_ja.md) · [中文](README_cn.md)**
