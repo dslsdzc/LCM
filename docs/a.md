@@ -300,7 +300,7 @@ LangLCM (a separate 4-layer transformer decoder + 6 codebook soft-read) was prev
 
 ### 4.4 Zero-Parameter Inference Engine
 
-LCM's reasoning process does not depend on neural network weights but is instead performed by a zero-parameter dynamic dataflow inference machine. The inference engine, acting as an independent cognitive computer, receives the fused output `z_q` from the multi-lattice memory and executes multi-step reasoning. Its detailed design is specified in the *Lattice Cognitive Model Inference Engine Specification* (`c.md`).
+LCM's reasoning process does not depend on neural network weights but is instead performed by a zero-parameter dynamic dataflow inference machine. **"Zero-parameter" is literal: the C engine code contains no trainable or updatable weights. Codebooks and W_out are loaded as external data — they are data, not parameters of the engine.** The inference engine, acting as an independent cognitive computer, receives the fused output `z_q` from the multi-lattice memory and executes multi-step reasoning. Its detailed design is specified in the *Lattice Cognitive Model Inference Engine Specification* (`c.md`).
 
 Core characteristics:
 - All reasoning operations are lattice primitives with mathematical definitions (retrieval, binding, low-rank translation, tangent space sliding, etc.).
