@@ -335,7 +335,7 @@ L_lang = cross_entropy(z_q @ W_out, targets)
 
 目标：codebook 条目收敛为稳定的语义-句法基元，使冻结LLM 能独立生成流畅文本。
 
-### 5.2 Stage 2：认知训练
+### 5.2 认知训练（独立流程）
 
 认知系统训练，被动通道 `z_q @ W_out` 和主动通道（Qwen 桥接）联合优化：
 - `L_passive`：被动通道 `z_q @ W_out` 的 CE loss（诚实直接读出）

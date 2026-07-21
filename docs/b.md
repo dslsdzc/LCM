@@ -600,12 +600,16 @@ Core interface:
 
 ### 6.1 Training Stages
 
-The dual LCM architecture has two training stages:
+Current processes (see §5):
 
-| Stage | Training Target | Loss | Goal |
-|-------|---------------|------|------|
-| **Stage 1 (Historical)** | Frozen LLM standalone — deprecated, LangLCM is transitional | `L_lang = CE` | Codebooks converge to semantic-syntactic primitives |
-| **Stage 2** | Cognitive LCM + Qwen bridge joint | `L_total = L_passive + L_active + L_VQ + L_contrast + L_orth` | Cognitive state z_q outputs via dual channels |
+- **Cognitive Training** (`cog_train.py`) — main process, full cognitive system training incl. codebooks
+- **Memory Training** (`train_memory.py`) — auxiliary process, independent codebook updates after deployment (continual learning)
+
+Historical (deprecated):
+
+| Stage | Training Target |
+|-------|---------------|
+| **Stage 1 (Historical)** | Frozen LLM standalone — LangLCM is transitional |
 
 ### 6.2 Stage 1 (Historical): Frozen LLM Loss
 
@@ -615,7 +619,7 @@ L_lang = cross_entropy(z_q @ W_out, targets)
 ```
 All Frozen LLM parameters (encoder + 6 codebooks + fusion + W_out) participate in training with pure gradient updates. No cognitive loop, introspection, or safety modules at this stage.
 
-### 6.3 Stage 2: Dual LCM Joint Loss
+### 6.3 Cognitive Training Loss
 
 ```
 Total loss:
@@ -658,7 +662,7 @@ L_total = L_passive + L_active + L_VQ + L_contrast + L_orth
 - Cognitive LCM: routing lattice codebook `C_route` and projection `W_route`
 - Cognitive LCM: scaling factors `α_i`
 - Cognitive LCM: binding lattice key-value projection matrices `A_k`, `A_v` (reusing low-rank lattice shared basis `V`)
-- **Frozen LLM**: all parameters (encoder + 6 codebooks + fusion + W_out) — Stage 1 independent training, Stage 2 optionally frozen or fine-tuned
+- **Frozen LLM (historical, deprecated)**: all parameters (encoder + 6 codebooks + fusion + W_out) — LangLCM transitional concept
 
 **EMA updated** codebooks:
 - Sparse lattice codebook (γ_sparse)

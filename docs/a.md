@@ -334,7 +334,7 @@ L_lang = cross_entropy(z_q @ W_out, targets)
 
 Goal: codebook entries converge to stable semantic-syntactic primitives, enabling the Frozen LLM to generate fluent text independently.
 
-### 5.2 Stage 2: Cognitive Training
+### 5.2 Cognitive Training (Standalone Process)
 
 Cognitive system training with dual channels: passive (`z_q @ W_out`) and active (Qwen bridge):
 

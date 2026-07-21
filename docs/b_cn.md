@@ -600,12 +600,16 @@ tokens (B, N)
 
 ### 6.1 训练阶段
 
-双LCM 架构分为两个训练阶段：
+当前流程（见 §五）：
 
-| 阶段 | 训练内容 | 损失 | 目标 |
-|------|---------|------|------|
-| **Stage 1（历史）** | 冻结LLM 独立训练——已淘汰，LangLCM 是过渡概念 | `L_lang = CE` | codebook 收敛为语义-句法基元 |
-| **Stage 2** | 认知LCM + Qwen 桥接联合 | `L_total = L_passive + L_active + L_VQ + L_contrast + L_orth` | 认知状态 z_q 通过双通道输出 |
+- **认知训练**（`cog_train.py`）— 主流程，全参数训练认知系统，包括码本
+- **记忆训练**（`train_memory.py`）— 辅助流程，部署后独立更新码本（持续学习）
+
+历史方案（已淘汰）：
+
+| 阶段 | 训练内容 |
+|------|---------|
+| **Stage 1（历史）** | 冻结LLM 独立训练——LangLCM 是过渡概念 |
 
 ### 6.2 Stage 1（历史）：冻结LLM 损失
 
@@ -615,7 +619,7 @@ L_lang = cross_entropy(z_q @ W_out, targets)
 ```
 冻结LLM 所有参数（encoder + 6 codebooks + fusion + W_out）参与训练，纯梯度更新。此阶段没有认知循环、自省、安全检测等模块。
 
-### 6.3 Stage 2：双LCM 联合损失
+### 6.3 认知训练损失
 
 ```
 总损失：
@@ -658,7 +662,7 @@ L_total = L_passive + L_active + L_VQ + L_contrast + L_orth
 - 认知LCM：路由格码本 `C_route` 及投影 `W_route`
 - 认知LCM：缩放因子 `α_i`
 - 认知LCM：绑定格键值投影矩阵 `A_k`, `A_v`（复用低秩格共享基 `V`）
-- **冻结LLM**：所有参数（encoder + 6 codebooks + fusion + W_out）— Stage 1 独立训练，Stage 2 可选冻结或微调
+- **冻结LLM（历史，已淘汰）**：所有参数（encoder + 6 codebooks + fusion + W_out）— LangLCM 过渡概念
 
 **EMA 更新**的码本：
 - 稀疏格码本（γ_sparse）
