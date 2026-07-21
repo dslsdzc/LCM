@@ -288,13 +288,13 @@ z_q = Σ_i w_i · α_i · o_i
 
 `β_val` controls the strength of the value constraint. Finally, LayerNorm stabilizes the distribution. The gradient is fully differentiable throughout.
 
-### 4.3 Active Channel: From Cognitive State to Language
+### 4.3 Active Channel: Continuous Semantic Feedback
 
-The active channel transforms cognitive state `z_q` into fluent natural language. **Not yet formed** — but the formation process has begun.
+The active channel is the **continuous semantic representation** produced by Qwen from cognitive state `z_q`, fed back to the main model to organize the cognitive system's latent space. **Not yet fully formed** — but the formation process has begun.
 
-**Mechanism: Qwen reverse-forms the active channel.** During cognitive training, the Qwen bridge gradient (`L_active`) backpropagates through the cognitive system, forcing z_q to converge in directions useful for language generation. This reverse process is essentially training the active channel — Qwen's output supervision signal is "teaching" the cognitive system how to decode language from its own state. Over time, the cognitive system learns to bypass Qwen and generate accurate semantic output directly from z_q.
+**Mechanism: Qwen reverse-forms the active channel.** z_q is projected via `z_proj` into Qwen's hidden space; Qwen's first 4 decoder layers produce continuous semantic vectors whose gradients backpropagate into the cognitive system, forcing z_q to converge toward semantically structured directions. This reverse process is essentially training the active channel — Qwen's continuous semantic supervision signal "teaches" the cognitive system how to organize a meaningful semantic space. Over time, the cognitive system learns to produce semantically structured z_q and eventually maintains semantic continuity independently, without Qwen.
 
-Current implementation: z_q (256d) is projected to Qwen's 896d hidden space via a trainable `z_proj`, Qwen's first 4 decoder layers generate logits, and the CE loss gradient flows back through Qwen (frozen) to z_q.
+Current implementation: z_q (256d) → `z_proj` → Qwen 896d hidden space → Qwen first 4 decoder layers → logits → CE loss → gradient flows back through Qwen (frozen) to z_q.
 
 LangLCM (a separate 4-layer transformer decoder + 6 codebook soft-read) was previously attempted — a complete LCM instance structurally identical to the Cognitive LCM, with codebooks storing semantic-syntactic primitives. It was abandoned due to insufficient capacity and missing position encoding. **LangLCM is a transitional concept and does not exist in the final architecture.** Code remains in `train/lang_lcm.py` for reference.
 
