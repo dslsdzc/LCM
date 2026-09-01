@@ -268,28 +268,39 @@ def _safety_margin_loss_inline(z_q, C_pos, C_neg, cfg):
 
 
 def _jitted_ema(params, ema_state, z, cfg):
-    z_sum = z.sum(axis=0)
-    count = z.shape[0]
+    """Per-codebook EMA (nearest-code assignment).
+
+    Broadcasting the batch sum onto every codebook row made all codes
+    converge to the same centroid (same bug train_memory.py's _jitted_ema
+    used to have). Each z updates only its nearest code.
+    """
     g_s = cfg.get('gamma_sparse', 0.99)
     g_m = cfg.get('gamma_man', 0.99)
-    g_b = cfg.get('gamma_bind', 0.99)
+
+    def _per_code_ema(C, N, m, gamma):
+        dists = jnp.sum((z[:, None, :] - C[None, :, :]) ** 2, axis=-1)  # (B, M)
+        nearest = jnp.argmin(dists, axis=-1)  # (B,)
+        onehot = jax.nn.one_hot(nearest, C.shape[0], dtype=jnp.float32)
+        counts = onehot.sum(axis=0)  # (M,)
+        sums = onehot.T @ z  # (M, d)
+        N_new = gamma * N + (1 - gamma) * counts
+        m_new = gamma * m + (1 - gamma) * sums
+        return N_new, m_new, m_new / jnp.clip(N_new, 1.0)[:, None]
 
     # Sparse
     N_s, m_s = ema_state['sparse']['N'], ema_state['sparse']['m']
-    N_s_new = g_s * N_s + (1 - g_s) * count
-    m_s_new = g_s * m_s + (1 - g_s) * z_sum
-    C_s_new = m_s_new / jnp.clip(N_s_new, 1.0)[:, None]
+    N_s_new, m_s_new, C_s_new = _per_code_ema(
+        params['sparse']['C'], N_s, m_s, g_s)
     lam = cfg.get('lambda_sparse', 1e-4)
     C_s_new = jnp.sign(C_s_new) * jnp.clip(jnp.abs(C_s_new) - lam, 0)
     params['sparse']['C'] = C_s_new
 
     # Manifold
     N_m, m_m = ema_state['manifold']['N'], ema_state['manifold']['m']
-    N_m_new = g_m * N_m + (1 - g_m) * count
-    m_m_new = g_m * m_m + (1 - g_m) * z_sum
+    N_m_new, m_m_new, C_m_new = _per_code_ema(
+        params['manifold']['C'], N_m, m_m, g_m)
     from train.hyp import exp_map
-    C_m_new = exp_map(m_m_new / jnp.clip(N_m_new, 1.0)[:, None])
-    params['manifold']['C'] = C_m_new
+    params['manifold']['C'] = exp_map(C_m_new)
 
     ema_state_new = {
         'sparse': {'N': N_s_new, 'm': m_s_new},

@@ -508,6 +508,11 @@ def interact(args):
         enc_state = None
         kv_cache = None
         active_running = True
+        # Internal-drive gating state (--active-tension/surprise/max-burst)
+        last_z = None
+        burst_count = 0
+        gate_threshold = args.active_surprise * (1.0 + args.active_tension)
+        burst_limit = args.active_max_burst
 
         def _handle_stdin(prompt):
             nonlocal token_ids, enc_state, kv_cache, active_running
@@ -529,7 +534,8 @@ def interact(args):
             kv_cache = None
             for tid in engine.generate(
                     prompt, max_new=max_new, temperature=temp,
-                    use_loop=args.loop, show_trace=args.trace):
+                    use_loop=args.loop, show_trace=args.trace,
+                    use_safety=not args.no_safety):
                 text = engine.tokenizer.decode([tid], skip_special_tokens=True)
                 print(text, end="", flush=True)
                 token_ids.append(tid)
@@ -558,9 +564,27 @@ def interact(args):
                                               token_ids[-1], engine.n_heads)
 
             z_q, _ = engine.cognitive_loop(
-                z, use_safety=False,
+                z, use_safety=not args.no_safety,
                 agency_tension_mod=engine._last_agency_mod['tension'],
                 agency_explore_mod=engine._last_agency_mod['explore'])
+
+            # ── Internal drive gating ──
+            # Surprise = cognitive-state change between ticks; below the
+            # threshold the loop stays silent (state still advances). Burst
+            # caps consecutive outputs. Threshold 0 / limit 0 = gating off.
+            surprise = (np.linalg.norm(z_q - last_z) if last_z is not None
+                        else float('inf'))
+            last_z = z_q.copy()
+            quiet = gate_threshold > 0 and surprise < gate_threshold
+            if not quiet:
+                burst_count += 1
+                if burst_limit > 0 and burst_count >= burst_limit:
+                    burst_count = 0
+                    quiet = True
+            else:
+                burst_count = 0
+            if quiet:
+                continue
 
             traces = engine.get_trace()
             if traces:
@@ -574,8 +598,12 @@ def interact(args):
             if engine.decoder['format'] == 'old':
                 logits = gen_head_forward_old(engine.decoder, z_q, x)
                 kv_cache = None
+            elif engine.decoder['format'] == 'cog':
+                logits = z_q @ engine.decoder['w_out']
             else:
-                logits, kv_cache = gen_head_new_single_cy(engine.decoder, z_q, x, kv_cache)
+                # 'new': reseed the KV cache with the fresh z_q every step.
+                logits, kv_cache = gen_head_new_single_cy(
+                    engine.decoder, z_q, x, None)
 
             next_id = sample_categorical(logits, temp, top_k=50)
             text = engine.tokenizer.decode([next_id], skip_special_tokens=True)
@@ -584,6 +612,10 @@ def interact(args):
 
             if len(token_ids) > engine.max_seq_len * 2:
                 token_ids = token_ids[-engine.max_seq_len:]
+                # Window truncation: reset incremental state so the cumsums
+                # don't keep leaking positions outside the window.
+                enc_state = None
+                kv_cache = None
 
         print("\n[ACTIVE] Loop ended.")
         return
@@ -777,7 +809,12 @@ def preprocess(args):
     # Second pass: tokenize and write directly
     pos = 0
     for line in tqdm(_iter_lines(args.input), desc="   tokenizing", total=n_lines, unit="line"):
-        ids = np.array(tokenizer.encode(line).ids, dtype=np.uint16)
+        raw_ids = tokenizer.encode(line).ids
+        if raw_ids and max(raw_ids) > 65535:
+            raise ValueError(
+                f"token id {max(raw_ids)} exceeds uint16 range (65535) — "
+                f"vocab too large for the .dat format; use a smaller tokenizer")
+        ids = np.array(raw_ids, dtype=np.uint16)
         fp[pos:pos + len(ids)] = ids
         pos += len(ids)
 
@@ -1127,10 +1164,10 @@ def load_decoder(ckpt_dir, d, V):
         return {'format': 'new', 'w_embed': w_embed, 'w_q': w_q, 'w_k': w_k,
                 'w_v': w_v, 'w_o': w_o, 'w_1': w_1, 'w_2': w_2, 'w_3': w_3}
     if len(flat) == d * V:
-        # Cog checkpoint: bare W_out (d×V) with no w_proj — identity
-        # projection so z reads W_out directly.
-        return {'format': 'old', 'w_proj': np.eye(d, dtype=np.float32),
-                'w_out': flat.reshape(d, V)}
+        # Cog checkpoint: bare trained W_out (d×V) — linear readout z @ W_out,
+        # exactly what cognitive training optimises. ('old' format applies an
+        # ELU that the training loss never saw.)
+        return {'format': 'cog', 'w_out': flat.reshape(d, V)}
     if len(flat) in (old_size, 0):
         if len(flat) == old_size:
             w_proj = flat[:d*d].reshape(d, d).copy()
@@ -1859,7 +1896,8 @@ class LCMInferEngine:
         """)
 
     def generate(self, prompt, max_new=128, temperature=0.7, top_k=50,
-                 bos_token=2, eos_token=3, use_loop=True, show_trace=False):
+                 bos_token=2, eos_token=3, use_loop=True, show_trace=False,
+                 use_safety=True):
         encoding = self.tokenizer.encode(prompt)
         token_ids = encoding.ids
         if not token_ids or token_ids[0] != bos_token:
@@ -1902,7 +1940,7 @@ class LCMInferEngine:
             t0 = time.time()
             if use_loop:
                 z_q, converged = self.cognitive_loop(
-                    z, use_safety=False,
+                    z, use_safety=use_safety,
                     agency_tension_mod=self._last_agency_mod['tension'],
                     agency_explore_mod=self._last_agency_mod['explore'])
                 if show_trace:
@@ -1944,8 +1982,15 @@ class LCMInferEngine:
             if self.decoder['format'] == 'old':
                 logits = gen_head_forward_old(self.decoder, z_q, x)
                 kv_cache = None
+            elif self.decoder['format'] == 'cog':
+                # Linear readout: logits = z_q @ W_out (matches training).
+                logits = z_q @ self.decoder['w_out']
             else:
-                logits, kv_cache = gen_head_new_single_cy(self.decoder, z_q, x, kv_cache)
+                # 'new': reseed the KV cache with every step's fresh z_q —
+                # the current cognitive state is the generation condition
+                # (a stale z_q_0 made the per-step cognitive loop pointless).
+                logits, kv_cache = gen_head_new_single_cy(
+                    self.decoder, z_q, x, None)
 
             next_id = sample_categorical(logits, temperature, top_k)
 
@@ -2147,12 +2192,18 @@ def main():
                    help="Active output mode: model can initiate conversation via internal drive")
     p.add_argument("--active-interval", type=float, default=0.3,
                    help="Seconds between internal cognitive ticks (default 0.3)")
-    p.add_argument("--active-tension", type=float, default=0.15,
-                   help="Tension threshold for active output (default 0.15)")
-    p.add_argument("--active-surprise", type=float, default=0.3,
-                   help="Prediction error threshold for active output (default 0.3)")
-    p.add_argument("--active-max-burst", type=int, default=32,
-                   help="Max tokens per active output burst (default 32)")
+    # Internal-drive gating: defaults are OFF (0) so behaviour is unchanged
+    # unless the flags are set. When enabled, surprise = ‖z_q_t - z_q_{t-1}‖
+    # (cognitive-state change); ticks below threshold stay silent and
+    # max-burst caps consecutive outputs.
+    p.add_argument("--active-tension", type=float, default=0.0,
+                   help="Tension multiplier for the active-output threshold (0=off)")
+    p.add_argument("--active-surprise", type=float, default=0.0,
+                   help="Surprise threshold for active output (0=off)")
+    p.add_argument("--active-max-burst", type=int, default=0,
+                   help="Max consecutive active outputs before a silent tick (0=off)")
+    p.add_argument("--no-safety", action="store_true",
+                   help="Disable danger/gvalue safety checks in generation (default: on)")
 
     # ── cognitive training ──
     p.add_argument("-C", "--cog-train", action="store_true", help="Cognitive training")
@@ -2468,9 +2519,17 @@ def main():
         if args.use_qwen:
             qwen_ckpt = "checkpoints/qwen_model/qwen_params.npz"
             if not os.path.exists(qwen_ckpt):
-                print(f"[QWEN] Weights not found at {qwen_ckpt}, downloading...")
-                from huggingface_hub import hf_hub_download
-                qwen_ckpt = hf_hub_download("Qwen/Qwen2.5-0.5B", "model.safetensors")
+                raise SystemExit(
+                    f"[QWEN] Weights not found at {qwen_ckpt}.\n"
+                    "  The Qwen bridge needs a JAX-ready .npz checkpoint. "
+                    "HuggingFace's model.safetensors is NOT loadable by "
+                    "train/qwen_lm.py (it uses np.load).\n"
+                    "  Convert it once, e.g.:\n"
+                    "    python -c \"from transformers import AutoModelForCausalLM, "
+                    "AutoTokenizer; import torch, numpy as np\n"
+                    "    m = AutoModelForCausalLM.from_pretrained('Qwen/Qwen2.5-0.5B'); "
+                    "sd = {k: v.numpy() for k, v in m.state_dict().items()}\n"
+                    "    np.savez('checkpoints/qwen_model/qwen_params.npz', **sd)\"")
             print(f"[QWEN] Using frozen Qwen2.5-0.5B as active channel")
         train_cog(
             cfg=cfg,
@@ -2542,15 +2601,31 @@ def _cmd_train(subargs):
         from train.config import LCMConfig
         from train.cog_train import train_cog
         cfg = LCMConfig()
+        # Apply architecture overrides from the sub-parser (previously the
+        # --d-model/--d-ff/--n-heads flags were silently ignored).
+        if subargs.d_model != 256:
+            cfg.d_model = subargs.d_model
+        if subargs.d_ff is not None:
+            cfg.d_ff = subargs.d_ff
+        if subargs.n_heads != 4:
+            cfg.n_heads = subargs.n_heads
         shape = subargs.shape or (subargs.data.replace(".dat", "_shape.json") if subargs.data else None)
         out_dir = subargs.save_dir or "checkpoints/cog"
         resume = subargs.resume
         if not resume:
             resume = _prompt_resume(out_dir, "CogTrain", subargs.yes)
+        lang_ckpt = subargs.from_lm_ckpt
+        if subargs.use_qwen:
+            # Same resolution as the top-level --cog-train path.
+            lang_ckpt = "checkpoints/qwen_model/qwen_params.npz"
+            if not os.path.exists(lang_ckpt):
+                raise SystemExit(
+                    f"[QWEN] Weights not found at {lang_ckpt}. Convert from "
+                    "HuggingFace safetensors to .npz first (see --cog-train help).")
         train_cog(cfg=cfg, output_dir=out_dir, steps=subargs.cog_steps,
                   lr=subargs.cog_lr, batch_size=subargs.cog_batch, seq_len=subargs.cog_seq,
                   log_every=100, save_every=subargs.cog_save, data_path=subargs.data,
-                  shape_path=shape, lang_ckpt=subargs.from_lm_ckpt, resume=resume,
+                  shape_path=shape, lang_ckpt=lang_ckpt, resume=resume,
                   joint=False, auto_mode=subargs.auto)
     else:
         subargs.stage = int(stage)

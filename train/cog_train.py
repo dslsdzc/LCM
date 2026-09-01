@@ -131,13 +131,16 @@ def _load_qwen_checkpoint(qwen_path, params, d=256):
     if _QWEN_PARAMS is None:
         _QWEN_PARAMS = load_qwen_params(qwen_path)
     params['qwen'] = _QWEN_PARAMS
-    # Trainable projection: z_q (d=256) → Qwen hidden (896)
-    rng = jax.random.PRNGKey(42)
-    qwen_d = QWEN_CONFIG['d_model']
-    params['z_proj'] = jax.random.normal(rng, (qwen_d, d)) * (d ** -0.5)
+    # Trainable projection: z_q (d=256) → Qwen hidden (896).
+    # Only initialise when the checkpoint lacks it — a resumed run must keep
+    # the z_proj it already trained.
+    if 'z_proj' not in params:
+        rng = jax.random.PRNGKey(42)
+        qwen_d = QWEN_CONFIG['d_model']
+        params['z_proj'] = jax.random.normal(rng, (qwen_d, d)) * (d ** -0.5)
     n_layers = QWEN_CONFIG['n_layers']
-    print(f"[COG] Frozen Qwen2.5-0.5B ({n_layers}x{qwen_d}) loaded as active channel")
-    print(f"[COG]  z_proj: ({qwen_d}, {d}) trainable")
+    print(f"[COG] Frozen Qwen2.5-0.5B ({n_layers}x{QWEN_CONFIG['d_model']}) loaded as active channel")
+    print(f"[COG]  z_proj: {'kept from checkpoint' if 'z_proj' in params else 'initialised'}")
 
 
 def init_cog_params(cfg, rng, lang_ckpt=None, resume=None):
@@ -194,7 +197,10 @@ def init_cog_params(cfg, rng, lang_ckpt=None, resume=None):
         print("[COG] Warning: no Language LCM checkpoint provided; active channel disabled")
         params['lang_lcm'] = None
         params['qwen'] = None
-        params['z_proj'] = None
+        # Keep a trained z_proj from a resumed checkpoint: a later resume with
+        # a Qwen npz must not discard the projection it already trained.
+        if 'z_proj' not in params:
+            params['z_proj'] = None
 
     return params, self_state
 
@@ -598,7 +604,8 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     final_dir = os.path.join(output_dir, f"step_{steps:06d}")
     save_cog_checkpoint(params, final_dir, steps, self_state=self_state)
     if sup and sup.best_params is not None:
-        sup.save_best(sup.best_params, sup.best_opt_state, sup.best_step)
+        sup.save_best(sup.best_params, sup.best_opt_state, sup.best_step,
+                      self_state=self_state)
     print(f"[COG] Training complete → {output_dir}/")
 
 
@@ -659,7 +666,11 @@ def save_cog_checkpoint(params, output_dir, step, self_state=None):
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
 
-    ckpt = jax.tree_util.tree_map(_to_np, params)
+    # Exclude the frozen Qwen weights from the pickle (≈2GB): they are
+    # reloaded from the .npz on demand (see _load_qwen_checkpoint). The
+    # trainable z_proj IS saved — resume must keep it.
+    save_params = {k: v for k, v in params.items() if k != 'qwen'}
+    ckpt = jax.tree_util.tree_map(_to_np, save_params)
     with open(os.path.join(output_dir, "cog_params.pkl"), "wb") as f:
         pickle.dump({'params': ckpt, 'step': step, 'self_state': self_state}, f)
 
@@ -800,13 +811,16 @@ def save_cog_checkpoint(params, output_dir, step, self_state=None):
             _f.write(_hl.sha256(_data).digest())
     except Exception as e:
         print(f"[CKPT] gvalue write skipped: {e}")
-    # danger codebook (dummy — random placeholder, values NOT trained; the
-    # danger lattice is not part of cognitive training yet)
+    # danger codebook (dummy placeholder, values NOT trained; the danger
+    # lattice is not part of cognitive training yet). Identical halves with a
+    # fixed seed → danger_score ≡ 0 → no spurious blocks, deterministic export.
+    # Matches checkpoint._save_danger.
     try:
         import zlib as _zl
         M_d = cfg.get("M_danger", 256)
+        _np.random.seed(0)
         danger_t = _np.random.randn(M_d, d).astype(_np.float32) * 0.02
-        danger_n = _np.random.randn(M_d, d).astype(_np.float32) * 0.02
+        danger_n = danger_t.copy()
         _data_d = danger_t.tobytes() + danger_n.tobytes()
         _sha_d = _hl.sha256(_data_d).digest()
         _crc_d = _zl.crc32(_data_d) & 0xFFFFFFFF

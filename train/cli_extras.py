@@ -147,9 +147,6 @@ def cmd_eval_ppl(args):
               file=sys.stderr)
         return
 
-    enc_params = _load_encoder(enc_path, lcfg)
-    dec_params = _load_decoder(dec_path, lcfg)
-
     data_path = getattr(args, 'data', None)
     if not data_path or not os.path.exists(data_path):
         for c in [cfg.get("data_path", ""), "data/zhwiki_tokens.dat",
@@ -168,7 +165,13 @@ def cmd_eval_ppl(args):
     data_iter = WikiDataIter(data_path, shape_path, B=1, N=lcfg.max_seq_len)
 
     from train.model import forward as model_forward
-    params = {"encoder": enc_params, "gen_head": dec_params}
+    # Full model params: encoder+decoder alone is NOT enough — train/model.py
+    # forward touches route/hrq/sparse/lowrank/manifold/binding/contrast/
+    # fusion and would KeyError. load_checkpoint assembles the complete tree
+    # (missing codebooks get re-initialised; the config comes from the
+    # checkpoint's own config.json).
+    from train.checkpoint import load_checkpoint
+    params, _, _, _ = load_checkpoint(ckpt, load_opt=False)
 
     def _eval_step(params, batch):
         inputs, targets = batch
@@ -533,7 +536,7 @@ def cmd_chat(args):
 
     history = []
     max_new = int(getattr(args, 'max_new', 128))
-    temp = float(getattr(args, 'temperature', 0.7))
+    temp = float(getattr(args, 'temp', 0.7))
 
     def _format_prompt(history):
         lines = []

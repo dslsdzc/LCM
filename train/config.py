@@ -119,7 +119,12 @@ class LCMConfig:
     # Inference engine (C)
     max_inference_steps: int = 32
     convergence_tol: float = 1e-3
-    entropy_threshold: float = 0.5
+    # 2.0 ≈ ln(7)+ε: uniform fusion entropy (≈1.95) never trips it, so the
+    # entropy gate is effectively disabled — convergence is driven by
+    # convergence_tol only. Aligned with infer/lcm.h LCM_ENTROPY_THRESHOLD.
+    # (0.5 used to make the convergence bonus in cog_train dead code: fusion
+    # entropy ≈ ln(6) ≈ 1.79 could never drop below it.)
+    entropy_threshold: float = 2.0
     max_retrievals_per_step: int = 12
 
     # Reflection loop (轨迹审计器)

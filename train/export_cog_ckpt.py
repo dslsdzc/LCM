@@ -83,7 +83,7 @@ def export(ckpt_dir: str, out_dir: str, data_dir: str = "data"):
         "n_self_codes": params.get("self", {}).get("modes", np.zeros((64, 1))).shape[0],
         "max_inference_steps": 32,
         "convergence_tol": 1e-3,
-        "entropy_threshold": 0.5,
+        "entropy_threshold": 2.0,
         "tau_route": 0.5,
         "beta_vq": 0.25,
         "gamma_sparse": 0.99,
@@ -282,10 +282,14 @@ def export(ckpt_dir: str, out_dir: str, data_dir: str = "data"):
         f.write(sha_gv)
     print(f"[EXPORT] gvalue_codebook.bin → {out_dir}/")
 
-    # danger codebook (dummy)
+    # danger codebook (dummy placeholder, values NOT trained; the danger
+    # lattice is not part of cognitive training yet). Identical halves with a
+    # fixed seed → danger_score ≡ 0 → no spurious blocks, deterministic export.
+    # Matches checkpoint._save_danger and cog_train's export.
     M_danger = cfg.get('M_danger', 256)
+    np.random.seed(0)
     danger_t = np.random.randn(M_danger, d_model).astype(np.float32) * 0.02
-    danger_n = np.random.randn(M_danger, d_model).astype(np.float32) * 0.02
+    danger_n = danger_t.copy()
     data_danger = danger_t.tobytes() + danger_n.tobytes()
     sha_danger = hashlib.sha256(data_danger).digest()
     crc_danger = zlib.crc32(data_danger) & 0xFFFFFFFF
