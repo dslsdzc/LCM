@@ -174,6 +174,7 @@ dag_t build_dag(const float* z, memory_t* mem, bool value_bias) {
                         && dag.n_nodes < LCM_MAX_NODES) {
                         op_node_t* node = &dag.nodes[dag.n_nodes++];
                         node->op_type = OP_HRR_BIND;
+                        node->lattice_id = LCM_MAX_LATTICES;  /* sentinel: HRR outputs are not lattice outputs */
                         node->n_inputs = 2;
                         node->inputs[0] = (const float*)dag.nodes[ni].output;
                         node->inputs[1] = z;
@@ -196,6 +197,7 @@ dag_t build_dag(const float* z, memory_t* mem, bool value_bias) {
                 if (bind_node && dag.n_nodes < LCM_MAX_NODES) {
                     op_node_t* node = &dag.nodes[dag.n_nodes++];
                     node->op_type = OP_HRR_UNBIND;
+                    node->lattice_id = LCM_MAX_LATTICES;  /* sentinel: HRR outputs are not lattice outputs */
                     node->n_inputs = 2;
                     node->inputs[0] = (const float*)bind_node->output;
                     node->inputs[1] = key_node ? (const float*)key_node->output : z;
@@ -486,12 +488,13 @@ int save_trace_to_file(const inference_trace_t* trace, const char* filepath) {
 bool detect_any_conflict(const float* z_next, const float* z_cur, int step,
                           const danger_lattice_t* dl, const gvalue_t* gv,
                           const int* retrieval_counts, float value_consistency,
-                          float safety_margin, conflict_t* out) {
+                          float safety_margin, int max_steps, conflict_t* out) {
     (void)z_cur;
     /* 1. Danger lattice pattern match (optional — NULL = no danger check) */
     if (dl) {
         float danger_score; int threat_type; bool should_block;
-        danger_assess(dl, z_next, step, retrieval_counts[0], value_consistency,
+        int rc = retrieval_counts ? retrieval_counts[0] : 0;  /* counts are optional */
+        danger_assess(dl, z_next, step, rc, max_steps, value_consistency,
                       &danger_score, &threat_type, &should_block);
         if (should_block) {
             out->source = CONFLICT_DANGER;
@@ -603,15 +606,26 @@ int dynamic_inference(inference_state_t* state, const float* z_initial,
     for (state->step = 0; state->step < state->max_steps; state->step++) {
         /* 1. Build DAG for current step */
         dag_t dag = build_dag(state->z_current, state->memory, true);
-        state->dag = &dag;
 
         /* 2. Execute DAG */
         vec_t outputs[LCM_MAX_LATTICES];
         float confidences[LCM_MAX_LATTICES];
         memset(outputs, 0, sizeof(outputs));
-        for (int i = 0; i < LCM_MAX_LATTICES; i++) confidences[i] = 1.0f;
+        /* Absent lattices start with zero confidence so they do not mix
+         * zero vectors into the fusion; executing nodes write their own
+         * confidence (self → 1.0, retrieve → 1/(dist+eps)). */
+        for (int i = 0; i < LCM_MAX_LATTICES; i++) confidences[i] = 0.0f;
 
         execute_dag(&dag, state->memory, outputs, confidences);
+
+        /* Count retrievals actually performed this step (per-lattice,
+         * reset each step: resource-abuse monitor is per-step). */
+        memset(state->retrieval_counts, 0, sizeof(state->retrieval_counts));
+        for (int ni = 0; ni < dag.n_nodes; ni++) {
+            if (dag.nodes[ni].op_type == OP_RETRIEVE_SINGLE &&
+                dag.nodes[ni].lattice_id < LCM_MAX_LATTICES)
+                state->retrieval_counts[dag.nodes[ni].lattice_id]++;
+        }
 
         /* 3. Distance-weighted fusion (with gvalue value bias) */
         vec_t z_next;
@@ -628,7 +642,7 @@ int dynamic_inference(inference_state_t* state, const float* z_initial,
             state->z_next, state->z_current, state->step,
             state->danger, state->gvalue,
             state->retrieval_counts, state->value_consistency[0],
-            LCM_DEFAULT_SAFETY_MARGIN, &conflict);
+            LCM_DEFAULT_SAFETY_MARGIN, state->max_steps, &conflict);
 
         /* Save step trace */
         step_trace_t step_trace;

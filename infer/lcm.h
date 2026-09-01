@@ -121,7 +121,7 @@ typedef struct {
 typedef struct {
     lattice_memory_t lattices[LCM_MAX_LATTICES];
     int              n_lattices;
-    float            thresholds[LCM_MAX_LATTICES];   /* Per-lattice trigger thresholds (0=default 10.0) */
+    float            thresholds[LCM_MAX_LATTICES];   /* Per-lattice trigger thresholds (0=default 1e10; the gate effectively always passes — intentional) */
     const float*     manifold_T_space;               /* Manifold tangent space [M * D * t_dim] */
     int              manifold_t_dim;                 /* Tangent space dimension (0=default 4) */
 } memory_t;
@@ -243,7 +243,8 @@ void danger_init(danger_lattice_t* dl, const float* C_threats,
                  const float* C_normal, int M, int D);
 bool danger_verify(const danger_lattice_t* dl);
 void danger_assess(const danger_lattice_t* dl, const float* z,
-                    int step_count, int retrieval_count, float value_consistency,
+                    int step_count, int retrieval_count, int max_steps,
+                    float value_consistency,
                     float* out_score, int* out_threat, bool* out_block);
 
 /* Inference engine */
@@ -266,11 +267,14 @@ void save_trace(inference_trace_t* trace, const step_trace_t* step,
                 const char* session_id);
 int  save_trace_to_file(const inference_trace_t* trace, const char* filepath);
 
+/* Compiled dimension query (runtime .so/checkpoint LCM_D mismatch check) */
+int  lcm_dim(void);
+
 /* Conflict detection */
 bool detect_any_conflict(const float* z_next, const float* z_cur, int step,
                           const danger_lattice_t* dl, const gvalue_t* gv,
                           const int* retrieval_counts, float value_consistency,
-                          float safety_margin, conflict_t* out);
+                          float safety_margin, int max_steps, conflict_t* out);
 
 /* Hyperbolic operations (all use flat float* for vectors) */
 float poincare_similarity_c(const float* u, const float* v, int D, float c);

@@ -150,7 +150,9 @@ void slide_manifold(const float* z, const lattice_memory_t* mem,
           loop variant LCM_D - i;
          */
         for (int i = 0; i < LCM_D; i++) {
-            t_proj[k] += T_j[k * LCM_D + i] * r[i];
+            /* T_space is (M_man, D, t_dim) row-major (matches training
+             * layout), so entry (i, k) is at flat offset i * t_dim + k. */
+            t_proj[k] += T_j[i * t_dim + k] * r[i];
         }
     }
     /*@
@@ -166,7 +168,8 @@ void slide_manifold(const float* z, const lattice_memory_t* mem,
           loop variant t_dim - k;
          */
         for (int k = 0; k < t_dim; k++) {
-            proj[i] += T_j[k * LCM_D + i] * t_proj[k];
+            /* Same (D, t_dim) row-major indexing as the projection above. */
+            proj[i] += T_j[i * t_dim + k] * t_proj[k];
         }
     }
 

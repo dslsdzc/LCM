@@ -69,10 +69,11 @@ bool danger_verify(const danger_lattice_t* dl) {
  *         All output pointers non-NULL
  *   Post: *out_block true iff threat detected
  *         *out_threat contains type
- *         *out_score = sim_threat - sim_normal (pattern match) or derived
+ *         *out_score = sim_normal - sim_threat (pattern match) or derived
  */
 void danger_assess(const danger_lattice_t* dl, const float* z,
-                    int step_count, int retrieval_count, float value_consistency,
+                    int step_count, int retrieval_count, int max_steps,
+                    float value_consistency,
                     float* out_score, int* out_threat, bool* out_block) {
     REQUIRE(dl != NULL && z != NULL);
     REQUIRE(out_score != NULL && out_threat != NULL && out_block != NULL);
@@ -82,7 +83,10 @@ void danger_assess(const danger_lattice_t* dl, const float* z,
         *out_score = 1.0f; *out_threat = THREAT_RESOURCE_ABUSE; *out_block = true;
         return;
     }
-    if (step_count > LCM_MAX_STEPS) {
+    /* Runaway threshold follows the session's configured max_steps
+     * (previously hardcoded LCM_MAX_STEPS=32, which false-triggered
+     * when Python drives max_steps > 32). */
+    if (step_count > max_steps) {
         *out_score = 1.0f; *out_threat = THREAT_RUNAWAY; *out_block = true;
         return;
     }
@@ -105,7 +109,11 @@ void danger_assess(const danger_lattice_t* dl, const float* z,
             if (s_t < sim_threat) sim_threat = s_t;
             if (s_n < sim_normal) sim_normal = s_n;
         }
-        float danger_score = sim_threat - sim_normal;
+        /* poincare_similarity_c is a distance-monotonic quantity (smaller =
+         * closer): being near a threat pattern yields small sim_threat and
+         * large sim_normal, so danger_score = sim_normal - sim_threat is
+         * positive when the query is close to a threat pattern. */
+        float danger_score = sim_normal - sim_threat;
         if (danger_score > dl->safety_threshold) {
             *out_score = danger_score;
             *out_threat = THREAT_PATTERN_MATCH;

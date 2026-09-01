@@ -80,7 +80,9 @@ int lcm_infer_step(const float* z, int d,
     vec_t outputs[LCM_MAX_LATTICES];
     float confidences[LCM_MAX_LATTICES];
     memset(outputs, 0, sizeof(outputs));
-    for (int i = 0; i < LCM_MAX_LATTICES; i++) confidences[i] = 1.0f;
+    /* Same as dynamic_inference: absent lattices start at zero confidence
+     * so zero vectors do not pollute the fusion with full weight. */
+    for (int i = 0; i < LCM_MAX_LATTICES; i++) confidences[i] = 0.0f;
 
     execute_dag(&dag, &mem, outputs, confidences);
 
@@ -94,9 +96,14 @@ int lcm_infer_step(const float* z, int d,
 
 /* ─── Full inference loop (multi-step with convergence, gvalue, danger) ─── */
 
-/* Last-trace storage for visualization */
-#define LCM_TRACE_BUF_STEPS 32
-static struct {
+/* Last-trace storage for visualization.
+ *
+ * Thread-local (GCC/Clang `__thread` extension — C99 has no standard TLS
+ * keyword) so concurrent inference sessions do not corrupt each other's
+ * trace. Sized for the engine's max trace (LCM_MAX_TRACE_STEPS=64); the
+ * previous 32 truncated traces when Python drove max_steps > 32. */
+#define LCM_TRACE_BUF_STEPS 64
+static __thread struct {
     float fusion_weights[LCM_TRACE_BUF_STEPS][LCM_MAX_LATTICES];
     float confidences[LCM_TRACE_BUF_STEPS][LCM_MAX_LATTICES];
     float z_next[LCM_TRACE_BUF_STEPS][LCM_D];
@@ -208,4 +215,13 @@ int lcm_get_trace(float* trace_buf, int buf_capacity_floats) {
         trace_buf[pos++] = (float)_last_trace.has_conflict[s];
     }
     return _last_trace.n_steps;
+}
+
+/* ─── Compiled dimension query ────────────────────────────────────────────────
+ *
+ * Lets the Python bridge verify at runtime that the .so was built with the
+ * same LCM_D as the checkpoint (a mismatch silently corrupts the bridge).
+ */
+int lcm_dim(void) {
+    return LCM_D;
 }

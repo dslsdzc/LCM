@@ -122,7 +122,9 @@ void log_map_c(const float* y, float* out, int D, float c) {
     for (int i = 0; i < D; i++) norm += y[i] * y[i];
     /*@ assert norm >= 1e-8f; */
     norm = sqrtf(norm);
-    float n_clip = norm < 0.999f ? norm : 0.999f;
+    /* Clip in the atanh domain: |t| = sqrtf(c) * n_clip < 1, so the cap is
+     * 0.999/sqrtf(c), not 0.999 (which overflows to NaN when c > 1.001). */
+    float n_clip = norm < 0.999f / sqrtf(c) ? norm : 0.999f / sqrtf(c);
     /*@ assert n_clip > 0.0f; */
     float t = sqrtf(c) * n_clip;
     /*@ assert t < 1.0f; */  /* atanh domain: |t| < 1 */

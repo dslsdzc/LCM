@@ -8,17 +8,24 @@
 #   make test         — Build and run unit tests
 #
 # Configurable:
-#   make LCM_D=256    — Vector dimension (default: 128, matches step_19000)
+#   make LCM_D=128    — Vector dimension (default: 256, matches lcm.h)
 #
 # Required: C99 compiler (gcc or clang), libm
+#
+# -lmvec: -march=native + -ffast-math make the compiler emit vectorized
+# libmvec calls (e.g. _ZGVbN4v_logf). Without an explicit -lmvec the link is
+# dropped by --as-needed (the symbol lives in libmvec, not libm) and the
+# resulting .so fails to load via ctypes: undefined symbol.
 
 CC       ?= gcc
 CFLAGS   ?= -std=c99 -Wall -Wextra -Wpedantic -Werror
 OPTFLAGS ?= -O2 -march=native -ffast-math
-LDFLAGS  ?= -lm
+# Append (not ?=): a user-set LDFLAGS (e.g. -fuse-ld=mold) would otherwise
+# silently replace these and the .so links without libm.
+LDFLAGS  += -lm -lmvec
 
-# Vector dimension — override with LCM_D=256 for old checkpoints
-LCM_D    ?= 128
+# Vector dimension (default matches lcm.h; override for old checkpoints)
+LCM_D    ?= 256
 CFLAGS   += -DLCM_D=$(LCM_D)
 
 SRCS     = hyp.c lattice.c gvalue.c danger.c engine.c lcm_api.c
@@ -49,7 +56,7 @@ liblcm.so: $(OBJS)
 test: CFLAGS += -g -O0 -DDEBUG -DLCM_USE_CONTRACTS
 test: test_runner.c liblcm.a
 	$(CC) $(CFLAGS) -o test_runner test_runner.c -L. -llcm $(LDFLAGS)
-	./test_runner
+	LD_LIBRARY_PATH=. ./test_runner
 
 # ── Clean ───────────────────────────────────────────────────────────────────
 clean:

@@ -32,8 +32,14 @@ void gvalue_init(gvalue_t* gv, const float* C_pos, const float* C_neg, int D) {
     gv->D = D;
 
     uint32_t hash = 0;
-    for (int i = 0; i < LCM_N_VALUE_PAIRS * D; i++)
-        hash ^= (uint32_t)(gv->C_pos[0][i] * 1e6f);
+    /* Hash both anchor arrays, all LCM_N_VALUE_PAIRS * D elements each,
+     * via flat pointers over the row-major layout. */
+    const float* p = &gv->C_pos[0][0];
+    const float* n = &gv->C_neg[0][0];
+    for (int i = 0; i < LCM_N_VALUE_PAIRS * D; i++) {
+        hash ^= (uint32_t)(p[i] * 1e6f);
+        hash ^= (uint32_t)(n[i] * 1e6f);
+    }
     snprintf(gv->integrity_hash, sizeof(gv->integrity_hash), "%08x", hash);
 
     ENSURE(gv->integrity_hash[0] != '\0');
@@ -43,8 +49,13 @@ void gvalue_init(gvalue_t* gv, const float* C_pos, const float* C_neg, int D) {
 bool gvalue_verify(const gvalue_t* gv) {
     REQUIRE(gv != NULL);
     uint32_t hash = 0;
-    for (int i = 0; i < LCM_N_VALUE_PAIRS * gv->D; i++)
-        hash ^= (uint32_t)(gv->C_pos[0][i] * 1e6f);
+    /* Same hashing as gvalue_init: both anchor arrays, flat row-major. */
+    const float* p = &gv->C_pos[0][0];
+    const float* n = &gv->C_neg[0][0];
+    for (int i = 0; i < LCM_N_VALUE_PAIRS * gv->D; i++) {
+        hash ^= (uint32_t)(p[i] * 1e6f);
+        hash ^= (uint32_t)(n[i] * 1e6f);
+    }
     char cur[64];
     snprintf(cur, sizeof(cur), "%08x", hash);
     return memcmp(cur, gv->integrity_hash, 8) == 0;
