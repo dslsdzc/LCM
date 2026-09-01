@@ -61,3 +61,6 @@ be/
 .env
 .env.*
 zhwiki_tokens_shape.json
+
+# --- Token data metadata (regenerated locally) ---
+*_tokens_shape.json
