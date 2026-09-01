@@ -219,11 +219,12 @@ def test_decoder_bin_bare_wout():
     w = np.random.randn(d, V).astype(np.float32)
     w.tofile(os.path.join(tmp, "decoder.bin"))
     dec = lcm_mod.load_decoder(tmp, d, V)
-    assert dec['format'] == 'old'
-    assert np.allclose(dec['w_proj'], np.eye(d)), "w_proj must be identity"
+    # Sweep-3: bare W_out now loads as 'cog' — linear readout (no ELU the
+    # training loss never saw).
+    assert dec['format'] == 'cog', f"format={dec['format']}, expected 'cog'"
     assert dec['w_out'].shape == (d, V)
     assert np.allclose(dec['w_out'], w)
-    print("  #7 OK: bare d×V decoder.bin → identity w_proj + w_out")
+    print("  #7 OK: bare d×V decoder.bin → 'cog' linear readout")
 
 
 # ── #13: CRC mismatch raises in load_codebook_for_c ──────────────────────────

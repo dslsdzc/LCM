@@ -173,15 +173,32 @@ def cmd_eval_ppl(args):
     from train.checkpoint import load_checkpoint
     params, _, _, _ = load_checkpoint(ckpt, load_opt=False)
 
-    def _eval_step(params, batch):
-        inputs, targets = batch
-        logits, _, _, extra, _ = model_forward(
-            params, None, inputs, lcfg, training=False)
-        log_probs = jax.nn.log_softmax(logits, axis=-1)
-        loss = -jnp.mean(
-            jnp.take_along_axis(
-                log_probs, targets[..., None], axis=-1).squeeze(-1))
-        return loss
+    gh = params.get('gen_head')
+    if isinstance(gh, dict) and gh.get('format') == 'cog':
+        # cog checkpoint: passive channel is a linear readout
+        # logits = z @ W_out (z from the encoder), predicting the next token
+        # after the window (targets[:, -1] == x[N]) — matches cog training.
+        from train.encoder import encoder_forward
+
+        def _eval_step(params, batch):
+            inputs, targets = batch
+            z = encoder_forward(params['encoder'], inputs, lcfg.n_heads)  # (B, N, d)
+            logits = z[:, -1, :] @ params['gen_head']['w_out']  # (B, V)
+            log_probs = jax.nn.log_softmax(logits, axis=-1)
+            loss = -jnp.mean(
+                jnp.take_along_axis(
+                    log_probs, targets[:, -1][..., None], axis=-1).squeeze(-1))
+            return loss
+    else:
+        def _eval_step(params, batch):
+            inputs, targets = batch
+            logits, _, _, extra, _ = model_forward(
+                params, None, inputs, lcfg, training=False)
+            log_probs = jax.nn.log_softmax(logits, axis=-1)
+            loss = -jnp.mean(
+                jnp.take_along_axis(
+                    log_probs, targets[..., None], axis=-1).squeeze(-1))
+            return loss
 
     batches = int(getattr(args, 'batches', 10))
     losses = []

@@ -1423,14 +1423,21 @@ def _encoder_recurrent_step(state, token_id, layer_params, n_heads):
 def gen_head_new_single(params, z_q, token_ids, kv_cache=None):
     d = len(z_q)
     if kv_cache is None:
+        # First step: seed the cumsum with z_q as the start token. The
+        # current token IS z_q — do not add it a second time below (the old
+        # code double-counted z_q in kv_sum/k_sum; the Cython
+        # genhead_step_cy only adds it once).
         k_start = _elu_plus_one(z_q @ params['w_k'])
         v_start = z_q @ params['w_v']
         kv_sum = np.outer(k_start, v_start)
         k_sum = k_start
         token_embed = z_q
-    else:
-        kv_sum, k_sum = kv_cache
-        token_embed = params['w_embed'][token_ids[-1]]
+        q = _elu_plus_one(token_embed @ params['w_q'])
+        attn_out = ((q @ kv_sum) / (np.dot(q, k_sum) + 1e-8)) @ params['w_o']
+        glu_out = _sigmoid(attn_out @ params['w_1']) * (attn_out @ params['w_2'])
+        return glu_out @ params['w_3'], (kv_sum, k_sum)
+    kv_sum, k_sum = kv_cache
+    token_embed = params['w_embed'][token_ids[-1]]
     q = _elu_plus_one(token_embed @ params['w_q'])
     k = _elu_plus_one(token_embed @ params['w_k'])
     v = token_embed @ params['w_v']
@@ -1646,9 +1653,19 @@ class LCMInferEngine:
             contrast_flat[:M_contrast * self.d], dtype=np.float32)
 
         gv_data, gv_n, _ = load_codebook_for_c(ckpt, "gvalue_codebook.bin")
+        gv_pos = gv_data[:gv_n * self.d]
+        gv_neg = gv_data[gv_n * self.d:]
+        if gv_n > 0 and np.array_equal(gv_pos, gv_neg):
+            # Placeholder export (C_pos == C_neg): the C engine's margin check
+            # (pos > neg - margin ⇒ unsafe) fires on nearly every input when
+            # use_safety is on, silently skipping the cognitive loop. Real
+            # anchors are not trained yet — disable the check (gv_n=0 → the
+            # engine builds no gv and skips gvalue entirely).
+            print("[GVAL] Placeholder gvalue detected (pos==neg) — safety check disabled")
+            gv_n = 0
         self.gv_n = gv_n
-        self.gv_pos = np.ascontiguousarray(gv_data[:gv_n * self.d], dtype=np.float32)
-        self.gv_neg = np.ascontiguousarray(gv_data[gv_n * self.d:], dtype=np.float32)
+        self.gv_pos = np.ascontiguousarray(gv_pos, dtype=np.float32)
+        self.gv_neg = np.ascontiguousarray(gv_neg, dtype=np.float32)
 
         danger_data, danger_M, _ = load_codebook_for_c(ckpt, "danger_codebook.bin")
         expected_half = danger_M * self.d

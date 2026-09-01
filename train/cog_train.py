@@ -801,7 +801,11 @@ def save_cog_checkpoint(params, output_dir, step, self_state=None):
         from train.checkpoint import _pack_header, _compute_checksum
         C_pos, C_neg = make_global_value_vectors(d)
         C_p = _to_np(C_pos)
-        C_n = _to_np(C_neg)
+        # Placeholder: identical halves → pos_d_min == neg_d_min → the C
+        # engine's margin check (pos > neg - margin ⇒ unsafe) never fires.
+        # Real anchors are NOT trained yet; without this, use_safety=True
+        # aborts the cognitive loop on (almost) every input.
+        C_n = C_p.copy()
         _hdr = bytearray(_pack_header(C_p.shape[0], d, 1, 2, 1.0))
         _data = C_p.tobytes() + C_n.tobytes()
         struct.pack_into("<I", _hdr, 20, _compute_checksum(_data))

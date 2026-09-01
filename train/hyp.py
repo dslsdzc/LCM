@@ -16,14 +16,18 @@ def poincare_similarity(u: jnp.ndarray, v: jnp.ndarray, c: float = 1.0) -> jnp.n
     v_norm2 = jnp.linalg.norm(v, axis=-1, keepdims=True) ** 2
     diff_norm2 = jnp.linalg.norm(u - v, axis=-1, keepdims=True) ** 2
     denom = (1 - c * u_norm2) * (1 - c * v_norm2)
-    return 2 * c * diff_norm2 / (denom + 1e-8)
+    # max-clamp (not additive eps): for off-ball inputs (‖·‖ > 1) denom is
+    # negative — additive eps keeps it negative and the similarity turns
+    # negative, making poincare_distance NaN. Matches infer/hyp.c.
+    return 2 * c * diff_norm2 / jnp.maximum(denom, 1e-8)
 
 
 def poincare_distance(u: jnp.ndarray, v: jnp.ndarray, c: float = 1.0) -> jnp.ndarray:
     """True hyperbolic distance. Only for human-readable output.
     For internal comparisons use poincare_similarity.
     """
-    return jnp.arccosh(1 + poincare_similarity(u, v, c) + 1e-8)
+    arg = 1 + poincare_similarity(u, v, c) + 1e-8
+    return jnp.arccosh(jnp.maximum(arg, 1.0))  # domain guard (arccosh ≥ 1)
 
 
 def exp_map(x: jnp.ndarray, c: float = 1.0) -> jnp.ndarray:

@@ -39,8 +39,11 @@ void danger_init(danger_lattice_t* dl, const float* C_threats,
 
     uint32_t hash = 0;
     for (int i = 0; i < M * D; i++) {
-        hash ^= (uint32_t)(C_threats[i] * 1e6f);
-        hash ^= (uint32_t)(C_normal[i] * 1e6f);
+        /* Bit-pattern hash: (uint32_t)(float*1e6) is compiler-flag dependent
+         * (negative values cast differently, NaN → 0). */
+        uint32_t b;
+        memcpy(&b, &C_threats[i], sizeof(b)); hash ^= b;
+        memcpy(&b, &C_normal[i], sizeof(b));  hash ^= b;
     }
     snprintf(dl->integrity_hash, sizeof(dl->integrity_hash), "%08x", hash);
     ENSURE(dl->integrity_hash[0] != '\0');

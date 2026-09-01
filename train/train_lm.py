@@ -71,7 +71,7 @@ def decoder_forward(params, x, training=True):
     kv_cs = jnp.cumsum(kv, axis=1)
     k_cs = jnp.cumsum(K, axis=1)
 
-    attn = jnp.einsum('bnd,bndd->bnd', Q, kv_cs) / (
+    attn = jnp.einsum('bnd,bnde->bne', Q, kv_cs) / (
         jnp.einsum('bnd,bnd->bn', Q, k_cs)[:, :, None] + 1e-8)
     attn_out = attn @ g['w_o']                           # (B, N+1, d)
 

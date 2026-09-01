@@ -131,7 +131,7 @@ def gen_head_forward(params_head, z_q, x, training=True):
     k_cs = jnp.cumsum(K, axis=1)                           # (B, N+1, d)
 
     # O_i = φ(Q_i) @ KV_i / (φ(Q_i) @ sum_{j <= i} φ(K_j) + eps)
-    attn = jnp.einsum('bnd,bndd->bnd', Q, kv_cs) / (
+    attn = jnp.einsum('bnd,bnde->bne', Q, kv_cs) / (
         jnp.einsum('bnd,bnd->bn', Q, k_cs)[:, :, None] + 1e-8)
     attn_out = attn @ params_head['w_o']                   # (B, N+1, d)
 

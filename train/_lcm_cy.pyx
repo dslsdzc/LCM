@@ -279,11 +279,15 @@ def sample_categorical_cy(
         if scaled[i] > max_val:
             max_val = scaled[i]
 
-    # Top-k: find k-th largest logit, zero out rest
+    # Top-k: find the top_k-th largest logit, zero out the rest.
+    # np.partition(scaled, V - top_k)[V - top_k] is the ascending
+    # (V - top_k)-th element == the descending top_k-th element. (The old
+    # `-np.partition(-scaled, k)[k]` was off by one and kept V - top_k + 1
+    # logits, making top-k effectively a no-op at V=30000, top_k=50.)
     if 0 < top_k < V:
-        k = V - top_k  # index of k-th largest in sorted order
+        k = V - top_k  # index of the top_k-th largest in ascending order
         # Partial O(V) selection
-        threshold = -np.partition(-scaled, k)[k]
+        threshold = np.partition(scaled, k)[k]
         for i in range(V):
             if scaled[i] < threshold:
                 scaled[i] = -1e9

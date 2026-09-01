@@ -32,13 +32,15 @@ void gvalue_init(gvalue_t* gv, const float* C_pos, const float* C_neg, int D) {
     gv->D = D;
 
     uint32_t hash = 0;
-    /* Hash both anchor arrays, all LCM_N_VALUE_PAIRS * D elements each,
-     * via flat pointers over the row-major layout. */
+    /* Bit-pattern hash over both anchor arrays (all LCM_N_VALUE_PAIRS * D
+     * elements each, flat row-major): (uint32_t)(float*1e6) is
+     * compiler-flag dependent (negative casts, NaN → 0). */
     const float* p = &gv->C_pos[0][0];
     const float* n = &gv->C_neg[0][0];
     for (int i = 0; i < LCM_N_VALUE_PAIRS * D; i++) {
-        hash ^= (uint32_t)(p[i] * 1e6f);
-        hash ^= (uint32_t)(n[i] * 1e6f);
+        uint32_t b;
+        memcpy(&b, &p[i], sizeof(b)); hash ^= b;
+        memcpy(&b, &n[i], sizeof(b)); hash ^= b;
     }
     snprintf(gv->integrity_hash, sizeof(gv->integrity_hash), "%08x", hash);
 
@@ -53,8 +55,9 @@ bool gvalue_verify(const gvalue_t* gv) {
     const float* p = &gv->C_pos[0][0];
     const float* n = &gv->C_neg[0][0];
     for (int i = 0; i < LCM_N_VALUE_PAIRS * gv->D; i++) {
-        hash ^= (uint32_t)(p[i] * 1e6f);
-        hash ^= (uint32_t)(n[i] * 1e6f);
+        uint32_t b;
+        memcpy(&b, &p[i], sizeof(b)); hash ^= b;
+        memcpy(&b, &n[i], sizeof(b)); hash ^= b;
     }
     char cur[64];
     snprintf(cur, sizeof(cur), "%08x", hash);

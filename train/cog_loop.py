@@ -85,7 +85,9 @@ def soft_retrieve(z, codebook, tau=0.1):
 
 # ─── DAG operations (JIT-safe: always retrieve all, mask inactives) ──────────
 
-def dag_fuse(z, codebooks, thresholds, tau=0.1, eps=1e-8):
+def dag_fuse(z, codebooks, thresholds, tau=0.1, eps=1e-6):
+    # eps aligned with the C engine (engine.c confidences 1/(√d + 1e-6)) so
+    # training and inference fuse to the same fixed point.
     """Build DAG + fuse in one JIT-safe pass.
 
     Always retrieves from every codebook. Inactive entries (distance above

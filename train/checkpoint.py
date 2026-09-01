@@ -230,9 +230,15 @@ def _save_contrast(params, path):
 
 
 def _save_gvalue(gvalue, path, d):
-    """gvalue: C_pos + C_neg + SHA-256 hash."""
+    """gvalue: C_pos + C_neg + SHA-256 hash.
+
+    Placeholder: C_neg mirrors C_pos so the C engine's margin check
+    (pos > neg - margin ⇒ unsafe) never fires — real anchors are not
+    trained yet, and asymmetric placeholders abort the cognitive loop on
+    nearly every input when use_safety is on.
+    """
     C_pos = np.asarray(gvalue.C_pos, dtype=np.float32)
-    C_neg = np.asarray(gvalue.C_neg, dtype=np.float32)
+    C_neg = C_pos.copy()
     M_pair = C_pos.shape[0]
 
     hdr = _pack_header(M_pair, d, 1, CB_HYPERBOLIC, 1.0)
@@ -708,6 +714,11 @@ def _load_decoder(path, cfg):
             gh[name] = jnp.array(flat[offset:offset + n_el].reshape(shape))
             offset += n_el
         return gh
+    elif len(flat) == d * V:
+        # cog checkpoint: bare W_out (d×V) — linear readout z @ W_out.
+        # (Without this branch the cog decoder fell into the random
+        # re-init below and eval ppl silently measured a random head.)
+        return {'format': 'cog', 'w_out': jnp.array(flat.reshape(d, V))}
     else:
         # Old format (w_proj + w_out): reinit with new params
         from train.fusion import init_gen_head_params

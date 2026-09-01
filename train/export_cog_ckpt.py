@@ -184,12 +184,12 @@ def export(ckpt_dir: str, out_dir: str, data_dir: str = "data"):
         parts.append(_to_np(gen_head["w_3"]).ravel())
         decoder_flat = np.concatenate(parts).astype(np.float32)
     elif "W_out" in params:
-        # old format: W_out as decoder
+        # cog format: bare W_out (d×V) → loads as 'cog' with a linear
+        # readout (z @ W_out), matching save_cog_checkpoint. The old
+        # identity+w_proj concatenation loaded as 'old' format, which
+        # applies an ELU the training loss never saw.
         W_out = _to_np(params["W_out"])
-        d = W_out.shape[0]
-        V = W_out.shape[1]
-        W_proj = np.eye(d, dtype=np.float32)
-        decoder_flat = np.concatenate([W_proj.ravel(), W_out.ravel()]).astype(np.float32)
+        decoder_flat = W_out.ravel().astype(np.float32)
     else:
         print("[EXPORT] WARN: no decoder/W_out found.  Writing dummy.")
         decoder_flat = np.random.randn(d_model * d_model + d_model * vocab_size).astype(np.float32)
@@ -270,7 +270,9 @@ def export(ckpt_dir: str, out_dir: str, data_dir: str = "data"):
     from train.gvalue import make_global_value_vectors
     C_pos, C_neg = make_global_value_vectors(d_model)
     C_p = np.asarray(C_pos, dtype=np.float32) if hasattr(C_pos, 'numpy') else np.array(C_pos, dtype=np.float32)
-    C_n = np.asarray(C_neg, dtype=np.float32) if hasattr(C_neg, 'numpy') else np.array(C_neg, dtype=np.float32)
+    # Placeholder: identical halves → the C engine's margin check never fires
+    # (see cog_train export). Real anchors are NOT trained yet.
+    C_n = C_p.copy()
     data_gv = C_p.tobytes() + C_n.tobytes()
     sha_gv = hashlib.sha256(data_gv).digest()
     M_gv = C_p.shape[0]

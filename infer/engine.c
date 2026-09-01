@@ -246,7 +246,11 @@ bool execute_dag(dag_t* dag, const memory_t* mem, vec_t* outputs, float* confide
                             result, &dist, &idx);
             node->dist = dist;
             if (node->lattice_id < LCM_MAX_LATTICES) {
-                confidences[node->lattice_id] = 1.0f / (dist + 1e-6f);
+                /* retrieve_single returns SQUARED distance — sqrt to L2 so
+                 * fusion weights match the JAX side (cog_loop.dag_fuse:
+                 * w = 1/(√d + 1e-6)). Previously 1/(d² + ε) made the C and
+                 * JAX fixed points drift apart (3× weight ratio at d₂/d₁=3). */
+                confidences[node->lattice_id] = 1.0f / (sqrtf(dist) + 1e-6f);
             }
             break;
         }

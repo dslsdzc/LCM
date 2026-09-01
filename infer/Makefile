@@ -12,14 +12,18 @@
 #
 # Required: C99 compiler (gcc or clang), libm
 #
-# -lmvec: -march=native + -ffast-math make the compiler emit vectorized
-# libmvec calls (e.g. _ZGVbN4v_logf). Without an explicit -lmvec the link is
-# dropped by --as-needed (the symbol lives in libmvec, not libm) and the
-# resulting .so fails to load via ctypes: undefined symbol.
+# No -ffast-math: it folds isnan/isfinite to constants, turns 0*inf and
+# inf-inf into 0 (silently masking overflow), and disables the NaN guards in
+# hyp.c/gvalue.c — measured with gcc 16.2.1. -O2 -march=native is enough.
+#
+# -lmvec: with -march=native the compiler may emit vectorized libmvec calls
+# (e.g. _ZGVbN4v_logf). Without an explicit -lmvec the link is dropped by
+# --as-needed (the symbol lives in libmvec, not libm) and the resulting .so
+# fails to load via ctypes: undefined symbol.
 
 CC       ?= gcc
 CFLAGS   ?= -std=c99 -Wall -Wextra -Wpedantic -Werror
-OPTFLAGS ?= -O2 -march=native -ffast-math
+OPTFLAGS ?= -O2 -march=native
 # Append (not ?=): a user-set LDFLAGS (e.g. -fuse-ld=mold) would otherwise
 # silently replace these and the .so links without libm.
 LDFLAGS  += -lm -lmvec

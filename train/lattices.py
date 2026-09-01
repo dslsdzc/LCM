@@ -561,18 +561,20 @@ def contrast_value_biased_nce_loss(params, z, v_harm, tau=0.5, tau_val=0.1):
         w_pos_a = jnp.take_along_axis(w_b[None, :], idx_b[:, None], axis=-1).squeeze(-1)
         w_pos_b = jnp.take_along_axis(w_a[None, :], idx_a[:, None], axis=-1).squeeze(-1)
 
-        loss_a = -jnp.log(
-            jnp.exp(-d_a_pos / tau) /
-            (jnp.exp(-d_a_pos / tau) +
-             weighted_neg_a -
-             w_pos_a * jnp.exp(-d_b_pos / tau))
-        )
-        loss_b = -jnp.log(
-            jnp.exp(-d_b_pos / tau) /
-            (jnp.exp(-d_b_pos / tau) +
-             weighted_neg_b -
-             w_pos_b * jnp.exp(-d_a_pos / tau))
-        )
+        # Stable form of the same InfoNCE:
+        #   -log(exp(-p/τ) / (exp(-p/τ) + Σ_{j≠pos} w_j·exp(-d_j/τ)))
+        #   = log(1 + Σ_{j≠pos} w_j·exp(-(d_j - d_pos)/τ))
+        # All exponent arguments are ≤ 0 (no overflow) and the old
+        # denominator-subtraction form could cancel to ≤ 0 in float32
+        # (harm weights concentrate → -inf/NaN). log1p → no underflow.
+        excl_b = jax.nn.one_hot(idx_b, w_b.shape[0], dtype=jnp.float32)  # (B, M)
+        excl_a = jax.nn.one_hot(idx_a, w_a.shape[0], dtype=jnp.float32)
+        w_b_excl = w_b[None, :] * (1.0 - excl_b)  # (B, M), positive excluded
+        w_a_excl = w_a[None, :] * (1.0 - excl_a)
+        loss_a = jnp.log1p(
+            jnp.sum(w_b_excl * jnp.exp(-(d_b - d_a_pos[:, None]) / tau), axis=-1))
+        loss_b = jnp.log1p(
+            jnp.sum(w_a_excl * jnp.exp(-(d_a - d_b_pos[:, None]) / tau), axis=-1))
         loss = loss + jnp.mean(loss_a) + jnp.mean(loss_b)
 
     return loss
