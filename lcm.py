@@ -27,6 +27,7 @@ import signal
 import struct
 import sys
 import time
+import zlib
 
 os.environ.setdefault("JAX_SKIP_CUDA_CONSTRAINTS_CHECK", "1")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -1054,6 +1055,10 @@ def _sigmoid(x):
     return 1.0 / (1.0 + np.exp(-np.clip(x, -30, 30)))
 
 
+def _silu(x):
+    return x * _sigmoid(x)
+
+
 HEADER_FMT = '<iiiifI'
 HEADER_SIZE = 24
 
@@ -1121,6 +1126,11 @@ def load_decoder(ckpt_dir, d, V):
         w_3 = flat[pos:pos+4*d*V].reshape(d*4, V)
         return {'format': 'new', 'w_embed': w_embed, 'w_q': w_q, 'w_k': w_k,
                 'w_v': w_v, 'w_o': w_o, 'w_1': w_1, 'w_2': w_2, 'w_3': w_3}
+    if len(flat) == d * V:
+        # Cog checkpoint: bare W_out (d×V) with no w_proj — identity
+        # projection so z reads W_out directly.
+        return {'format': 'old', 'w_proj': np.eye(d, dtype=np.float32),
+                'w_out': flat.reshape(d, V)}
     if len(flat) in (old_size, 0):
         if len(flat) == old_size:
             w_proj = flat[:d*d].reshape(d, d).copy()
@@ -1137,7 +1147,36 @@ def load_codebook_for_c(ckpt_dir, filename):
     M, d, n_layers, cb_type, c, crc = _read_bin_header(path)
     data = _read_bin_data(path,
                           has_hash=(filename.startswith('gvalue') or filename.startswith('danger')))
+    # CRC covers the data section (SHA-256 suffix already stripped above).
+    # Raise on mismatch — a silently corrupt codebook misaligns the C
+    # engine's fixed-size arrays.
+    actual_crc = zlib.crc32(data) & 0xFFFFFFFF
+    if actual_crc != crc:
+        raise ValueError(
+            f"CRC mismatch in {path}: stored={crc:#010x}, "
+            f"actual={actual_crc:#010x} — file is corrupt or was written "
+            f"by an old writer; re-export the checkpoint")
     return np.ascontiguousarray(data, dtype=np.float32), M, d
+
+
+def _check_lcm_dim(lib, d_model):
+    """Verify the compiled C engine's LCM_D matches the checkpoint d_model.
+
+    A mismatch silently corrupts the ctypes bridge (fixed-size C arrays).
+    Old .so builds without lcm_dim() are tolerated via getattr.
+    """
+    dim_fn = getattr(lib, 'lcm_dim', None)
+    if dim_fn is None:
+        print("[INFER] WARNING: liblcm.so lacks lcm_dim() — skipping LCM_D check")
+        return
+    if hasattr(dim_fn, 'restype'):
+        dim_fn.restype = ctypes.c_int
+    compiled_d = int(dim_fn())
+    if compiled_d != d_model:
+        raise RuntimeError(
+            f"liblcm.so was compiled with LCM_D={compiled_d} but the "
+            f"checkpoint uses d_model={d_model}. Rebuild the C engine:\n"
+            f"    cd infer && make LCM_D={d_model}")
 
 
 # ── Encoder forward ─────────────────────────────────────────────────────────
@@ -1175,7 +1214,7 @@ def _linear_attn(x, w_q, w_k, w_v, w_o, n_heads):
 
 
 def _glu(x, w_1, w_2, w_3):
-    return (_sigmoid(x @ w_1) * (x @ w_2)) @ w_3
+    return (_silu(x @ w_1) * (x @ w_2)) @ w_3
 
 
 # ─── Incremental encoder (recurrent, O(d²) per step) ─────────────────────
@@ -1192,6 +1231,22 @@ def _glu(x, w_1, w_2, w_3):
 #   see new ones).  This is more appropriate for autoregressive generation.
 
 ENC_RESET_INTERVAL = 256  # full re-encode every N steps to reset cumsum
+
+
+def _kv_cumsum_block(kv, n_heads, d_h, d):
+    """Per-head KV cumsum (H, d_h, d_h) → (d, d) block-diagonal layout.
+
+    The Cython incremental encoder (train/_lcm_cy.encoder_recurrent_step_cy,
+    compiled with boundscheck=False) indexes the (d, d) matrix by absolute
+    head blocks — head hh occupies rows/cols [hh*d_h, (hh+1)*d_h). The
+    recurrent state must live in this layout, or the wrapper hands it
+    (H, d_h, d_h) arrays and the Cython code reads out of bounds.
+    """
+    block = np.zeros((d, d), dtype=np.float32)
+    for hh in range(n_heads):
+        s0, s1 = hh * d_h, (hh + 1) * d_h
+        block[s0:s1, s0:s1] = kv[hh]
+    return block
 
 
 def _encoder_full_with_state(params, x, n_heads):
@@ -1241,7 +1296,10 @@ def _encoder_full_with_state(params, x, n_heads):
             layer['w_1'], layer['w_2'], layer['w_3'])
         h = h_new
 
-        layers_state.append({'kv': kv.copy(), 'k': k_sum.copy()})
+        # Block layout (d, d) / (d,): consumed in-place by the Cython
+        # incremental encoder (see _kv_cumsum_block).
+        layers_state.append({'kv': _kv_cumsum_block(kv, n_heads, d_h, d),
+                             'k': np.ascontiguousarray(k_sum.reshape(-1))})
 
     # Global attention pooling (bidirectional sum over N)
     k_pool = _elu_plus_one(h)
@@ -1291,14 +1349,22 @@ def _encoder_recurrent_step(state, token_id, layer_params, n_heads):
         k = _elu_plus_one(h_norm @ layer['w_k']).reshape(n_heads, d_h)
         v = (h_norm @ layer['w_v']).reshape(n_heads, d_h)
 
-        # Append to cumsum
-        ls['kv'] += np.einsum('hd,he->hde', k, v)
-        ls['k'] += k
+        # Append to cumsum (block layout — head hh occupies rows/cols hh*d_h..)
+        kv_inc = np.einsum('hd,he->hde', k, v)
+        for hh in range(n_heads):
+            s0, s1 = hh * d_h, (hh + 1) * d_h
+            ls['kv'][s0:s1, s0:s1] += kv_inc[hh]
+        ls['k'] += k.reshape(-1)
 
-        # Attention: φ(q) @ kv / (φ(q) @ k_sum)
-        num = np.einsum('hd,hde->he', q, ls['kv'])
-        den = np.einsum('hd,hd->h', q, ls['k'])
-        attn_out = (num / (den[:, None] + 1e-6)).reshape(d) @ layer['w_o']
+        # Attention: φ(q) @ kv / (φ(q) @ k_sum) — block-diagonal M is zero
+        # outside each head's block, so a plain (d,) matmul picks out the
+        # per-head products; the denominator stays a per-head scalar (dot of
+        # q with the k cumsum), matching the Cython kernel and the batch
+        # encoder's per-head normalization.
+        num = q.reshape(-1) @ ls['kv']  # (d,)
+        den = (q.reshape(-1) * ls['k']).reshape(n_heads, d_h).sum(axis=1)
+        attn_out = (num.reshape(n_heads, d_h) / (den[:, None] + 1e-6)
+                    ).reshape(d) @ layer['w_o']
 
         h = h + attn_out
         h = h + _glu(
@@ -1446,7 +1512,15 @@ class LCMInferEngine:
         self.n_heads = self.cfg['n_heads']
         self.n_lattices = self.cfg['n_lattices']
 
+        # liblcm.so is built with -march=native → references libmvec symbols
+        # (e.g. _ZGVbN4v_logf); preload libm with RTLD_GLOBAL so the engine
+        # resolves them on load.
+        try:
+            ctypes.CDLL('libm.so.6', mode=ctypes.RTLD_GLOBAL)
+        except OSError:
+            pass
         self.lib = ctypes.CDLL(str(self.lib_path))
+        _check_lcm_dim(self.lib, self.d)
         self.lib.lcm_infer_step.restype = ctypes.c_int
         self.lib.lcm_infer_loop.restype = ctypes.c_int
         self.lib.lcm_get_trace.restype = ctypes.c_int
@@ -1584,7 +1658,7 @@ class LCMInferEngine:
             print(f"[INFER] WARNING: lcm_infer_step returned {ret}", file=sys.stderr)
         return z_out
 
-    def cognitive_loop(self, z, conv_tol=1e-3, entropy_thresh=0.5,
+    def cognitive_loop(self, z, conv_tol=1e-3, entropy_thresh=2.0,
                        max_steps=32, use_safety=True,
                        agency_tension_mod=0.0, agency_explore_mod=0.0):
         """Cognitive inference loop with agency-modulated convergence.
@@ -1592,7 +1666,11 @@ class LCMInferEngine:
         Args:
             z: Input vector (d,).
             conv_tol: Base convergence tolerance.
-            entropy_thresh: Base entropy threshold.
+            entropy_thresh: Base entropy threshold. Uniform weights over the
+                7 lattices give entropy ≈ ln(7) ≈ 1.95, so the old default
+                0.5 made multi-lattice responses always "abort" on entropy
+                gating; 2.0 effectively disables the gate (matches
+                LCM_ENTROPY_THRESHOLD in infer/lcm.h).
             max_steps: Base max inference steps.
             use_safety: Whether to use gvalue/danger checking.
             agency_tension_mod: From agency.get_tension_modulator() [-0.5, 0.5].
@@ -2303,9 +2381,6 @@ def main():
         elif args.data_action == "sample":
             cmd_data_sample(args)
         return
-    elif args.mode == "stats":
-        _cmd_data_stats(args.data, args.shape, args.num_samples, args.tokenizer)
-        return
     elif args.mode == "chart":
         from train.monitor import make_chart_html
         make_chart_html(args.input, args.output)
@@ -2347,7 +2422,9 @@ def main():
         p, ss = init_cog_params(cfg, jax.random.split(rng)[1], lang_ckpt=lck)
         opt = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(3e-4, weight_decay=0.01))
         ts = make_train_step(cfg, opt)
-        opt_st = opt.init(p)
+        # Frozen Qwen is excluded from the optimizer tree (train_step filters
+        # it out of updates) — init must match that structure.
+        opt_st = opt.init({k: v for k, v in p.items() if k != 'qwen'})
         d = (jnp.zeros((B, N), dtype=jnp.int32), jnp.ones((B, N), dtype=jnp.int32))
         import time as tm
         t0 = tm.time()
@@ -2473,7 +2550,7 @@ def _cmd_train(subargs):
         train_cog(cfg=cfg, output_dir=out_dir, steps=subargs.cog_steps,
                   lr=subargs.cog_lr, batch_size=subargs.cog_batch, seq_len=subargs.cog_seq,
                   log_every=100, save_every=subargs.cog_save, data_path=subargs.data,
-                  shape_path=shape, lm_ckpt=subargs.from_lm_ckpt, resume=resume,
+                  shape_path=shape, lang_ckpt=subargs.from_lm_ckpt, resume=resume,
                   joint=False, auto_mode=subargs.auto)
     else:
         subargs.stage = int(stage)

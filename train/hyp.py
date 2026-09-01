@@ -36,7 +36,7 @@ def log_map(y: jnp.ndarray, c: float = 1.0) -> jnp.ndarray:
     """Poincaré ball → Euclidean vector (logarithmic map)."""
     n = jnp.linalg.norm(y, axis=-1, keepdims=True) + 1e-8
     n_clipped = clamp(0.0, n, 0.999)  # Stay within domain of atanh
-    return jnp.arctanh(jnp.sqrt(c) * n_clipped) * y / (jnp.sqrt(c) * n)
+    return jnp.arctanh(jnp.sqrt(c) * n_clipped) * y / (jnp.sqrt(c) * n_clipped)
 
 
 def mobius_add(u: jnp.ndarray, v: jnp.ndarray, c: float = 1.0) -> jnp.ndarray:

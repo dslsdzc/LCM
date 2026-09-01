@@ -80,7 +80,8 @@ def _check_world_dev(record, thresholds):
 def _check_state_jump(record, thresholds):
     th = thresholds.get('state_jump', 0.5)
     if record.convergence_diff is not None and record.convergence_diff > th:
-        score = record.convergence_diff / th
+        # 仿照 _check_world_dev：刚过阈值时 score 从 0 起，不饱和
+        score = (record.convergence_diff - th) / th
         return True, float(np.clip(score, 0.0, 1.0))
     return False, 0.0
 
@@ -138,11 +139,10 @@ class ImportanceEvaluator:
             score: 0.0 = not important, >0 = importance level.
             rule_name: Which rule triggered (empty string if none).
         """
-        # Periodic sampling by step number
+        # Periodic sampling by step number（优先级 7 最低）：
+        # 只作兜底 —— 规则循环之后、无规则命中时返回，避免覆盖高优先级规则。
         period = self.thresholds.get('periodic', 100)
         step_num = step if step is not None else getattr(record, 'step', 0)
-        if step_num > 0 and step_num % period == 0:
-            return 0.3, 'periodic'
 
         for rule in self.rules:
             if rule.name == 'periodic':
@@ -153,6 +153,9 @@ class ImportanceEvaluator:
                     return float(np.clip(score, 0.0, 1.0)), rule.name
             except Exception:
                 continue
+
+        if step_num > 0 and step_num % period == 0:
+            return 0.3, 'periodic'
 
         return 0.0, ""
 

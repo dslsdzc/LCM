@@ -157,18 +157,20 @@ def init_encoder_state(params, x, n_heads):
     for layer in params['layers']:
         h_norm = layer_norm(h, layer['ln1_scale'], layer['ln1_bias'])
 
-        Q = (jnn.elu(h_norm @ layer['w_q']) + 1).reshape(B, N, n_heads, d_h)
-        K = (jnn.elu(h_norm @ layer['w_k']) + 1).reshape(B, N, n_heads, d_h)
-        V = (h_norm @ layer['w_v']).reshape(B, N, n_heads, d_h)
+        # Transpose to (B, H, N, d_h) — matches the einsum layout below and
+        # the numpy reference (lcm.py _encoder_full_with_state).
+        Q = (jnn.elu(h_norm @ layer['w_q']) + 1).reshape(B, N, n_heads, d_h).transpose(0, 2, 1, 3)
+        K = (jnn.elu(h_norm @ layer['w_k']) + 1).reshape(B, N, n_heads, d_h).transpose(0, 2, 1, 3)
+        V = (h_norm @ layer['w_v']).reshape(B, N, n_heads, d_h).transpose(0, 2, 1, 3)
 
         # KV cumsum over ALL positions (for recurrent update later)
-        kv = jnp.einsum('b n h d, b n h e -> b h d e', K, V)
-        k_sum = K.sum(axis=1)  # (B, n_heads, d_h)
+        kv = jnp.einsum('b h n d, b h n e -> b h d e', K, V)
+        k_sum = K.sum(axis=2)  # (B, n_heads, d_h)
 
         # Full attention output (bidirectional)
         Z = jnp.einsum('b h n d, b h d e -> b h n e', Q, kv)
-        norm = jnp.einsum('b h n d, b h d -> b h n', Q, k_sum[:, :, None, :]).squeeze(-1)
-        Z = Z / (jnp.expand_dims(norm, -1) + 1e-6)
+        norm = jnp.einsum('b h n d, b h d -> b h n', Q, k_sum)[..., None]  # (B,H,N,1)
+        Z = Z / (norm + 1e-6)
         Z = Z.transpose(0, 2, 1, 3).reshape(B, N, d) @ layer['w_o']
 
         h = h + Z

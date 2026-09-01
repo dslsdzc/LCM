@@ -7,6 +7,10 @@ a test case — quantified over all values satisfying preconditions).
 This is NOT testing.  Testing checks one execution path per assertion.
 Z3 proves the property has no counter-example across the entire input space.
 
+⚠️ 验证目标是本文件中的手写抽象模型（model_* 函数），不是 C 实现本身。
+抽象模型与 C 实现的偏差（如实现细节改动）不会被本套件捕获——
+它证明的是"模型满足合同"，C 代码是否忠实于模型需要另行审查/测试。
+
 Verified contracts (one proof per bullet):
 
   danger_assess
@@ -241,43 +245,77 @@ def verify_danger_assess() -> None:
 #           *out_violated_law = -1 when safe
 
 def model_gvalue_check_safety(
-    pos_d_min: ArithRef,
-    neg_d_min: ArithRef,
+    pair_pos: list,
+    pair_neg: list,
     safety_margin: ArithRef,
 ) -> tuple[BoolRef, ArithRef]:
-    """Abstract model of gvalue_check_safety.
+    """Abstract model of gvalue_check_safety（gvalue.c 真实语义）.
 
-    Returns (safe, violated_law).
-    The violated_law is abstracted to the min margin index.
+    Args:
+        pair_pos: N_VALUE_PAIRS 个律对的 positive 距离 d_pos[i]。
+        pair_neg: N_VALUE_PAIRS 个律对的 negative 距离 d_neg[i]。
+        safety_margin: 安全余量 (>= 0)。
+
+    Returns:
+        (safe, violated_law)。
+        safe ⇔ pos_d_min ≤ neg_d_min - safety_margin（含等号，等号安全，
+        与 gvalue.c 的 `pos_d_min > neg_d_min - safety_margin → unsafe` 一致）。
+        unsafe 时 violated_law = argmin_i (d_pos_i - (d_neg_i - margin))
+        ∈ [0, N_VALUE_PAIRS-1]（gvalue.c 的 min-margin 索引语义；
+        平局取小索引，与 C 循环的严格 `<` 更新一致）。
+        safe 时 violated_law = -1。
     """
+    pos_d_min = pair_pos[0]
+    neg_d_min = pair_neg[0]
+    for i in range(1, N_VALUE_PAIRS):
+        pos_d_min = If(pair_pos[i] < pos_d_min, pair_pos[i], pos_d_min)
+        neg_d_min = If(pair_neg[i] < neg_d_min, pair_neg[i], neg_d_min)
+
     safe = pos_d_min <= neg_d_min - safety_margin
-    # violated_law = -1 when safe, some 0..N_VALUE_PAIRS-1 when unsafe
-    violated_law = If(safe, IntVal(-1), IntVal(0))  # 0 = first law pair
+
+    # violated_law = argmin over per-pair margins
+    margins = [pair_pos[i] - (pair_neg[i] - safety_margin)
+               for i in range(N_VALUE_PAIRS)]
+    law = If(
+        And(margins[0] <= margins[1],
+            margins[0] <= margins[2],
+            margins[0] <= margins[3]),
+        IntVal(0),
+        If(And(margins[1] <= margins[2], margins[1] <= margins[3]), IntVal(1),
+           If(margins[2] <= margins[3], IntVal(2), IntVal(3))))
+    violated_law = If(safe, IntVal(-1), law)
     return safe, violated_law
 
 
 def verify_gvalue_check_safety() -> None:
     """Prove all gvalue_check_safety contracts."""
-    pos = Real("pos_d_min")
-    neg = Real("neg_d_min")
+    pos = [Real(f"pos_d_{i}") for i in range(N_VALUE_PAIRS)]
+    neg = [Real(f"neg_d_{i}") for i in range(N_VALUE_PAIRS)]
     margin = Real("safety_margin")
 
     # Precondition: safety_margin >= 0, distances >= 0
-    pre = And(margin >= 0, pos >= 0, neg >= 0)
+    pre = And(margin >= 0, *[p >= 0 for p in pos], *[n >= 0 for n in neg])
 
     safe, law = model_gvalue_check_safety(pos, neg, margin)
 
+    # 模型内部推导的最接近对距离（pos_d_min / neg_d_min）
+    pos_d_min = pos[0]
+    neg_d_min = neg[0]
+    for i in range(1, N_VALUE_PAIRS):
+        pos_d_min = If(pos[i] < pos_d_min, pos[i], pos_d_min)
+        neg_d_min = If(neg[i] < neg_d_min, neg[i], neg_d_min)
+
     # ── P5: safe ⇒ pos_d_min ≤ neg_d_min - safety_margin ────────────────
-    lemma("P5", implies(pre, implies(safe, pos <= neg - margin)),
+    lemma("P5", implies(pre, implies(safe, pos_d_min <= neg_d_min - margin)),
           "safe ⇒ pos_d_min ≤ neg_d_min - safety_margin")
 
     # ── P6: ¬safe ⇒ pos_d_min > neg_d_min - safety_margin ───────────────
-    lemma("P6", implies(pre, implies(Not(safe), pos > neg - margin)),
+    lemma("P6", implies(pre, implies(Not(safe), pos_d_min > neg_d_min - margin)),
           "¬safe ⇒ pos_d_min > neg_d_min - safety_margin")
 
-    # ── P7: violated_law ∈ {-1, 0} (0 here = first law pair) ────────────
-    lemma("P7", implies(pre, Or(law == -1, law == 0)),
-          "violated_law ∈ {-1, 0} where 0 = first violated law pair")
+    # ── P7: violated_law ∈ {-1, 0, 1, 2, 3} ─────────────────────────────
+    lemma("P7", implies(pre, Or(law == -1, law == 0, law == 1, law == 2, law == 3)),
+          "violated_law ∈ {-1, 0, 1, 2, 3} (argmin 索引或 -1)")
 
     # ── P8: safe ⇔ violated_law = -1 ────────────────────────────────────
     lemma("P8a", implies(pre, implies(safe, law == -1)),
@@ -409,6 +447,8 @@ def verify_hard_interrupt() -> None:
     # ── P11: halt_and_alert ⇔ return -1 ──────────────────────────────────
     # In the C engine, halt_and_alert is called exactly when the outcome
     # is CONFLICT or MAX_STEPS — both of which return -1.
+    # 结构性质（抽象模型上验证，非 C 实现行为证明）：outcome 枚举的
+    # 互斥穷尽是建模时按 C 代码结构构造的，不是运行时检查出的。
     lemma("P11",
           Implies(outcome_valid, halt_and_alert_called == Not(converged)),
           "halt_and_alert ⇔ outcome is NOT convergence (⇔ return -1)")
@@ -418,6 +458,8 @@ def verify_hard_interrupt() -> None:
     # Therefore halt_and_alert (CONFLICT or MAX_STEPS) and convergence (CONVERGED)
     # cannot both occur in the same invocation.  There is no fallback from
     # conflict back to convergence in the C code.
+    # 结构性质（抽象模型上验证，非 C 实现行为证明）：单枚举互斥由构造保证，
+    # 不能捕获 C 实现中"先 halt_and_alert 后仍返回 0"这类偏离。
     lemma("P12",
           Implies(outcome_valid,
                   And(halt_and_alert_called == Not(converged),
@@ -475,7 +517,8 @@ def verify_composition() -> None:
     pos_3l = Real("pos_3l")
     neg_3l = Real("neg_3l")
     pre_3l = And(pos_3l >= 0, neg_3l >= 0)
-    safe_3l, law_3l = model_gvalue_check_safety(pos_3l, neg_3l, DEFAULT_MARGIN)
+    safe_3l, law_3l = model_gvalue_check_safety(
+        [pos_3l] * N_VALUE_PAIRS, [neg_3l] * N_VALUE_PAIRS, DEFAULT_MARGIN)
     lemma("P13d",
           implies(And(pre_3l, pos_3l > neg_3l - DEFAULT_MARGIN), Not(safe_3l)),
           "THREAT_THREE_LAWS detected by gvalue_check_safety when margin violated")
@@ -537,9 +580,11 @@ def verify_determinism() -> None:
     m1, m2 = Reals("m1 m2")
 
     same_in_gv = And(p1 == p2, n1 == n2, m1 == m2)
-    s1_gv, l1_gv = model_gvalue_check_safety(p1, n1, m1)
-    s2_gv, l2_gv = model_gvalue_check_safety(p2, n2, m2)
-    lemma("P16b", implies(same_in_gv, s1_gv == s2_gv),
+    s1_gv, l1_gv = model_gvalue_check_safety(
+        [p1] * N_VALUE_PAIRS, [n1] * N_VALUE_PAIRS, m1)
+    s2_gv, l2_gv = model_gvalue_check_safety(
+        [p2] * N_VALUE_PAIRS, [n2] * N_VALUE_PAIRS, m2)
+    lemma("P16b", implies(same_in_gv, And(s1_gv == s2_gv, l1_gv == l2_gv)),
           "gvalue_check_safety: same inputs ⇒ same outputs (pure)")
 
 
@@ -591,24 +636,29 @@ def verify_edge_cases() -> None:
 
     # pos_d_min == neg_d_min - margin (barely safe)
     s_barely, _ = model_gvalue_check_safety(
-        DEFAULT_MARGIN, DEFAULT_MARGIN + DEFAULT_MARGIN, DEFAULT_MARGIN)
+        [DEFAULT_MARGIN] * N_VALUE_PAIRS,
+        [DEFAULT_MARGIN + DEFAULT_MARGIN] * N_VALUE_PAIRS, DEFAULT_MARGIN)
     lemma("E5", s_barely,
           "pos = neg - margin (boundary) ⇒ safe (barely)")
 
     # pos_d_min == neg_d_min (margin = 0) — always safe
-    s_zero_margin, _ = model_gvalue_check_safety(RealVal("1.0"), RealVal("1.0"), RealVal("0.0"))
+    s_zero_margin, _ = model_gvalue_check_safety(
+        [RealVal("1.0")] * N_VALUE_PAIRS, [RealVal("1.0")] * N_VALUE_PAIRS,
+        RealVal("0.0"))
     lemma("E6", s_zero_margin,
           "margin = 0 ∧ pos = neg ⇒ safe")
 
     # pos_d_min = 0 (perfect alignment with positive)
-    s_aligned, _ = model_gvalue_check_safety(RealVal("0.0"), RealVal("10.0"),
-                                              DEFAULT_MARGIN)
+    s_aligned, _ = model_gvalue_check_safety(
+        [RealVal("0.0")] * N_VALUE_PAIRS, [RealVal("10.0")] * N_VALUE_PAIRS,
+        DEFAULT_MARGIN)
     lemma("E7", s_aligned,
           "pos_d_min = 0 (perfect positive alignment) ⇒ safe")
 
     # neg_d_min = 0 (perfect alignment with negative) — unsafe
-    s_neg_aligned, _ = model_gvalue_check_safety(RealVal("10.0"), RealVal("0.0"),
-                                                  DEFAULT_MARGIN)
+    s_neg_aligned, _ = model_gvalue_check_safety(
+        [RealVal("10.0")] * N_VALUE_PAIRS, [RealVal("0.0")] * N_VALUE_PAIRS,
+        DEFAULT_MARGIN)
     lemma("E8", Not(s_neg_aligned),
           "neg_d_min = 0 (perfect negative alignment) ⇒ unsafe")
 
@@ -1089,10 +1139,16 @@ def verify_binding_lattice() -> None:
 #   keys[1+4L] > keys[4L+1] = 4L+1+1 > 4L+1. No overlap ✓
 
 def verify_rng_keys() -> None:
-    """Prove the RNG key fix produces non-overlapping keys.
+    """Prove the RNG key fix removes the critical pool/layer key overlaps.
 
-    The fix adds 1 more split key (3+4L instead of 2+4L) and uses
-    keys[-2]/keys[-1] for pool params, ensuring no overlap with layer keys.
+    注意：本套件证明的是「关键重叠被消除」，不是「全部 key 非重叠」——
+    按 P36b/P36c 的实际证明内容：
+      - w_proj = keys[-1] = keys[4L+2] 在最后一层 key 范围之外
+        → 专属 key，无重叠（P36a/P36d）
+      - q_pool = keys[-2] = keys[4L+1] 仍在最后一层范围内（P36b），
+        不再与 w_q/w_1 共享（P36c），但与 w_o 共享同一 key
+    因此标题为 "RNG Key Independence"（消除关键重叠），而非
+    "proves non-overlapping keys"。
     """
     # Symbolic n_layers (≥ 1) for quantified proof
     L = Int("n_layers")

@@ -174,7 +174,9 @@ def self_lattice_forward(params, state, z: Optional[jnp.ndarray] = None,
     # Mode activation momentum determines which mode is active.
     # This is the key design choice: self state changes based on its own
     # internal dynamics, not on what the external world looks like.
-    logits = params['tau_self'] * mode_activation  # (M_self,)
+    # mode_activation 是概率（初始为均匀），当 logits 用会锐化采样
+    # （softmax(τ·p)），坍缩加速。改用对数概率：采样 ∝ p^τ，argmax 不变。
+    logits = params['tau_self'] * jnp.log(mode_activation + 1e-8)  # (M_self,)
 
     if training:
         # Gumbel-Softmax for differentiable mode selection

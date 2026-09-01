@@ -148,8 +148,10 @@ def compute_value_contrast_loss(params, gvalue, aux, cfg: LCMConfig):
         d_neg_w = jnp.stack(d_neg_vals, axis=-1).mean(axis=-1)  # (B, 1)
 
         # Numerically stable InfoNCE: -log(sigmoid((neg-pos)/τ))
-        # = softplus((d_neg - d_pos) / τ)
-        logit = (d_neg_w.squeeze(-1) - d_pos.squeeze(-1)) / tau_val
+        # = softplus(-(neg-pos)/τ) = softplus((d_pos - d_neg) / τ)
+        # Safe state (d_neg > d_pos) → logit < 0 → loss ≈ 0;
+        # unsafe state (d_neg < d_pos) → loss large.
+        logit = (d_pos.squeeze(-1) - d_neg_w.squeeze(-1)) / tau_val
         loss = loss + jnp.mean(jax.nn.softplus(logit))
 
     return cfg.lambda_val * loss / n_lattices

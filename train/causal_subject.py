@@ -132,19 +132,26 @@ class CausalGraph:
         self._edge_valid = np.zeros(max_edges, dtype=np.uint8)
         self._edge_pos = 0  # next write position in flat arrays
 
-    def add_edge(self, edge: CausalEdge):
-        """添加一条因果边（由检测规则调用）。"""
-        self._edges.append(edge)
-        self._action_counter += 1
+    # 状态变化判定阈值：|z_q(step) - z_q(step-1)| < 此值视为无状态变化
+    STATE_CHANGE_THRESHOLD = 1e-3
 
-        # Flat arrays: ring buffer same size as deque
+    def _write_edge_flat(self, edge: CausalEdge):
+        """写入 flat 数组（Cython edge counting 用）。
+
+        环形缓冲区，与 deque 同尺寸。所有建边路径都必须调用。
+        """
         self._effect_steps[self._edge_pos] = edge.effect_step
         self._internal_flags[self._edge_pos] = 1 if edge.internal_chain else 0
         self._edge_valid[self._edge_pos] = 1
         self._edge_pos = (self._edge_pos + 1) % self.max_edges
 
+    def add_edge(self, edge: CausalEdge):
+        """添加一条因果边（由检测规则调用）。"""
+        self._edges.append(edge)
+        self._action_counter += 1
+        self._write_edge_flat(edge)
+
     def detect_causal_edge(self, step: int, action_desc: str,
-                           source: int,
                            prev_records: List) -> Optional[CausalEdge]:
         """基本因果检测规则。
 
@@ -156,7 +163,6 @@ class CausalGraph:
         Args:
             step: 当前步号。
             action_desc: 前一步的操作描述。
-            source: 前一步的源标签。
             prev_records: 前几步的 StepRecord 列表。
 
         Returns:
@@ -172,21 +178,38 @@ class CausalGraph:
         if prev is None:
             return None
 
-        # 条件 2：当前步没有 external 输入
+        # 查找当前步的记录
         current = None
         for r in prev_records:
             if hasattr(r, 'step') and r.step == step:
                 current = r
                 break
 
+        # 条件 1：当前步有状态变化（与上一步的 z_q 差异 > 阈值）
+        # 记录无状态向量时跳过该条件（向后兼容）。
+        cur_state = getattr(current, 'z_q', None) if current is not None else None
+        if cur_state is None:
+            cur_state = getattr(current, 'z', None) if current is not None else None
+        prev_state = getattr(prev, 'z_q', None)
+        if prev_state is None:
+            prev_state = getattr(prev, 'z', None)
+        if cur_state is not None and prev_state is not None:
+            diff = float(np.linalg.norm(
+                np.asarray(cur_state).ravel() - np.asarray(prev_state).ravel()))
+            if diff < self.STATE_CHANGE_THRESHOLD:
+                return None
+
+        # 条件 2：当前步没有 external 输入
         if current is not None:
             cur_source = getattr(current, 'source', SOURCE_EXTERNAL)
             if cur_source == SOURCE_EXTERNAL:
                 # 有外部输入 → 因果链中断
                 return None
 
-        # 条件 3：前一步有 action（source 来自系统内部操作）
-        internal_chain = (source == SOURCE_INTERNAL)
+        # 条件 3：前一步有 action。source 语义是"前一步动作"的源标签，
+        # 来自前一步记录，而不是调用方传入的当前步 source。
+        prev_source = getattr(prev, 'source', SOURCE_EXTERNAL)
+        internal_chain = (prev_source == SOURCE_INTERNAL)
 
         # 构建边
         edge = CausalEdge(
@@ -194,12 +217,13 @@ class CausalGraph:
             action_desc=action_desc,
             effect_step=step,
             effect_desc=f"state_change from step {step - 1}",
-            source=source,
+            source=prev_source,
             confidence=0.5,
             internal_chain=internal_chain,
         )
         self._edges.append(edge)
         self._action_counter += 1
+        self._write_edge_flat(edge)
         return edge
 
     def get_edges_by_range(self, start_step: int,
@@ -589,18 +613,24 @@ class CausalSubject:
         if self._last_record is not None:
             prev_records = [self._last_record, record]
 
-            # 检测因果边
+            # 检测因果边（source 语义是前一步动作的源标签，由
+            # detect_causal_edge 内部从前一步记录读取）
             if action_desc:
                 edge = self.graph.detect_causal_edge(
                     step=record.step,
                     action_desc=self._last_action_desc or action_desc,
-                    source=source,
                     prev_records=prev_records,
                 )
 
         # ── 涌现层 2.1：责任归属 ──
+        # 基线：无内部动作（外部导致结果）也记录，使 prob_given_no_action
+        # 有统计量 —— 否则 responsibility = P(action) - 0 恒 ≥ 0，
+        # "阻止"语义（负责任分）永不表达。
+        if not action_desc or source == SOURCE_EXTERNAL:
+            self.action_stats.observe('__no_action__', record, True)
+
         if action_desc:
-            # 用当前记录的 source 判断是否有外部中断
+            # 用当前记录的 source 判断结果是否由内部处理导致
             result_occurred = (source == SOURCE_INTERNAL)
             self.action_stats.observe(action_desc, record, result_occurred)
 

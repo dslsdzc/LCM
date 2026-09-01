@@ -127,12 +127,14 @@ def hrq_forward(params, z, tau_fallback=0.1, value_scalars=None, alpha_val=0.0):
     else:
         sims = poincare_similarity(z_P[:, None, :], C_top_P[None, :, :])
         sims = sims.squeeze(-1)  # (B, M_top)
-        top_idx = sims.argmax(axis=-1)
+        # poincare_similarity is distance-monotone (larger = farther): nearest = argmin
+        top_idx = sims.argmin(axis=-1)
         top_sim = jnp.take_along_axis(sims, top_idx[:, None], axis=-1).squeeze(-1)
 
     # Check if we need fallback (top-1 / top-2 gap < threshold)
-    sorted_sims = jnp.sort(sims, axis=-1)[:, ::-1]  # descending
-    gap = sorted_sims[:, 0] - sorted_sims[:, 1]
+    # Ascending: closest first; gap = second-closest minus closest
+    sorted_sims = jnp.sort(sims, axis=-1)  # ascending
+    gap = sorted_sims[:, 1] - sorted_sims[:, 0]
     use_fallback = gap < tau_fallback
 
     # Hard route or fallback
@@ -340,12 +342,13 @@ def manifold_ema_update(C, z_sum, count, N, m, gamma=0.99):
 
 def init_binding_params(rng, d, M_bind, n_layers, r_max):
     keys = jax.random.split(rng, 3)
+    k_k, k_v, k_b = jax.random.split(keys[2], 3)  # distinct streams per codebook family
     return {
         'A_k': jax.random.normal(keys[0], (r_max, d)) * 0.01,
         'A_v': jax.random.normal(keys[1], (r_max, d)) * 0.01,
-        'key_cb': [init_simvq(k, M_bind, d) for k in jax.random.split(keys[2], n_layers)],
-        'val_cb': [init_simvq(k, M_bind, d) for k in jax.random.split(keys[2], n_layers)],
-        'bind_cb': [init_simvq(k, M_bind, d) for k in jax.random.split(keys[2], n_layers)],
+        'key_cb': [init_simvq(k, M_bind, d) for k in jax.random.split(k_k, n_layers)],
+        'val_cb': [init_simvq(k, M_bind, d) for k in jax.random.split(k_v, n_layers)],
+        'bind_cb': [init_simvq(k, M_bind, d) for k in jax.random.split(k_b, n_layers)],
     }
 
 

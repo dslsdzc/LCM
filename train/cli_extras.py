@@ -43,7 +43,7 @@ def cmd_train(args):
             save_every=args.cog_save,
             data_path=args.data,
             shape_path=shape,
-            lm_ckpt=args.from_lm_ckpt,
+            lang_ckpt=args.from_lm_ckpt,
             resume=args.resume,
             joint=joint,
         )

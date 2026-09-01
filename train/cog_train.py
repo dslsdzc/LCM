@@ -160,7 +160,10 @@ def init_cog_params(cfg, rng, lang_ckpt=None, resume=None):
 
     if resume:
         params, self_state = load_stage2_params(resume, cfg, rng)
-        params['W_out'] = jax.random.normal(keys[7], (d, cfg.vocab_size)) * (d ** -0.5)
+        # Only initialise W_out when the checkpoint lacks it (resume must not
+        # silently discard the trained readout).
+        if 'W_out' not in params:
+            params['W_out'] = jax.random.normal(keys[7], (d, cfg.vocab_size)) * (d ** -0.5)
     else:
         # ── Init from scratch ──
         params = {}
@@ -360,7 +363,11 @@ def make_train_step(cfg, optimizer, joint=False):
 
             # ── Passive channel: z_q @ W_out ────────────────────────────
             p_logits = jnp.einsum('bsd,dv->bsv', z_qs, p['W_out'])
-            p_target = targets[:, 0]
+            # targets[:, -1] == x[N]: the true next token AFTER the sequence.
+            # (targets[:, 0] == x[1] is inside the bidirectional encoder's
+            # input, so z already "sees" it — the passive channel would
+            # degenerate into copying.)
+            p_target = targets[:, -1]
             p_loss = optax.softmax_cross_entropy_with_integer_labels(
                 p_logits.reshape(-1, p_logits.shape[-1]),
                 p_target[:, None].repeat(cfg.max_inference_steps, axis=1).reshape(-1),
@@ -387,8 +394,12 @@ def make_train_step(cfg, optimizer, joint=False):
             conv = (diffs[:, -1] < cfg.convergence_tol) & (entropies[:, -1] < cfg.entropy_threshold)
             n_steps = jnp.argmax((diffs < cfg.convergence_tol).astype(jnp.float32), axis=-1) + 1
 
+            # Convergence bonus — reward FAST convergence (n=1 → +0.0035,
+            # n=max_steps → 0). The old sign rewarded slow loops: n=1 got 0
+            # while n=32 got -0.0035 (i.e. smaller loss for slower loops).
             loss = p_loss + a_loss + loss_self + jnp.mean(
-                jnp.where(conv, -0.001 * jnp.log(n_steps.astype(jnp.float32) + 1e-8), 0.0))
+                jnp.where(conv, 0.001 * jnp.log(
+                    cfg.max_inference_steps / (n_steps.astype(jnp.float32) + 1e-8)), 0.0))
 
             # ── Stage 3 joint losses ─────────────────────────────────────
             stage3_extra = {}
@@ -419,8 +430,14 @@ def make_train_step(cfg, optimizer, joint=False):
         (loss, aux_out), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
         grads = jax.tree_util.tree_map(
             lambda g: jnp.clip(g, -1.0, 1.0), grads)
-        updates, new_opt = optimizer.update(grads, opt_state, params)
-        new_params = optax.apply_updates(params, updates)
+        # Frozen Qwen is kept out of the optimizer tree (init side in train_cog):
+        # it must not accumulate state or weight decay — it only serves loss_fn.
+        trainable = {k: v for k, v in params.items() if k != 'qwen'}
+        updates, new_opt = optimizer.update(
+            {k: v for k, v in grads.items() if k != 'qwen'},
+            opt_state, trainable)
+        new_params = {**optax.apply_updates(trainable, updates),
+                      'qwen': params['qwen']}
         return new_params, new_opt, loss, aux_out
 
     return train_step
@@ -462,11 +479,10 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
                      b2=cfg.adam_beta2, eps=cfg.adam_eps,
                      weight_decay=cfg.weight_decay),
     )
-    # Separate frozen Qwen from trainable params (Qwen must NOT be in optimizer)
-    frozen_qwen = params.pop('qwen', None)
-    opt_state = optimizer.init(params)
-    if frozen_qwen is not None:
-        params['qwen'] = frozen_qwen
+    # Qwen stays frozen: keep it out of the optimizer tree entirely (no state,
+    # no weight-decay drift — adamw's decoupled decay would otherwise slowly
+    # erode the frozen bridge). train_step() filters it out of the update tree.
+    opt_state = optimizer.init({k: v for k, v in params.items() if k != 'qwen'})
 
     data_iter = WikiDataIter(data_path, shape_path, B=batch_size, N=seq_len)
     train_step = make_train_step(cfg, optimizer, joint=joint)
@@ -526,17 +542,17 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
         current_lr = schedule(step)
         rng, step_rng = jax.random.split(rng)
 
-        # Remove Qwen from trainable params (optimizer must not touch it)
-        frozen_qwen = params.pop('qwen', None)
+        # Shallow backups: train_step returns fresh trees, never mutates these.
+        params_backup, opt_state_backup = params, opt_state
+        self_state_backup = self_state
+
         if sup:
             params, opt_state, loss_val, aux_out = sup.step(
-                train_step, params, opt_state, batch, step_rng,
-                step=step, self_state=self_state, lr=current_lr)
+                train_step, params, opt_state, batch, current_lr, step_rng,
+                step=step, self_state=self_state)
         else:
             params, opt_state, loss_val, aux_out = train_step(
                 params, opt_state, batch, current_lr, step_rng, self_state=self_state)
-        if frozen_qwen is not None:
-            params['qwen'] = frozen_qwen
 
         # Update self state from forward pass
         if self_state is not None and aux_out.get('self_state') is not None:
@@ -544,14 +560,18 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
 
         loss_f = float(loss_val)
 
-        # Save checkpoint before NaN check (always save on schedule)
+        # NaN/inf self-heal: without a Supervisor, one bad step would poison
+        # params forever (every later checkpoint NaN). Roll back and skip.
+        if np.isnan(loss_f) or np.isinf(loss_f):
+            params, opt_state, self_state = (
+                params_backup, opt_state_backup, self_state_backup)
+            pbar.update(1)
+            continue
+
+        # Save checkpoint (only with a clean step — never on poisoned params)
         if save_every > 0 and step % save_every == 0 and step > 0:
             ckpt_dir = os.path.join(output_dir, f"step_{step:06d}")
             save_cog_checkpoint(params, ckpt_dir, step, self_state=self_state)
-
-        if np.isnan(loss_f) or np.isinf(loss_f):
-            pbar.update(1)
-            continue
 
         running_loss += loss_f
 
@@ -672,7 +692,7 @@ def save_cog_checkpoint(params, output_dir, step, self_state=None):
         'n_value_pairs': 4, 'M_danger': 256,
         'n_self_codes': _to_np(params['self']['modes']).shape[0],
         'max_inference_steps': 32, 'convergence_tol': 1e-3,
-        'entropy_threshold': 0.5,
+        'entropy_threshold': 2.0,
     }
     with open(os.path.join(output_dir, "config.json"), "w") as f:
         json.dump(cfg, f)
@@ -762,43 +782,41 @@ def save_cog_checkpoint(params, output_dir, step, self_state=None):
             shutil.copy2(cand, os.path.join(output_dir, "tokenizer.json"))
             break
 
-    # gvalue codebooks
+    # gvalue codebooks — standard 24-byte header. The old 36-byte custom
+    # header made lcm.py parse M as garbage (gv_n wrong → C engine got
+    # misaligned pointers).
     try:
         import hashlib as _hl
+        from train.checkpoint import _pack_header, _compute_checksum
         C_pos, C_neg = make_global_value_vectors(d)
         C_p = _to_np(C_pos)
         C_n = _to_np(C_neg)
-        _hdr = bytearray(36)
-        _hdr[0:6] = b"LCM_CB"
-        struct.pack_into("<I", _hdr, 6, 2)
-        struct.pack_into("<I", _hdr, 10, C_p.shape[0])
-        struct.pack_into("<I", _hdr, 14, d)
-        struct.pack_into("<I", _hdr, 18, 1)
-        _hdr[22] = 20
-        struct.pack_into("<I", _hdr, 24, 0)
-        struct.pack_into("<I", _hdr, 28, sum(_hdr[:28]) & 0xFFFFFFFF)
+        _hdr = bytearray(_pack_header(C_p.shape[0], d, 1, 2, 1.0))
         _data = C_p.tobytes() + C_n.tobytes()
+        struct.pack_into("<I", _hdr, 20, _compute_checksum(_data))
         with open(os.path.join(output_dir, "gvalue_codebook.bin"), "wb") as _f:
             _f.write(_hdr)
             _f.write(_data)
             _f.write(_hl.sha256(_data).digest())
     except Exception as e:
         print(f"[CKPT] gvalue write skipped: {e}")
-    # danger codebook (dummy)
+    # danger codebook (dummy — random placeholder, values NOT trained; the
+    # danger lattice is not part of cognitive training yet)
     try:
+        import zlib as _zl
         M_d = cfg.get("M_danger", 256)
         danger_t = _np.random.randn(M_d, d).astype(_np.float32) * 0.02
         danger_n = _np.random.randn(M_d, d).astype(_np.float32) * 0.02
         _data_d = danger_t.tobytes() + danger_n.tobytes()
         _sha_d = _hl.sha256(_data_d).digest()
-        _crc_d = zlib.crc32(_data_d) & 0xFFFFFFFF
+        _crc_d = _zl.crc32(_data_d) & 0xFFFFFFFF
         _hdr_d = struct.pack("<iiiifI", int(M_d), int(d), 1, 2, 1.0, _crc_d)
         with open(os.path.join(output_dir, "danger_codebook.bin"), "wb") as _f:
             _f.write(_hdr_d)
             _f.write(_data_d)
             _f.write(_sha_d)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[CKPT] danger write skipped: {e}")
 
     # 统计大小
     total_bytes = 0
@@ -807,29 +825,6 @@ def save_cog_checkpoint(params, output_dir, step, self_state=None):
             if f.endswith('.bin') or f.endswith('.json') or f.endswith('.pkl'):
                 total_bytes += os.path.getsize(os.path.join(root, f))
     print(f"[CKPT] Step {step}: inference format → {output_dir}/ ({total_bytes/1e6:.0f} MB)")
-
-
-def _write_cb_bin(dir_path, filename, mat, cb_type):
-    """Write numpy matrix as LCM binary codebook file with header."""
-    import numpy as _np
-    import struct
-    buf = bytearray(36)
-    M, d = mat.shape
-    buf[0:6] = b"LCM_CB"
-    struct.pack_into("<I", buf, 6, 2)    # version
-    struct.pack_into("<I", buf, 10, M)    # n_codes
-    struct.pack_into("<I", buf, 14, d)    # dim
-    struct.pack_into("<I", buf, 18, 1)    # n_layers
-    buf[22] = cb_type
-    buf[23] = 0
-    struct.pack_into("<I", buf, 24, 0)    # c
-    crc = sum(buf[:28]) & 0xFFFFFFFF
-    struct.pack_into("<I", buf, 28, crc)
-    struct.pack_into("<I", buf, 32, 0)    # reserved
-    path = os.path.join(dir_path, filename)
-    with open(path, "wb") as f:
-        f.write(buf)
-        mat.astype(_np.float32).tofile(f)
 
 
 def load_cog_checkpoint(path, d_model=None, n_self_codes=64):

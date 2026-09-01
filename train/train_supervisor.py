@@ -60,26 +60,32 @@ class Supervisor:
         if self.enable:
             print(f"[SUPERVISOR] Auto mode ON — monitoring loss, convergence, and crashes")
 
-    def step(self, train_fn, params, opt_state, batch, rng, **kwargs):
+    def step(self, train_fn, params, opt_state, batch, lr, rng,
+             step=None, self_state=None):
         """Run one training step with monitoring.
+
+        Signature mirrors train_step: (params, opt_state, batch, lr, rng).
+        Passing lr/rng/self_state positionally avoids the old bug where
+        rng landed in the lr slot → "multiple values for argument 'lr'".
 
         Returns (params, opt_state, loss, aux) on success.
         On NaN/inf: auto-reduces LR, rolls back, retries.
         """
         if not self.enable:
-            return train_fn(params, opt_state, batch, rng, **kwargs)
+            return train_fn(params, opt_state, batch, lr, rng,
+                            self_state=self_state)
 
         try:
             new_params, new_opt, loss_val, aux_out = train_fn(
-                params, opt_state, batch, rng, **kwargs)
+                params, opt_state, batch, lr, rng, self_state=self_state)
 
             loss_f = float(loss_val)
 
             # ── NaN / Inf detection ──
             if np.isnan(loss_f) or np.isinf(loss_f):
                 return self._handle_bad_step(
-                    params, opt_state, batch, rng,
-                    f"loss={loss_f}", **kwargs)
+                    params, opt_state, batch, lr, rng,
+                    f"loss={loss_f}", step=step, self_state=self_state)
 
             # ── Loss spike detection ──
             if self.best_loss < float("inf") and loss_f > self.best_loss * 3:
@@ -87,7 +93,11 @@ class Supervisor:
                 if self.bad_streak >= self.patience:
                     print(f"\n[SUPERVISOR] Loss spike x{self.bad_streak}: {loss_f:.4f} vs best {self.best_loss:.4f}")
                     print(f"[SUPERVISOR] Rolling back to step {self.best_step}, reducing LR")
-                    return self._rollback(params, opt_state, batch, rng, **kwargs)
+                    # Roll back to the BEST (healthy) params — passing the
+                    # current degraded params would lock in the damage.
+                    return self._rollback(
+                        self.best_params, self.best_opt_state,
+                        batch, lr, rng, step=step, self_state=self_state)
             else:
                 self.bad_streak = 0
 
@@ -98,7 +108,7 @@ class Supervisor:
                     lambda x: jnp.array(x), new_params)
                 self.best_opt_state = jax.tree_util.tree_map(
                     lambda x: jnp.array(x), new_opt)
-                self.best_step = kwargs.get('step', 0)
+                self.best_step = step if step is not None else 0
 
             # ── Track cognitive convergence ──
             stage3 = aux_out.get('stage3', {})
@@ -110,23 +120,25 @@ class Supervisor:
 
         except Exception as e:
             # ── Crash recovery ──
-            print(f"\n[SUPERVISOR] Training crashed at step {kwargs.get('step', '?')}: {e}")
-            self._emergency_save(params, opt_state, kwargs.get('step', 0))
+            print(f"\n[SUPERVISOR] Training crashed at step {step}: {e}")
+            self._emergency_save(params, opt_state, step or 0)
             return params, opt_state, jnp.array(float("nan")), {}
 
-    def _handle_bad_step(self, params, opt_state, batch, rng, reason, **kwargs):
+    def _handle_bad_step(self, params, opt_state, batch, lr, rng, reason,
+                         step=None, self_state=None):
         """Handle NaN/inf by LR reduction + rollback."""
-        step = kwargs.get('step', 0)
         print(f"\n[SUPERVISOR] Bad step {step}: {reason}")
         self.bad_streak += 1
 
         if self.bad_streak >= self.patience and self.best_params is not None:
             print(f"[SUPERVISOR] Rolling back to step {self.best_step} (loss={self.best_loss:.4f})")
             return self._rollback(self.best_params, self.best_opt_state,
-                                  batch, rng, **kwargs)
+                                  batch, lr, rng, step=step,
+                                  self_state=self_state)
         return params, opt_state, jnp.array(float("nan")), {}
 
-    def _rollback(self, params, opt_state, batch, rng, **kwargs):
+    def _rollback(self, params, opt_state, batch, lr, rng,
+                  step=None, self_state=None):
         """Rollback and reduce LR."""
         self.current_lr *= self.lr_decay
         print(f"[SUPERVISOR] LR reduced to {self.current_lr:.6f}")

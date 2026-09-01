@@ -180,8 +180,10 @@ def detect_anomaly(state: VerifierState, z_batch: jnp.ndarray,
 
     # Combined (weighted average)
     combined = 0.5 * mlp_score + 0.5 * (mahal - 2.0)  # shift mahal so normal ≈ 0
-    # z-score of combined
-    combined_z = combined / (combined.std() + 1e-8)
+    # 用运行统计归一化（B=1 时 batch 自身 std=0 会退化，且 batch std
+    # 与历史分布无关）。scale = 各维运行方差均值的平方根。
+    scale = jnp.sqrt(jnp.mean(state.z_var)) + 1e-8
+    combined_z = combined / scale
 
     is_anomaly = combined_z > params['threshold_low']
     return is_anomaly, combined_z
@@ -256,15 +258,16 @@ def compute_verifier_loss(params_verifier, z_batch, state: VerifierState,
                           lambda_verifier: float = 0.001):
     """Optional regularization to keep representations away from LOCK boundary.
 
-    L_verifier = λ_v * mean(max(0, threshold_low - ||z - z_mean||_Mahal)²)
+    L_verifier = λ_v * mean(max(0, ||z - z_mean||_Mahal - threshold_low)²)
 
-    This is a mild penalty when z_batch is close to the anomaly boundary,
-    training the encoder to produce in-distribution representations.
+    This is a mild penalty when z_batch is FAR from the training distribution
+    (beyond the anomaly threshold), training the encoder to produce
+    in-distribution representations.
     """
     centered = z_batch - state.z_mean[None, :]
     mahal = jnp.sqrt(jnp.sum(
         centered ** 2 / (state.z_var[None, :] + 1e-8), axis=-1))
-    excess = jnp.clip(params_verifier['threshold_low'] - mahal, min=0)
+    excess = jnp.clip(mahal - params_verifier['threshold_low'], min=0)
     return lambda_verifier * jnp.mean(excess ** 2)
 
 

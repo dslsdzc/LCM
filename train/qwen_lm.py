@@ -43,13 +43,17 @@ def precompute_freqs(dim, max_pos, theta=1000000.0):
 
 
 def apply_rope(x, cos, sin):
-    """Apply RoPE to x (B, N, H, d_head). Standard pair-wise rotation."""
-    B, N, H, d = x.shape
-    # x_even, x_odd: (B, N, H, d/2)
-    x_even = x[..., ::2]
-    x_odd  = x[..., 1::2]
+    """Apply RoPE to x (B, N, H, d_head). Standard rotate-half rotation.
 
-    n_freqs = x_even.shape[-1]
+    Qwen2 uses the HF rotate_half convention: the head dimension is split
+    into front/back halves and each frequency rotates one front element with
+    the corresponding back element (NOT interleaved even/odd pairing).
+    """
+    B, N, H, d = x.shape
+    if d % 2 != 0:
+        raise ValueError(f"RoPE requires even head_dim, got {d}")
+
+    n_freqs = d // 2
     # cos/sin shape: (N_full, freqs_full). Slice to (N, n_freqs)
     cos_ = cos[:N, :n_freqs]  # (N, n_freqs)
     sin_ = sin[:N, :n_freqs]
@@ -58,11 +62,12 @@ def apply_rope(x, cos, sin):
     cos_ = cos_[None, :, None, :]
     sin_ = sin_[None, :, None, :]
 
-    rotated_even = x_even * cos_ - x_odd * sin_
-    rotated_odd  = x_even * sin_ + x_odd * cos_
+    # rotate_half: x' = x * cos + cat(-x_back, x_front) * sin
+    x1 = x[..., :n_freqs]  # front half
+    x2 = x[..., n_freqs:]  # back half
 
-    # Interleave → (B, N, H, d)
-    rotated = jnp.stack([rotated_even, rotated_odd], axis=-1).reshape(*x.shape)
+    rotated = jnp.concatenate(
+        [x1 * cos_ - x2 * sin_, x1 * sin_ + x2 * cos_], axis=-1)
     return rotated
 
 
@@ -180,8 +185,10 @@ def qwen_forward(qwen_params, input_ids, z_q=None, z_proj=None, n_layers=24):
     cos_n = cos[:N]
     sin_n = sin[:N]
 
-    # Causal mask
-    mask = jnp.tril(jnp.full((N, N), -float('inf'), dtype=jnp.float32), k=0)
+    # Causal mask: block j > i (future), allow j <= i (past + self).
+    # triu(..., k=1) keeps -inf strictly above the diagonal; tril would
+    # invert the mask and let earlier tokens attend to later ones.
+    mask = jnp.triu(jnp.full((N, N), -float('inf'), dtype=jnp.float32), k=1)
     mask = mask[None, None, :, :]  # (1, 1, N, N)
 
     # Decoder layers

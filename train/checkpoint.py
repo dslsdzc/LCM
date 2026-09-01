@@ -106,10 +106,14 @@ def _read_bin(path, has_hash=False):
             sha = data_bytes[-32:]
             data_bytes = data_bytes[:-32]
 
-        # Verify checksum
+        # Verify checksum (WARN, not raise: old checkpoints predate CRC or
+        # were written by writers that computed it differently — they must
+        # still load, but the corruption is surfaced clearly).
         actual_crc = _compute_checksum(data_bytes)
         if actual_crc != stored_crc:
-            print(f"  [WARN] CRC mismatch in {path}: stored={stored_crc:#x}, actual={actual_crc:#x}")
+            print(f"  [WARN] CRC mismatch in {path}: stored={stored_crc:#x}, "
+                  f"actual={actual_crc:#x} — file is corrupt or was written "
+                  f"by an older writer; re-export the checkpoint")
 
         data = np.frombuffer(data_bytes, dtype=np.float32)
         expected = M * d * n_layers
@@ -349,10 +353,17 @@ def _save_route(params, path):
 
 
 def _save_danger(params, path, M_danger, d):
-    """danger: C with SHA-256 hash (frozen)."""
+    """danger: threats + normals, SHA-256 hash (frozen, values not trained).
+
+    The C engine (lcm.py) reads TWO halves: C_threats (M_danger × d) then
+    C_normal (M_danger × d). params['danger'] only carries the threat
+    codebook (C) — the normal half is a C placeholder: identical threats
+    give danger_score = sim_threat - sim_normal = 0, so the pattern-match
+    gate never fires until real normals are trained.
+    """
     C = np.asarray(params['danger']['C'], dtype=np.float32)
     hdr = _pack_header(M_danger, d, 1, CB_EUCLIDEAN, 1.0)
-    data_bytes = C.tobytes()
+    data_bytes = C.tobytes() + C.tobytes()
     sha = _sha256(data_bytes)
     _write_bin(path, hdr, data_bytes, sha256_digest=sha)
     print(f"    SHA-256: {sha.hex()[:16]}...")

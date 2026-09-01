@@ -69,7 +69,9 @@ def match_euclidean_cy(
         return None
 
     K_actual = K if K < nv else nv
-    top = np.argpartition(dists[:nv], K_actual)[:K_actual]
+    if K_actual <= 0:
+        return None
+    top = np.argpartition(dists[:nv], K_actual - 1)[:K_actual]
     top = top[np.argsort(dists[:nv][top])]
 
     cdef np.ndarray[float, ndim=1] z_pred = np.zeros(D, dtype=np.float32)
@@ -136,7 +138,9 @@ def match_hamming_cy(
         return None
 
     K_actual = K if K < nv else nv
-    top = np.argpartition(dists[:nv], K_actual)[:K_actual]
+    if K_actual <= 0:
+        return None
+    top = np.argpartition(dists[:nv], K_actual - 1)[:K_actual]
     top = top[np.argsort(dists[:nv][top])]
 
     cdef np.ndarray[float, ndim=1] z_pred = np.zeros(D, dtype=np.float32)
@@ -224,6 +228,7 @@ def count_edges_cy(
 # ─── PRNG for sampling (xorshift32, module-local) ─────────────────────────────
 
 cdef unsigned int _rng_state = 2463534242
+cdef unsigned int _rng_seeded = 0
 
 cdef inline float _rand_f32() nogil:
     """Uniform float32 in (0, 1] using xorshift32."""
@@ -235,9 +240,16 @@ cdef inline float _rand_f32() nogil:
 
 
 def init_rng_cy(unsigned int seed):
-    """Seed the module-level PRNG (call once at startup)."""
-    global _rng_state
-    _rng_state = seed
+    """Seed the module-level PRNG (call once at startup; later calls no-op).
+
+    Guarded: repeated calls must NOT reset the state — reseeding with 0 would
+    put xorshift32 into its absorbing state and make _rand_f32() constant.
+    Seed 0 is mapped to a nonzero default for the same reason.
+    """
+    global _rng_state, _rng_seeded
+    if not _rng_seeded:
+        _rng_state = seed if seed != 0 else 2463534242
+        _rng_seeded = 1
 
 
 # ─── sample_categorical_cy — fused top‑k + softmax + CDF walk ────────────────
@@ -518,6 +530,10 @@ def encoder_recurrent_step_cy(
             v_raw[i] = s
 
         # ── Per-head cumsum update ───────────────────────────────────────
+        # State layout: layers_kv[l] is a (d, d) block-diagonal matrix —
+        # head hh occupies rows/cols [hh*d_h, (hh+1)*d_h) (see
+        # lcm.py _kv_cumsum_block). layers_k[l] is the (d,) diagonal of that
+        # per-head k-sum in the same block order.
         for hh in range(n_heads):
             h_start = hh * d_h
             for i in range(d_h):
@@ -572,7 +588,7 @@ def encoder_recurrent_step_cy(
             s = 0.0
             for j in range(d):
                 s += h_norm[j] * _w_1[j, i]
-            glu_gate[i] = (exp(s) if s < 0 else s + 1.0)  # SiLU
+            glu_gate[i] = s / (1.0 + exp(-(s if s > -30.0 else -30.0)))  # SiLU: s * sigmoid(s)
 
         for i in range(d_ff):
             s = 0.0

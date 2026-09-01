@@ -59,22 +59,21 @@ class SlidingStats:
         self._count += 1
 
         n = len(self._buffer)
-        if n < 10:
-            return None  # 冷启动
 
         # 增量均值和方差（Welford 在线算法）
+        # _var 维护 M2 累计量（不除），std 在读取时计算 sqrt(M2/(n-1))。
         if n == 1:
             self._mean = value
             self._var = 0.0
-            return 0.0
+        else:
+            old_mean = self._mean
+            self._mean += (value - old_mean) / n
+            self._var += (value - old_mean) * (value - self._mean)
 
-        old_mean = self._mean
-        self._mean += (value - old_mean) / n
-        self._var += (value - old_mean) * (value - self._mean)
-        if n > 1:
-            self._var /= (n - 1)
+        if n < 10:
+            return None  # 冷启动（统计量仍正确更新，只是不判异常）
 
-        std = np.sqrt(self._var) + 1e-8
+        std = np.sqrt(self._var / (n - 1)) + 1e-8
         z = (value - self._mean) / std
         return float(z)
 
@@ -103,6 +102,12 @@ class AnomalyDetector:
         'convergence_diff', # 收敛差异
         'step_time',        # 步时
     ]
+
+    # 信号方向：值越大越异常（高侧触发）
+    _HIGH_BAD = {'step_time', 'world_dev', 'entropy', 'pred_error',
+                 'fusion_entropy', 'convergence_diff'}
+    # 信号方向：值越小越异常（低侧触发，如 safety_margin 越低越接近危险）
+    _LOW_BAD = {'safety_near_miss'}
 
     def __init__(self, stats_window: int = 100, z_threshold: float = 3.0):
         self.stats_window = stats_window
@@ -159,7 +164,16 @@ class AnomalyDetector:
             if sig_type not in self._stats:
                 continue
             z = self._stats[sig_type].update(value)
-            if z is not None and abs(z) > self.z_threshold:
+            if z is None:
+                continue
+            # 按信号方向触发：高侧异常 z > th，低侧异常（safety_margin）z < -th
+            if sig_type in self._LOW_BAD:
+                triggered = z < -self.z_threshold
+            elif sig_type in self._HIGH_BAD:
+                triggered = z > self.z_threshold
+            else:
+                triggered = abs(z) > self.z_threshold  # 未知类型保持原双向行为
+            if triggered:
                 # 持久性检查：同一类型连续触发才算
                 self._persistent_window.append((sig_type, step))
                 recent_same = [x for x in self._persistent_window
@@ -465,13 +479,11 @@ class CorrectionAction:
     created_step: int = 0
     description: str = ""
 
-    @property
     def is_expired(self, current_step: int) -> bool:
         if self.decay_steps <= 0:
             return False
         return (current_step - self.created_step) >= self.decay_steps
 
-    @property
     def decay_factor(self, current_step: int) -> float:
         if self.decay_steps <= 0:
             return 1.0
@@ -654,6 +666,7 @@ class ReflectionLoop:
         self.executor = CorrectionExecutor(self.registry)
         self._records: deque = deque(maxlen=max_records)
         self._reports: deque = deque(maxlen=100)
+        self._last_step = 0  # 最近一次 feed 的步号（get_stats 的修正活跃判定用）
 
         # 抑制：同类型异常在 N 步内不重复触发
         self._last_signal: Dict[str, int] = defaultdict(int)
@@ -673,6 +686,7 @@ class ReflectionLoop:
         """
         # 存储轨迹
         self._records.append(record)
+        self._last_step = step
 
         # 异常检测
         anomalies = self.detector.feed(step, record)
@@ -800,12 +814,21 @@ class ReflectionLoop:
     def get_recent_reports(self, n: int = 5) -> List[ReflectionReport]:
         return list(self._reports)[-n:]
 
-    def get_stats(self) -> dict:
+    def get_stats(self, current_step: int = None) -> dict:
+        """反思回路统计。
+
+        Args:
+            current_step: 当前步号（步号而非 epoch 秒——修正的
+                created_step 是步号，用 time.time() 比较恒判过期）。
+                缺省用最近 feed 的步号。
+        """
+        if current_step is None:
+            current_step = getattr(self, '_last_step', 0)
         return {
             'n_anomalies': len(self.detector._anomalies),
             'n_reports': len(self._reports),
             'n_active_corrections': len(self.registry.get_active(
-                int(time.time()))),
+                current_step)),
             'anomaly_rate': self.detector.get_anomaly_rate(),
         }
 

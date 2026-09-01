@@ -123,23 +123,40 @@ def make_memory_step(cfg, gvalue_C_pos, gvalue_C_neg):
 
 @jax.jit
 def _jitted_ema(params, ema_state, z):
-    """EMA updates for sparsely-managed codebooks."""
-    z_sum = z.sum(axis=0)
-    count = z.shape[0]
+    """EMA updates for sparsely-managed codebooks.
 
+    按最近码索引做每码本更新：z 只更新其最近码的 N/m 累计量，
+    而不是把 batch 总和广播到每个码本行（否则所有码收敛到同一质心）。
+    """
     # Sparse
+    C_s = params['sparse']['C']
+    M_s = C_s.shape[0]
+    dists = jnp.sum((z[:, None, :] - C_s[None, :, :]) ** 2, axis=-1)  # (B, M)
+    nearest = jnp.argmin(dists, axis=-1)  # (B,)
+    onehot = jax.nn.one_hot(nearest, M_s, dtype=jnp.float32)  # (B, M)
+    counts = onehot.sum(axis=0)  # (M,)
+    sums = onehot.T @ z  # (M, d)
+
     N_s, m_s = ema_state['sparse']['N'], ema_state['sparse']['m']
-    N_s_new = 0.99 * N_s + 0.01 * count
-    m_s_new = 0.99 * m_s + 0.01 * z_sum
+    N_s_new = 0.99 * N_s + 0.01 * counts
+    m_s_new = 0.99 * m_s + 0.01 * sums
     C_s_new = m_s_new / jnp.clip(N_s_new, 1.0)[:, None]
     lam = 1e-4
     C_s_new = jnp.sign(C_s_new) * jnp.clip(jnp.abs(C_s_new) - lam, 0)
     params['sparse']['C'] = C_s_new
 
-    # Manifold
+    # Manifold（同上，更新 C 后用 exp_map 回到 Poincaré 球）
+    C_m = params['manifold']['C']
+    M_m = C_m.shape[0]
+    dists_m = jnp.sum((z[:, None, :] - C_m[None, :, :]) ** 2, axis=-1)  # (B, M)
+    nearest_m = jnp.argmin(dists_m, axis=-1)  # (B,)
+    onehot_m = jax.nn.one_hot(nearest_m, M_m, dtype=jnp.float32)  # (B, M)
+    counts_m = onehot_m.sum(axis=0)  # (M,)
+    sums_m = onehot_m.T @ z  # (M, d)
+
     N_m, m_m = ema_state['manifold']['N'], ema_state['manifold']['m']
-    N_m_new = 0.99 * N_m + 0.01 * count
-    m_m_new = 0.99 * m_m + 0.01 * z_sum
+    N_m_new = 0.99 * N_m + 0.01 * counts_m
+    m_m_new = 0.99 * m_m + 0.01 * sums_m
     from train.hyp import exp_map
     C_m_new = exp_map(m_m_new / jnp.clip(N_m_new, 1.0)[:, None])
     params['manifold']['C'] = C_m_new

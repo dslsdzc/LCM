@@ -41,7 +41,10 @@ def _softmax_attention(q, k, v, mask=None):
 
 
 def _causal_mask(N):
-    return jnp.tril(jnp.full((N, N), -1e9), k=0)
+    # Causal: block j > i (future), allow j <= i (past + self).
+    # triu(..., k=1) keeps the fill strictly above the diagonal; tril would
+    # invert the mask and let earlier tokens attend to later ones.
+    return jnp.triu(jnp.full((N, N), -1e9), k=1)
 
 
 # ─── GLU ──────────────────────────────────────────────────────────────────────

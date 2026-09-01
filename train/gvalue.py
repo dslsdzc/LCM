@@ -116,7 +116,9 @@ class GValueCodebook:
                            for i in range(4)]).min(axis=0)  # (B,)
 
         margins = d_neg - safety_margin_relative - d_pos  # (B,)
-        is_safe = margins > 0
+        # 边界含等号：与 C 引擎 gvalue_check_safety 一致
+        # （pos_d_min > neg_d_min - margin 才不安全，等号安全）
+        is_safe = margins >= 0
 
         # Find which law pair is closest to violation
         all_margins = jnp.stack([
