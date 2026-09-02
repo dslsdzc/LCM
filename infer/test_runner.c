@@ -11,6 +11,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include "lcm.h"
+#include "lcm_api.h"
 
 static int failures = 0;
 
@@ -81,12 +82,61 @@ static void test_danger_direction(void) {
     CHECK(!block, "z near normal prototype → not blocked");
 }
 
+static void test_hrr_no_overwrite(void) {
+    /* Regression: HRR bind/unbind nodes used to leak into outputs[0] (the
+     * HRQ slot) — the fused z came out as ~1/D phase-reconstruction garbage
+     * instead of the retrieved codebook entry. */
+    float cb[2][LCM_D];
+    for (int i = 0; i < LCM_D; i++) cb[0][i] = 0.5f;
+    for (int i = 0; i < LCM_D; i++) cb[1][i] = -0.25f;
+    float z[LCM_D];
+    for (int i = 0; i < LCM_D; i++) z[i] = 0.4f;
+    float z_out[LCM_D];
+    memset(z_out, 0, sizeof(z_out));
+    int ret = lcm_infer_loop(z, LCM_D,
+                             &cb[0][0], 2, NULL, 0, NULL, 0, NULL, 0, NULL, 0,
+                             NULL, 0, NULL, 0,
+                             NULL, 0, NULL, NULL, 0, NULL,
+                             1, 1e-3f, 2.0f, 8, z_out);
+    CHECK(ret == 0 || ret == -1, "lcm_infer_loop ran");
+    float val = fabsf(z_out[0]);
+    CHECK(val > 0.1f, "z_out ≈ codebook entry (0.5), not ~1/D HRR garbage");
+}
+
+static void test_fusion_l2_weights(void) {
+    /* Two lattices. From z=0 the first fused point is
+     * (1/1.1·1.1 + ⅓·3)/(1/1.1 + ⅓) ≈ 1.61 (weights 1/√d); the loop then
+     * switches the first lattice to entry [2,0] and converges to ≈2.22 —
+     * a fixed point of the L2-reciprocal fusion (with squared-distance
+     * weights, the old bug, it converged to ≈1.05). Assert the L2 basin.
+     * (confidences = 1/(√d + ε) is verified separately in the trace.) */
+    float cb1[2][LCM_D];
+    float cb2[2][LCM_D];
+    memset(cb1, 0, sizeof(cb1));
+    memset(cb2, 0, sizeof(cb2));
+    cb1[0][0] = 1.1f; cb1[1][0] = 2.0f;
+    cb2[0][0] = 3.0f; cb2[1][0] = 4.0f;
+    float z[LCM_D];
+    memset(z, 0, sizeof(z));
+    float z_out[LCM_D];
+    memset(z_out, 0, sizeof(z_out));
+    lcm_infer_loop(z, LCM_D,
+                   &cb1[0][0], 2, &cb2[0][0], 2,
+                   NULL, 0, NULL, 0, NULL, 0, NULL, 0, NULL, 0,
+                   NULL, 0, NULL, NULL, 0, NULL,
+                   2, 1e-3f, 2.0f, 8, z_out);
+    CHECK(fabsf(z_out[0] - 2.22f) < 0.15f,
+          "fusion fixed point ≈ 2.22 (L2 reciprocal weights)");
+}
+
 int main(void) {
     printf("LCM engine tests (LCM_D=%d):\n", LCM_D);
     test_lcm_dim();
     test_log_map_c_finite_for_c_gt_1();
     test_gvalue_hash_covers_neg();
     test_danger_direction();
+    test_hrr_no_overwrite();
+    test_fusion_l2_weights();
     if (failures == 0)
         printf("ALL TESTS PASSED\n");
     else
