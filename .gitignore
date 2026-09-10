@@ -22,6 +22,9 @@ infer/test_runner
 checkpoints/
 data/
 
+# --- Consolidated experiment archive (raw bundles from Download.zip) ---
+artifacts/
+
 # --- Raw data files (Wikipedia dumps, corpus, extracts, etc.) ---
 extracted/
 *.bz2
