@@ -118,6 +118,10 @@ def gen_head_forward(params_head, z_q, x, training=True):
 
     # Embed all input tokens, prepend z_q → (B, N+1, d)
     target_emb = params_head['w_embed'][x]  # (B, N, d)
+    # Keep the cognitive state visible at every decoding position.  Injecting
+    # it only as a prefix lets a shallow recurrent/linear decoder forget the
+    # prompt after the first few tokens.
+    target_emb = target_emb + 0.5 * z_q[:, None, :]
     inputs = jnp.concatenate([z_q[:, None, :], target_emb], axis=1)  # (B, N+1, d)
 
     # ---- Causal linear attention: φ(x) = ELU(x) + 1 ----
