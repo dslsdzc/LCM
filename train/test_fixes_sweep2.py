@@ -100,7 +100,10 @@ def test_train_py_ema_no_collapse():
 
     for _ in range(300):
         batch = np.stack([_sample() for _ in range(B)])
-        params, ema_state = _jitted_ema(params, ema_state, jnp.array(batch), cfg)
+        # aux=None: this fixture has no binding codebooks, so there are no
+        # per-layer residual inputs to drive the binding EMA either.
+        params, ema_state = _jitted_ema(params, ema_state, jnp.array(batch),
+                                        None, cfg)
     d_sparse = _min_code_dist(params['sparse']['C'])
     d_man = _min_code_dist(params['manifold']['C'])
     assert d_sparse > 0.1, f"sparse codes collapsed (min dist {d_sparse:.3f})"

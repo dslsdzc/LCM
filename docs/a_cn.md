@@ -338,8 +338,19 @@ L_lang = cross_entropy(z_q @ W_out, targets)
 ### 5.2 认知训练（独立流程）
 
 认知系统训练，被动通道 `z_q @ W_out` 和主动通道（Qwen 桥接）联合优化：
-- `L_passive`：被动通道 `z_q @ W_out` 的 CE loss（诚实直接读出）
+
+> **上下文/生成段切分（必须）**：序列在 `cog_context_frac`（默认 0.5）处切成两段，
+> `z` **只从上下文段** 计算，两个通道都只监督**生成段**，且生成段单独喂给主动通道。
+> 若 `z` 由整条序列的双向 encoder 算出、又用来监督整条 shifted target，则 encoder 在
+> 位置 i 预测 `x[i+1]` 之前就已经读过 `x[i+1]` —— 每个 target 都从 `z` 泄漏，loss 会
+> 非常漂亮但没有任何意义。`L_z_margin` 是配套的防退化铰链：`logit(真值|z) −
+> logit(真值|z=0)` 必须 ≥ `active_z_margin`，否则主动通道会直接忽略 `z`、退化成普通
+> 因果 LM。此结构即 `train/causal_student_train.py` 已验证的形态。
+
+- `L_passive`：被动通道 `z_q @ W_out` 的 CE loss（诚实直接读出）。读出目标是上下文之后
+  的第一个 token `x[ctx_len]` —— 它不在 encoder 输入内，因此不可能退化成复制。
 - `L_active`：主动通道（冻结LLM 检索融合后输出）CE loss（丰富表达）
+- `L_z_margin`：主动通道对 `z` 的依赖铰链（权重 `active_z_margin_weight`）
 - `L_VQ_i`：各格的承诺损失 `β ‖sg[z_gate] - o_i‖²`，`β` 可配置。各格损失已含多层结构：多层格的承诺损失为各残差层之和。
 - 稀疏性由 EMA + 软阈值萎缩（`λ_sparse`）+ 特征池死点重置实现，无单独 `L_sparse`。
 - `L_contrast`：双码本 InfoNCE（多层求和，跨码本负采样），权重 `λ_contrast`。

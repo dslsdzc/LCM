@@ -151,63 +151,6 @@ def gen_head_forward(params_head, z_q, x, training=True):
     return full_logits[:, 1:, :]  # (B, N, V)
 
 
-def gen_head_generate(params_head, z_q, max_len, bos_token, eos_token, rng):
-    """Autoregressive generation with causal linear attention + GLU (step-by-step).
-
-    Uses recurrent KV-sum cache (O(d²) per step) for linear attention,
-    avoiding N×N attention matrix.
-    """
-    d = z_q.shape[-1]
-
-    # Initialise KV cumulative sum with z_q as the start token
-    K_start = (jax.nn.elu(z_q @ params_head['w_k']) + 1.0)[None, :]  # (1, d)
-    V_start = (z_q @ params_head['w_v'])[None, :]                     # (1, d)
-    kv_sum = jnp.einsum('bd,be->de', K_start, V_start)               # (d, d)
-    k_sum = K_start[0]                                                # (d,)
-
-    tokens = [bos_token]
-    rng_key = rng
-    current_embed = z_q
-
-    for step in range(max_len):
-        # Compute query from current input
-        Q = (jax.nn.elu(current_embed @ params_head['w_q']) + 1.0)  # (d,) or (B, d)
-
-        # Receptive KV for this step: Q @ kv_sum / (Q @ k_sum + eps)
-        numerator = jnp.einsum('d,de->e', Q if Q.ndim == 1 else Q[0], kv_sum)
-        denominator = jnp.einsum('d,d->', Q if Q.ndim == 1 else Q[0], k_sum)[None] + 1e-8
-        attn_out = (numerator / denominator) @ params_head['w_o']  # (d,)
-
-        # GLU
-        gate = jax.nn.sigmoid(attn_out @ params_head['w_1'])
-        up = attn_out @ params_head['w_2']
-        glu_out = gate * up  # (d*4,)
-
-        # Vocab projection
-        logits = glu_out @ params_head['w_3']  # (V,)
-
-        # Sample
-        rng_key, subkey = jax.random.split(rng_key)
-        next_token = jax.random.categorical(subkey, logits)
-        next_id = int(jnp.squeeze(jax.lax.stop_gradient(next_token)))
-
-        tokens.append(next_id)
-
-        if next_id == eos_token:
-            break
-
-        # Embed the sampled token for the next step
-        current_embed = params_head['w_embed'][next_id]  # (d,)
-
-        # Accumulate into KV cache
-        K_new = (jax.nn.elu(current_embed @ params_head['w_k']) + 1.0)  # (d,)
-        V_new = current_embed @ params_head['w_v']                       # (d,)
-        kv_sum = kv_sum + jnp.einsum('d,e->de', K_new, V_new)
-        k_sum = k_sum + K_new
-
-    return jnp.array(tokens)
-
-
 def init_gen_head_params(rng, d, vocab_size):
     """Initialize generation head parameters with causal linear attention + GLU."""
     k1, k2, k3, k4, k5, k6, k7, k8 = jax.random.split(rng, 8)

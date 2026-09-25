@@ -35,24 +35,27 @@ def compute_vq_loss(params, aux, z, cfg: LCMConfig):
     """Compute all VQ commitment losses."""
     # Normalize z to unit sphere so commitment is about direction, not magnitude.
     # Without this, encoder output can grow unboundedly and commitment loss explodes.
-    z = z / (jnp.linalg.norm(z, axis=-1, keepdims=True) + 1e-8)
+    z = safe_unit(z)
     losses = {}
 
-    # Routing gate
-    losses['route'] = route_commit_loss(z, aux['z_route'], cfg.beta_vq)
+    # Routing gate — pass the RAW codebook vector, not routing_gate's STE output.
+    # The STE output is constant w.r.t. C_route, so the loss would leave the
+    # routing prototype with zero gradient (see route_commit_loss).
+    losses['route'] = route_commit_loss(
+        z, params['route']['C_route'][aux['route_idx']], cfg.beta_vq)
 
     # Hierarchy: commitment for each SimVQ layer
     hrq_loss = 0.0
     for fb in params['hrq']['fine']:
         C_fb = fb['A'] @ fb['W']
-        hrq_loss += _commit_loss(z, C_fb, cfg.beta_vq)
+        hrq_loss += commit_loss(z, C_fb, cfg.beta_vq)
     C_top = params['hrq']['top']['A'] @ params['hrq']['top']['W']
-    hrq_loss += _commit_loss(z, C_top, cfg.beta_vq)
+    hrq_loss += commit_loss(z, C_top, cfg.beta_vq)
     losses['hrq'] = hrq_loss
 
     # Sparse
     C_sparse = params['sparse']['C']
-    losses['sparse'] = _commit_loss(z, C_sparse, cfg.beta_vq)
+    losses['sparse'] = commit_loss(z, C_sparse, cfg.beta_vq)
 
     # Low-rank (all layers)
     lr_loss = 0.0
@@ -60,14 +63,14 @@ def compute_vq_loss(params, aux, z, cfg: LCMConfig):
     r = z
     for u_k, r_k in zip(params['lowrank']['U'], cfg.ranks):
         C_k = u_k @ V[:, :r_k].T
-        lr_loss += _commit_loss(r, C_k, cfg.beta_vq)
+        lr_loss += commit_loss(r, C_k, cfg.beta_vq)
         idx = jnp.linalg.norm(r[:, None, :] - C_k[None, :, :], axis=-1).argmin(axis=-1)
         r = r - C_k[idx]
     losses['lowrank'] = lr_loss
 
     # Manifold
     C_man = exp_map(params['manifold']['C'])
-    losses['manifold'] = _commit_loss(z, log_map(C_man), cfg.beta_vq)
+    losses['manifold'] = commit_loss(z, log_map(C_man), cfg.beta_vq)
 
     # Binding: all sub-codebooks
     binding_loss = 0.0
@@ -76,16 +79,16 @@ def compute_vq_loss(params, aux, z, cfg: LCMConfig):
                     params['binding']['bind_cb']]:
         for cb in cb_list:
             C_cb = cb['A'] @ cb['W']
-            binding_loss += _commit_loss(z, C_cb, cfg.beta_vq)
+            binding_loss += commit_loss(z, C_cb, cfg.beta_vq)
     losses['binding'] = binding_loss
 
     return losses
 
 
-def _commit_loss(z, C, beta=0.25):
+def commit_loss(z, C, beta=0.25):
     """VQ commitment loss: β·||sg[z_norm] - C_norm[idx]||² (unit-sphere)."""
-    z_n = z / (jnp.linalg.norm(z, axis=-1, keepdims=True) + 1e-8)
-    C_n = C / (jnp.linalg.norm(C, axis=-1, keepdims=True) + 1e-8)
+    z_n = safe_unit(z)
+    C_n = safe_unit(C)
     dist = jnp.linalg.norm(z_n[:, None, :] - C_n[None, :, :], axis=-1)
     idx = dist.argmin(axis=-1)
     return beta * jnp.mean((lax.stop_gradient(z_n) - C_n[idx]) ** 2)
@@ -105,98 +108,108 @@ def compute_contrast_loss(params, z, cfg: LCMConfig, gvalue=None):
         params['contrast'], z, tau=0.5)
 
 
-def compute_orth_loss(params, aux, cfg: LCMConfig):
-    """Tangent space orthogonality regularization."""
-    return cfg.lambda_orth * manifold_orth_loss(
+def compute_orth_loss(params, aux, cfg: LCMConfig, rng=None):
+    """Tangent space orthogonality regularization: λ·‖Tᵀ T − I‖².
+
+    ``manifold_orth_loss`` already scales by ``lambda_orth``; multiplying again
+    here applied the weight twice (λ²).
+    """
+    return manifold_orth_loss(
         params['manifold']['T'],
         aux['man_idx'],
         k=cfg.n_orth_samples,
-        lambda_orth=cfg.lambda_orth)
+        lambda_orth=cfg.lambda_orth,
+        rng=rng)
+
+
+def _min_euclidean(x, anchors):
+    """Minimum Euclidean distance from x (B, d) to each of the anchors (d,)."""
+    return jnp.min(jnp.stack(
+        [jnp.linalg.norm(x - a[None, :], axis=-1) for a in anchors], axis=-1),
+        axis=-1)
+
+
+def value_contrast_loss(lattice_outputs, C_pos, C_neg, tau_val,
+                        lambda_val=1.0):
+    """Value contrast loss over the lattice outputs — the canonical form.
+
+    ``L = λ · mean_i softplus((d_pos(i) − d_neg(i)) / τ)``
+
+    Safe state (far from the negative anchors, close to the positive ones)
+    drives the logit negative and the loss to zero; an unsafe state makes it
+    large. Note the sign: ``d_pos − d_neg``, NOT ``d_neg − d_pos``. The
+    reversed form trains the lattice outputs *toward* the negative anchors and
+    away from the positive ones — it is a silent, high-impact inversion (the
+    loss still decreases, just in the wrong direction).
+
+    Distances are Euclidean, not hyperbolic. Lattice outputs are
+    ``z + stop_gradient(...)`` with ``z`` normalised to the unit sphere, i.e.
+    they sit essentially on the Poincaré ball's boundary, where
+    ``poincare_similarity``'s denominator ``(1−‖u‖²)(1−‖v‖²)`` collapses to the
+    clamp and the "distance" becomes meaningless.
+
+    ``lambda_val`` is applied exactly once, here. Callers must not scale the
+    result again.
+
+    The negative term is the distance to the *nearest* negative anchor. The
+    previous form, a harm-proximity-weighted mean ``Σ_j exp(−‖o−v_harm‖/τ)·d_j``,
+    evaluated to zero in practice: lattice outputs sit at unit norm and the
+    anchors at 0.9, so distances are O(1) while ``tau_val_signal`` is 0.1 and
+    ``exp(−1.4/0.1) ≈ 1e-6``. The weighting did not reweight the four anchors
+    either — it depends on ``o`` and the harm anchor only, so it scaled the
+    whole negative term by a factor that was always ~0. The loss then reduced
+    to "be close to the positive anchors" with the negatives inert. Harm
+    emphasis is still present where it is well-posed: the value signal in
+    ``fusion.fuse_lattices`` and the per-entry weighting in
+    ``lattices.contrast_value_biased_nce_loss``.
+
+    Args:
+        lattice_outputs: list of (B, d) arrays, one per lattice.
+        C_pos: (P, d) positive value anchors.
+        C_neg: (N, d) negative value anchors; ``C_neg[1]`` is the harm anchor.
+        tau_val: Temperature for the margin logit.
+        lambda_val: Loss weight.
+
+    Returns:
+        Scalar loss.
+    """
+    if lattice_outputs is None or C_pos is None or C_neg is None:
+        return jnp.array(0.0)
+    if lambda_val == 0:
+        return jnp.array(0.0)
+
+    loss = 0.0
+    for o in lattice_outputs:
+        d_pos = _min_euclidean(o, C_pos)
+        d_neg = _min_euclidean(o, C_neg)
+        logit = (d_pos - d_neg) / tau_val
+        loss = loss + jnp.mean(jax.nn.softplus(logit))
+
+    return lambda_val * loss / len(lattice_outputs)
 
 
 def compute_value_contrast_loss(params, gvalue, aux, cfg: LCMConfig):
-    """Value contrast loss for local value scalars.
+    """Value contrast loss for local value scalars (see ``value_contrast_loss``).
 
-    Negative samples weighted by proximity to v_harm (safety-critical boundary):
-      L_val = λ_val * Σ_i InfoNCE(o_i, C_pos, C_neg_w_harm_weight)
-
-    Uses numerically stable log-softplus formulation to avoid exp underflow.
-
-    Only trains the local value scalars v_j (gvalue stays frozen).
+    Negative samples are weighted by proximity to the harm anchor, so
+    safety-critical boundaries dominate the signal. Only the local value
+    scalars are affected; ``gvalue`` stays frozen.
     """
     if gvalue is None or aux.get('value_signals') is None:
         return jnp.array(0.0)
-
-    v_harm = gvalue.C_neg[1]  # the harm vector (index 1 in C_neg)
-    loss = 0.0
-    n_lattices = len(aux['lattice_outputs'])
-    tau_val = cfg.tau_val_signal
-
-    for i in range(n_lattices):
-        o = aux['lattice_outputs'][i]  # (B, d)
-
-        # Distances to positive anchors (min over 4 laws)
-        d_pos = jnp.stack([poincare_distance(o, gvalue.C_pos[j])
-                           for j in range(4)]).min(axis=0)  # (B, 1)
-        # Distances to negative anchors, harm-weighted
-        d_neg_vals = []
-        for j in range(4):
-            d_j = poincare_distance(o, gvalue.C_neg[j])  # (B, 1)
-            harm_dist = poincare_distance(o, v_harm)  # (B, 1)
-            w_harm = jnp.exp(-harm_dist / tau_val)
-            d_neg_vals.append(w_harm * d_j)
-        d_neg_w = jnp.stack(d_neg_vals, axis=-1).mean(axis=-1)  # (B, 1)
-
-        # Numerically stable InfoNCE: -log(sigmoid((neg-pos)/τ))
-        # = softplus(-(neg-pos)/τ) = softplus((d_pos - d_neg) / τ)
-        # Safe state (d_neg > d_pos) → logit < 0 → loss ≈ 0;
-        # unsafe state (d_neg < d_pos) → loss large.
-        logit = (d_pos.squeeze(-1) - d_neg_w.squeeze(-1)) / tau_val
-        loss = loss + jnp.mean(jax.nn.softplus(logit))
-
-    return cfg.lambda_val * loss / n_lattices
+    return value_contrast_loss(
+        aux['lattice_outputs'], gvalue.C_pos, gvalue.C_neg,
+        cfg.tau_val_signal, cfg.lambda_val)
 
 
-def compute_safety_margin_loss(gvalue, aux, cfg: LCMConfig):
-    """Safety margin regularization — mild penalty near boundary."""
-    if gvalue is None or 'lattice_outputs' not in aux:
-        return jnp.array(0.0)
-    # Apply to fused output z_q (we don't have it here directly, use lattice_outputs)
-    # In practice, safety_margin_loss is applied separately in train_step
-    return jnp.array(0.0)
 
-
-def compute_total_loss(params, gvalue, logits, targets, z, aux, cfg: LCMConfig,
-                       ewc_loss_val=None):
-    """Compute total training loss.
-
-    L_total = L_LM + L_VQ + L_contrast + L_orth + L_val + L_ewc + L_margin
-
-    Args:
-        ewc_loss_val: Optional EWC loss from continual learning system.
-    """
-    loss_lm = compute_lm_loss(logits, targets, cfg.vocab_size)
-    vq_losses = compute_vq_loss(params, aux, z, cfg)
-    loss_vq = sum(vq_losses.values())
-    loss_contrast = compute_contrast_loss(params, z, cfg, gvalue=gvalue)
-    loss_orth = compute_orth_loss(params, aux, cfg)
-    loss_val = compute_value_contrast_loss(params, gvalue, aux, cfg)
-
-    total = loss_lm + loss_vq + loss_contrast + loss_orth + loss_val
-
-    if ewc_loss_val is not None:
-        total = total + ewc_loss_val
-
-    components = {
-        'lm': loss_lm,
-        'vq': loss_vq,
-        'contrast': loss_contrast,
-        'orth': loss_orth,
-        'val': loss_val,
-        'ewc': ewc_loss_val if ewc_loss_val is not None else jnp.array(0.0),
-    }
-    return total, components
+# NOTE: there used to be a `compute_total_loss` composition here, reachable only
+# from train.py's `_build_loss_grad_fn` — a second, never-executed copy of the
+# training loss. Both are gone; `_jitted_step.loss_fn` in train.py is the single
+# live composition, and every term it uses comes from this module or lattices.py.
+# Two parallel loss implementations is how the value-contrast sign and the
+# orthogonality term drifted apart in the first place.
 
 
 # Import for hyperbolic ops in this module
-from train.hyp import exp_map, log_map, poincare_distance
+from train.hyp import exp_map, log_map, safe_unit

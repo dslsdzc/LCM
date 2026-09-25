@@ -10,6 +10,7 @@ import optax
 
 from train.config import LCMConfig
 from train.encoder import init_encoder_params, encoder_forward
+from train.hyp import safe_unit
 from train.lattices import (
     init_route_params, routing_gate, route_commit_loss,
     init_hrq_params, hrq_forward,
@@ -115,7 +116,7 @@ def forward(params, gvalue, x, cfg: LCMConfig, training=True, rng=None,
     # Normalize to unit sphere so encoder magnitude doesn't explode through
     # lattice forwards and commitment losses. Without this, N=512 with random
     # init can produce z-norms that overflow downstream softmax/log ops.
-    z = z / (jnp.linalg.norm(z, axis=-1, keepdims=True) + 1e-8)
+    z = safe_unit(z)
 
     # Routing gate with optional bias injection
     route_params = params['route']
@@ -147,7 +148,7 @@ def forward(params, gvalue, x, cfg: LCMConfig, training=True, rng=None,
         value_scalars=vs.get('manifold'), alpha_val=alpha_val)
 
     V = params['lowrank']['A_V'] @ params['lowrank']['W_V']
-    o_binding = binding_forward(
+    o_binding, binding_residuals = binding_forward(
         params['binding'], z, V,
         value_scalars=vs.get('binding'), alpha_val=alpha_val)
     o_contrast = contrast_forward(
@@ -193,6 +194,10 @@ def forward(params, gvalue, x, cfg: LCMConfig, training=True, rng=None,
         'hrq_idx': hrq_idx,
         'hrq_top_sim': hrq_top_sim,
         'sparse_idx': sparse_idx,
+        # Per-layer query vectors of the binding residual chains — the space
+        # each binding codebook actually quantises, and therefore the space its
+        # EMA must accumulate.
+        'binding_residuals': binding_residuals,
         'value_signals': None if gvalue is None else
             gvalue.compute_value_signal_batch(lattice_outputs, cfg.tau_val_signal),
         'safety_margin': min_margin,
@@ -204,40 +209,49 @@ def forward(params, gvalue, x, cfg: LCMConfig, training=True, rng=None,
 
 
 def get_frozen_param_names():
-    """Return names of parameters excluded from gradient updates.
+    """Return names of parameters excluded from *all* updates.
 
-    The global value lattice is frozen entirely.
-    EMA-managed codebooks are also excluded from gradient updates
-    (they are updated via EMA update function).
+    These are the permanently-frozen safety layers. They are never trained and
+    never touched by the optimizer, so neither their gradient nor AdamW's
+    decoupled weight decay may modify them.
+
+    Deliberately NOT listed here (see README §"Gradient and EMA Hybrid
+    Management"): ``sparse/C``, ``manifold/C`` and ``binding/*_cb``. Those are
+    *EMA + gradient* codebooks — they receive gradient like any other
+    parameter **and** are additionally updated by the per-code EMA pass. An
+    earlier revision of this list marked them frozen, which contradicted the
+    README and the EMA design; it was never applied anywhere, so nothing
+    depended on it. ``gvalue`` is absent from ``params`` altogether (it lives
+    on ``TrainingState`` as a ``GValueCodebook``) and needs no entry.
     """
     return [
-        # Global value lattice — never touched by optimizer
-        'gvalue/*',
-        # EMA-managed codebooks — excluded from gradient, updated by EMA
-        'sparse/C',
-        'sparse/zero_vec',
-        'manifold/C',
-        'binding/key_cb/*',
-        'binding/val_cb/*',
-        'binding/bind_cb/*',
+        'danger/C',      # Danger lattice — frozen, never trained
     ]
 
 
-def split_trainable_frozen(params, frozen_prefixes):
-    """Split params into trainable and frozen trees."""
-    import re
-    trainable = {}
-    frozen = {}
-    # Flatten params and match against prefixes
-    flat = _flatten_dict(params)
-    for path, val in flat.items():
+def restore_frozen_params(params_new, params_old, frozen_prefixes):
+    """Undo any change to frozen leaves after an optimizer update.
+
+    AdamW applies decoupled weight decay as ``-lr·wd·θ`` regardless of the
+    gradient, so a parameter that is never trained still shrinks every step
+    unless something restores it. The optimizer tree keeps every leaf (the
+    optimizer state shape is unchanged), so existing checkpoints stay loadable.
+
+    Note ``_flatten_dict`` treats a Python list as a single leaf, so a pattern
+    cannot address *inside* a list (``hrq/fine/0/W`` will not match). Freeze
+    whole subtrees, or extend the flattener first.
+    """
+    if not frozen_prefixes:
+        return params_new
+    flat_old = _flatten_dict(params_old)
+    flat_new = _flatten_dict(params_new)
+    out = {}
+    for path, val in flat_new.items():
         key = '/'.join(path)
-        is_frozen = any(_match_prefix(key, p) for p in frozen_prefixes)
-        if is_frozen:
-            _set_in_dict(frozen, path, val)
-        else:
-            _set_in_dict(trainable, path, val)
-    return trainable, frozen
+        if any(_match_prefix(key, p) for p in frozen_prefixes):
+            val = flat_old[path]
+        _set_in_dict(out, path, val)
+    return out
 
 
 def _flatten_dict(d, prefix=()):

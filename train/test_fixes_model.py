@@ -131,6 +131,14 @@ def test_value_contrast_loss_direction():
     """Near-positive state → small loss; near-harm state → large loss.
 
     With the reversed (buggy) sign, the near-harm state gets ~0 loss.
+
+    Absolute thresholds here are set by the metric, not by the sign property:
+    the loss switched from Poincaré to Euclidean distance (lattice outputs sit
+    on the ball boundary where the hyperbolic denominator collapses to its
+    clamp). For this fixture the analytical values are
+    ``λ·softplus(−d/τ) ≈ 1.5e-10`` when safe and ``λ·softplus(+d/τ) = 0.01·18 =
+    0.18`` when at the harm anchor, so the guarded property is the ratio, with
+    a loose absolute floor as a sanity check.
     """
     cfg = LCMConfig()
     p = jnp.array([0.9, 0.0])
@@ -144,9 +152,9 @@ def test_value_contrast_loss_direction():
 
     loss_safe = float(losses.compute_value_contrast_loss({}, gvalue, aux_safe, cfg))
     loss_harm = float(losses.compute_value_contrast_loss({}, gvalue, aux_harm, cfg))
-    assert loss_safe < 0.1, f"near-positive state should have small loss, got {loss_safe}"
-    assert loss_harm > 0.5, f"near-harm state should have large loss, got {loss_harm}"
-    assert loss_harm > 5 * loss_safe, \
+    assert loss_safe < 1e-3, f"near-positive state should have ~0 loss, got {loss_safe}"
+    assert loss_harm > 0.1, f"near-harm state should have large loss, got {loss_harm}"
+    assert loss_harm > 1e3 * loss_safe, \
         f"loss ratio wrong: safe={loss_safe}, harm={loss_harm}"
 
 

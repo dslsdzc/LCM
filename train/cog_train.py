@@ -33,7 +33,7 @@ from train.self_lattice import (
     self_lattice_reg_loss,
 )
 from train.cog_loop import cog_loop_scan
-from train.lattices import contrast_info_nce_loss
+from train.lattices import contrast_info_nce_loss, manifold_orth_loss
 from train.lang_lcm import lang_lcm_forward
 from train.qwen_lm import qwen_forward, load_qwen_params, QWEN_CONFIG
 
@@ -310,12 +310,22 @@ def active_loss(logits, targets):
 def make_train_step(cfg, optimizer, joint=False):
     """Create jitted training step with dual-channel output + self-lattice.
 
-    Every macro step's z_q feeds both channels:
-      - Passive (introspection):  z_q @ W_out → single-token CE
-      - Active (expression):      Language LCM(z_q) → full-sequence CE
+    The sequence is split at ``cog_context_frac``. z is computed from the
+    **context** half only; both channels are then supervised on what follows:
 
-    The Language LCM is frozen (stop_gradient) so the gradient forces the
-    cognitive state z_q to adapt to the frozen language model.
+      - Passive (introspection): z_q @ W_out → the first token after the context
+      - Active (expression):     active_channel(z_q, generation segment)
+
+    The generation segment is fed to the active channel on its own, so z is the
+    only channel carrying the context. Supervising the whole shifted sequence
+    from a global z — the previous behaviour — leaks every target through z,
+    because the bidirectional encoder has already read x[i+1] by the time
+    position i is asked to predict it. The loss looked excellent and measured
+    nothing. A hinge on ``logit(true | z) − logit(true | z=0)`` stops the active
+    channel from ignoring z and degenerating into a plain causal LM.
+
+    The Language LCM / Qwen bridge is frozen (stop_gradient) so the gradient
+    forces the cognitive state z_q to adapt to it.
 
     Self-lattice provides internal state machine (mode selection, self output).
 
@@ -329,9 +339,27 @@ def make_train_step(cfg, optimizer, joint=False):
     def train_step(params, opt_state, batch, lr, rng, self_state=None):
         inputs, targets = batch
         B, N = inputs.shape
+        # Context / generation split for the active channel (see the
+        # make_train_step docstring). Derived from the *batch* length, not
+        # cfg.max_seq_len — those differ whenever --cog-seq is set, and a split
+        # past the end would leave an empty generation segment.
+        ctx_len = max(1, min(int(N * cfg.cog_context_frac), N - 1))
+        # Context = the tokens z is allowed to see. The generation segment is
+        # structurally disjoint from it, so no target is ever inside z's input.
+        ctx = inputs[:, :ctx_len]
+        # The bridge injects z by OVERWRITING position 0's embedding, so the
+        # token placed there is consumed by the injection slot and never
+        # predicted. Feed one extra token — x[ctx_len-1], which the injection
+        # discards anyway — and every remaining position then predicts its own
+        # successor: logits[:, j] <-> targets[:, ctx_len-1+j]. Starting the
+        # segment at ctx_len instead skips x[ctx_len] entirely and leaves every
+        # later target off by one (verified: an off-by-one target change at the
+        # last position produced bit-identical losses).
+        gen_in = inputs[:, ctx_len - 1:]
+        k = gen_in.shape[1]
 
         def loss_fn(p):
-            z = encoder_forward(p['encoder'], inputs, cfg.n_heads)  # (B, d)
+            z = encoder_forward(p['encoder'], ctx, cfg.n_heads)  # (B, d)
             codebooks = pack_codebooks_for_c(p)
 
             # ── Normalise encoder output to codebook scale ────────────────
@@ -369,32 +397,71 @@ def make_train_step(cfg, optimizer, joint=False):
 
             # ── Passive channel: z_q @ W_out ────────────────────────────
             p_logits = jnp.einsum('bsd,dv->bsv', z_qs, p['W_out'])
-            # targets[:, -1] == x[N]: the true next token AFTER the sequence.
-            # (targets[:, 0] == x[1] is inside the bidirectional encoder's
-            # input, so z already "sees" it — the passive channel would
-            # degenerate into copying.)
-            p_target = targets[:, -1]
+            # The honest readout is the token that follows the context. It is
+            # outside the encoder's input by construction, so the passive
+            # channel cannot degenerate into copying. (Reading targets[:, -1]
+            # instead asks the converged state to jump N-ctx_len tokens ahead
+            # — legitimate but no longer the same "next step" the active
+            # channel is trained on.)
+            p_target = inputs[:, ctx_len]
             p_loss = optax.softmax_cross_entropy_with_integer_labels(
                 p_logits.reshape(-1, p_logits.shape[-1]),
                 p_target[:, None].repeat(cfg.max_inference_steps, axis=1).reshape(-1),
             ).mean()
 
             # ── Active channel: Qwen or Language LCM (frozen) ───────────
+            #
+            # z is the ONLY channel carrying the context: the generation
+            # segment is fed on its own, so the active channel cannot read the
+            # answer off its own attention context. This is the structure
+            # causal_student_train.py already validated.
+            #
+            # Supervising the whole shifted sequence from a *global* z (what
+            # this used to do) leaks every target through z: the bidirectional
+            # encoder has already read x[i+1] by the time position i is asked to
+            # predict it. The loss then looks excellent and means nothing.
             z_final = z_qs[:, -1, :]  # (B, d)
             use_qwen = 'qwen' in p and p['qwen'] is not None
+            # Contiguous window matching the overwrite-at-position-0 injection
+            # (see the gen_in construction above): k logits, k targets, and the
+            # window covers the whole generation segment x[ctx_len..N-1] plus
+            # the out-of-sequence token x[N] == targets[:, N-1].
+            a_targets = targets[:, ctx_len - 1:ctx_len - 1 + k]
             if use_qwen:
                 qwen_params = jax.lax.stop_gradient(p['qwen'])
                 z_proj = p['z_proj']  # trainable projection
-                a_logits = qwen_forward(qwen_params, inputs,
+                a_logits = qwen_forward(qwen_params, gen_in,
                                          z_q=z_final, z_proj=z_proj,
                                          n_layers=4)
-                a_loss = active_loss(a_logits, targets)
             elif p.get('lang_lcm') is not None:
                 lang_params = jax.lax.stop_gradient(p['lang_lcm'])
-                a_logits = active_channel_forward(lang_params, z_final, inputs, cfg)
-                a_loss = active_loss(a_logits, targets)
+                a_logits = active_channel_forward(
+                    lang_params, z_final, gen_in, cfg)
+            else:
+                a_logits = None
+
+            if a_logits is not None:
+                a_loss = active_loss(a_logits, a_targets)
+                # Force the active channel to actually depend on z: with a
+                # generation segment of its own to attend over, the cheapest
+                # solution is to ignore z entirely and behave like a plain
+                # causal LM. Penalise any step where zeroing z does not hurt.
+                z0 = jax.lax.stop_gradient(jnp.zeros_like(z_final))
+                if use_qwen:
+                    b_logits = qwen_forward(qwen_params, gen_in, z_q=z0,
+                                            z_proj=p['z_proj'], n_layers=4)
+                else:
+                    b_logits = active_channel_forward(
+                        lang_params, z0, gen_in, cfg)
+                tgt = a_targets[:, :, None]
+                with_z = jnp.take_along_axis(a_logits, tgt, axis=-1).squeeze(-1)
+                without_z = jnp.take_along_axis(b_logits, tgt, axis=-1).squeeze(-1)
+                z_margin = jnp.mean(jnp.maximum(
+                    0.0, cfg.active_z_margin - with_z + without_z))
+                a_loss = a_loss + cfg.active_z_margin_weight * z_margin
             else:
                 a_loss = jnp.array(0.0)
+                z_margin = jnp.array(0.0)
 
             # Convergence bonus
             conv = (diffs[:, -1] < cfg.convergence_tol) & (entropies[:, -1] < cfg.entropy_threshold)
@@ -424,13 +491,26 @@ def make_train_step(cfg, optimizer, joint=False):
                     loss = loss + c_loss
 
                 if cfg.lambda_orth > 0 and 'manifold' in p:
-                    o_loss = cfg.lambda_orth * jnp.mean(
-                        jnp.sum(p['manifold']['T'] ** 2, axis=(-2, -1)))
+                    # λ·‖Tᵀ T − I‖², NOT λ·mean(Σ T²). The latter is plain
+                    # weight decay on the tangent basis: it drives T → 0 rather
+                    # than towards an orthonormal frame, collapsing the tangent
+                    # space the manifold lattice projects into.
+                    # No forward pass here, so the active manifold codes are
+                    # recomputed with the same Euclidean criterion this loop
+                    # already uses for its VQ term.
+                    C_man = p['manifold']['C']
+                    man_idx = jnp.argmin(
+                        jnp.sum((z[:, None, :] - C_man[None, :, :]) ** 2, axis=-1),
+                        axis=-1)
+                    o_loss = manifold_orth_loss(
+                        p['manifold']['T'], man_idx,
+                        cfg.n_orth_samples, lambda_orth=cfg.lambda_orth,
+                        rng=rng)
                     stage3_extra['orth'] = o_loss
                     loss = loss + o_loss
 
             aux_out = {'self_state': self_state_out, 'loss_self': loss_self,
-                       'stage3': stage3_extra}
+                       'z_margin': z_margin, 'stage3': stage3_extra}
             return loss, aux_out
 
         (loss, aux_out), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
@@ -510,6 +590,30 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     else:
         active_name = "DISABLED"
     print(f"[COG] Dual-channel: passive (z_q @ W_out) + active ({active_name})")
+
+    # ── Active-channel vocabulary check ──────────────────────────────────
+    # The batch supplies token ids from the *local* BPE tokenizer
+    # (cfg.vocab_size entries), but the active channel's logits are indexed by
+    # its own vocabulary. If the two differ, every cross-entropy above scores a
+    # local id against an unrelated column of the bridge's output: training
+    # runs, the loss falls, and nothing is being learned. Checked here, once,
+    # because nothing downstream can detect it.
+    if has_qwen:
+        bridge_vocab = int(params['qwen']['model.embed_tokens.weight'].shape[0])
+    elif has_lang:
+        bridge_vocab = int(params['lang_lcm']['W_out'].shape[-1])
+    else:
+        bridge_vocab = None
+    if bridge_vocab is not None and bridge_vocab != cfg.vocab_size:
+        print(f"[COG] *** VOCABULARY MISMATCH ***")
+        print(f"      data tokenizer : {cfg.vocab_size} tokens (LocalBPE)")
+        print(f"      active channel : {bridge_vocab} tokens")
+        print(f"      The active-channel loss compares local token ids against "
+              f"the bridge's own vocabulary, so it is optimising the wrong "
+              f"targets. Fix by training the data with the bridge's tokenizer "
+              f"(set cfg.vocab_size = {bridge_vocab} and re-run preprocess), or "
+              f"by remapping the ids. Until then the active channel learns "
+              f"nothing and `loss` is not a meaningful metric.")
     print(f"[COG] Self-lattice: {cfg.n_self_codes} modes")
     print(f"[COG] Steps: {steps}, B={batch_size}, N={seq_len}, lr={lr}")
     if joint:
@@ -801,10 +905,14 @@ def save_cog_checkpoint(params, output_dir, step, self_state=None):
         from train.checkpoint import _pack_header, _compute_checksum
         C_pos, C_neg = make_global_value_vectors(d)
         C_p = _to_np(C_pos)
-        # Placeholder: identical halves → pos_d_min == neg_d_min → the C
-        # engine's margin check (pos > neg - margin ⇒ unsafe) never fires.
-        # Real anchors are NOT trained yet; without this, use_safety=True
-        # aborts the cognitive loop on (almost) every input.
+        # PLACEHOLDER — NOT A WORKING SAFETY LAYER.
+        # Identical halves → pos_d_min == neg_d_min → the C engine's margin
+        # check (pos > neg - margin ⇒ unsafe) never fires, and lcm.py detects
+        # the equality and disables gvalue entirely. Real anchors are not
+        # trained yet; distinct halves would abort the cognitive loop on
+        # (almost) every input instead, which is worse. See README §Safety.
+        print("[CKPT] WARNING: exporting PLACEHOLDER gvalue (pos == neg) — "
+              "the global value safety check is DISABLED in the C engine")
         C_n = C_p.copy()
         _hdr = bytearray(_pack_header(C_p.shape[0], d, 1, 2, 1.0))
         _data = C_p.tobytes() + C_n.tobytes()
@@ -815,11 +923,13 @@ def save_cog_checkpoint(params, output_dir, step, self_state=None):
             _f.write(_hl.sha256(_data).digest())
     except Exception as e:
         print(f"[CKPT] gvalue write skipped: {e}")
-    # danger codebook (dummy placeholder, values NOT trained; the danger
-    # lattice is not part of cognitive training yet). Identical halves with a
-    # fixed seed → danger_score ≡ 0 → no spurious blocks, deterministic export.
+    # danger codebook — PLACEHOLDER, same story as gvalue above: identical
+    # halves with a fixed seed → danger_score ≡ 0 → the danger lattice never
+    # fires. The danger lattice is not part of cognitive training yet.
     # Matches checkpoint._save_danger.
     try:
+        print("[CKPT] WARNING: exporting PLACEHOLDER danger codebook "
+              "(threat == normal) — the danger lattice is INACTIVE")
         import zlib as _zl
         M_d = cfg.get("M_danger", 256)
         _np.random.seed(0)

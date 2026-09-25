@@ -20,6 +20,10 @@ Directory layout:
   ├── bind_codebook.bin     # header + key/val/bind per layer
   ├── contrast_codebook.bin # header + C_a/C_b per layer
   ├── gvalue_codebook.bin   # header + C_pos + C_neg + SHA256
+  ├── fusion.bin            # alpha + ln_scale + ln_bias
+  ├── value_scalars.bin     # header + per-lattice local value scalars
+  ├── self_lattice.bin      # core + modes + tau_self + bias_self
+  ├── binding_proj.bin      # HRR projections A_k / A_v
   ├── opt_state.bin         # optimizer state (Python, not C-readable)
   ├── config.json           # all hyperparameters
   ├── tokenizer.json        # BPE vocabulary
@@ -335,6 +339,15 @@ def save_checkpoint(state, cfg, output_dir="checkpoint", step=None):
         dg_path = os.path.join(output_dir, "danger_codebook.bin")
         _save_danger(params, dg_path, cfg.M_danger, d)
 
+    # 8b. Trainable parts that are not codebooks. Without these the loader had
+    # no choice but to re-initialise them from fixed PRNG keys, which is what
+    # made resume non-deterministic.
+    _save_fusion(params, os.path.join(output_dir, "fusion.bin"))
+    _save_value_scalars(params, os.path.join(output_dir, "value_scalars.bin"), cfg)
+    _save_self(params, os.path.join(output_dir, "self_lattice.bin"))
+    _save_binding_proj(params, os.path.join(output_dir, "binding_proj.bin"))
+    print(f"  [CKPT] fusion / value_scalars / self_lattice / binding_proj")
+
     # 9. Optimizer state (for resume)
     opt_path = os.path.join(output_dir, "opt_state.bin")
     _save_opt_state(state['opt_state'], opt_path)
@@ -356,6 +369,114 @@ def _save_route(params, path):
         np.asarray(rt['W_route']).ravel(),
     ]).astype(np.float32)
     flat.tofile(path)
+
+
+# ── Trainable parts that must survive a round-trip ───────────────────────────
+# These used to be dropped on save and silently re-initialised with fixed PRNG
+# keys on load, so load(save(model)) != model and a "resume" restarted from
+# random fusion / value scalars / self params / binding projections.
+
+def _save_fusion(params, path):
+    """fusion: alpha (n_lattices,) + ln_scale (d,) + ln_bias (d,)."""
+    fu = params['fusion']
+    np.concatenate([
+        np.asarray(fu['alpha']).ravel(),
+        np.asarray(fu['ln_scale']).ravel(),
+        np.asarray(fu['ln_bias']).ravel(),
+    ]).astype(np.float32).tofile(path)
+
+
+def _save_value_scalars(params, path, cfg):
+    """value_scalars: one (M_lattice,) vector per lattice, in fixed order."""
+    order = [('hrq', cfg.M_top), ('sparse', cfg.M_sparse),
+             ('lowrank', cfg.M_lr), ('manifold', cfg.M_man),
+             ('binding', cfg.M_bind), ('contrast', cfg.M_contrast)]
+    vs = params.get('value_scalars', {})
+    parts = [np.asarray(vs.get(name, np.zeros(M))).ravel() for name, M in order]
+    flat = np.concatenate(parts).astype(np.float32)
+    # n_layers=1: the payload is a ragged concatenation whose length is the sum
+    # of the per-lattice sizes in `order`, so the header's M*d*n_layers must not
+    # accidentally equal it (that would make _read_bin reshape it). The loader
+    # ravels regardless, so this only keeps the file self-describing.
+    hdr = _pack_header(len(order), cfg.d_model, 1, CB_EUCLIDEAN, 1.0)
+    _write_bin(path, hdr, flat.tobytes())
+
+
+def _save_self(params, path):
+    """self lattice params: core (d,) + modes (M_self, d) + 2 scalars."""
+    sp = params['self']
+    flat = np.concatenate([
+        np.asarray(sp['core']).ravel(),
+        np.asarray(sp['modes']).ravel(),
+        np.asarray(sp['tau_self']).ravel(),
+        np.asarray(sp['bias_self']).ravel(),
+    ]).astype(np.float32)
+    flat.tofile(path)
+
+
+def _save_binding_proj(params, path):
+    """binding HRR projections A_k / A_v (the codebooks are in bind_codebook.bin)."""
+    b = params['binding']
+    np.concatenate([
+        np.asarray(b['A_k']).ravel(),
+        np.asarray(b['A_v']).ravel(),
+    ]).astype(np.float32).tofile(path)
+
+
+def _load_fusion(path, cfg):
+    d = cfg.d_model
+    n_lt = cfg.n_lattices
+    flat = np.fromfile(path, dtype=np.float32)
+    if flat.size != n_lt + 2 * d:
+        raise ValueError(f"fusion.bin has {flat.size} floats, expected {n_lt + 2 * d}")
+    return {
+        'alpha': jnp.array(flat[:n_lt]),
+        'ln_scale': jnp.array(flat[n_lt:n_lt + d]),
+        'ln_bias': jnp.array(flat[n_lt + d:n_lt + 2 * d]),
+    }
+
+
+def _load_value_scalars(path, cfg):
+    order = [('hrq', cfg.M_top), ('sparse', cfg.M_sparse),
+             ('lowrank', cfg.M_lr), ('manifold', cfg.M_man),
+             ('binding', cfg.M_bind), ('contrast', cfg.M_contrast)]
+    _, data, _ = _read_bin(path)
+    flat = np.asarray(data).ravel()
+    out, pos = {}, 0
+    for name, M in order:
+        if pos + M > flat.size:
+            raise ValueError(f"value_scalars.bin truncated at {name} "
+                             f"({flat.size} floats, need {pos + M})")
+        out[name] = jnp.array(flat[pos:pos + M])
+        pos += M
+    return out
+
+
+def _load_self(path, cfg):
+    d = cfg.d_model
+    M_self = cfg.n_self_codes
+    flat = np.fromfile(path, dtype=np.float32)
+    if flat.size != d + M_self * d + 2:
+        raise ValueError(f"self_lattice.bin has {flat.size} floats, "
+                         f"expected {d + M_self * d + 2}")
+    pos = 0
+    core = jnp.array(flat[pos:pos + d]); pos += d
+    modes = jnp.array(flat[pos:pos + M_self * d].reshape(M_self, d)); pos += M_self * d
+    tau_self = jnp.array(flat[pos]); pos += 1
+    bias_self = jnp.array(flat[pos])
+    return {'core': core, 'modes': modes,
+            'tau_self': tau_self, 'bias_self': bias_self}
+
+
+def _load_binding_proj(path, cfg):
+    d = cfg.d_model
+    r_max = cfg.r_max
+    flat = np.fromfile(path, dtype=np.float32)
+    if flat.size != 2 * r_max * d:
+        raise ValueError(f"binding_proj.bin has {flat.size} floats, "
+                         f"expected {2 * r_max * d}")
+    return (jnp.array(flat[:r_max * d].reshape(r_max, d)),
+            jnp.array(flat[r_max * d:].reshape(r_max, d)))
 
 
 def _save_danger(params, path, M_danger, d):
@@ -381,7 +502,13 @@ def load_checkpoint(output_dir, cfg=None, rng=None, load_opt=True):
 
     Loads encoder, decoder, all codebooks, gvalue, and optional optimizer state.
     Codebooks are loaded as clean vectors (A=clean, W=I) suitable for inference.
-    For training resume, use the pickle-based load_checkpoint in train.py instead.
+
+    This is also the resume path for ``lcm.py --stage3 --resume``, so it has to
+    be a genuine round-trip: ``fusion``, ``value_scalars``, the self lattice and
+    binding's ``A_k``/``A_v`` are restored from their own files. When those
+    files are absent (checkpoints written before round-trip saving) each one is
+    re-initialised from a fixed PRNG key and a warning is printed — that is a
+    *different model*, not a resume, and it used to happen silently.
 
     Args:
         output_dir: Path to checkpoint directory.
@@ -427,9 +554,19 @@ def load_checkpoint(output_dir, cfg=None, rng=None, load_opt=True):
         params['gen_head'] = _load_decoder(dec_path, cfg)
         print(f"  [CKPT] decoder.bin loaded")
 
-    # Fusion params (re-init — small, not saved separately)
+    # Fusion params — loaded when the checkpoint has them, otherwise re-init.
+    # The re-init path exists only for checkpoints written before round-trip
+    # saving; it is announced loudly because it silently discards training.
     rng_fuse, rng_gen = jax.random.split(jax.random.PRNGKey(0))
-    params['fusion'] = init_fusion_params(rng_fuse, cfg.n_lattices, d)
+    fusion_path = os.path.join(output_dir, "fusion.bin")
+    if os.path.exists(fusion_path):
+        params['fusion'] = _load_fusion(fusion_path, cfg)
+        print(f"  [CKPT] fusion.bin loaded")
+    else:
+        print("  [WARN] fusion.bin missing — re-initialising fusion randomly. "
+              "This checkpoint predates round-trip saving; resume WILL NOT "
+              "reproduce the original run.")
+        params['fusion'] = init_fusion_params(rng_fuse, cfg.n_lattices, d)
     params['gen_head'] = params.get('gen_head',
         init_gen_head_params(rng_gen, d, cfg.vocab_size))
 
@@ -443,16 +580,26 @@ def load_checkpoint(output_dir, cfg=None, rng=None, load_opt=True):
     else:
         params['route'] = init_route_params(jax.random.PRNGKey(1), cfg.n_lattices, d)
 
-    # Local value scalars (re-init)
+    # Local value scalars
     lattice_sizes = [
         ('hrq', cfg.M_top), ('sparse', cfg.M_sparse),
         ('lowrank', cfg.M_lr), ('manifold', cfg.M_man),
         ('binding', cfg.M_bind), ('contrast', cfg.M_contrast),
     ]
-    params['value_scalars'] = init_value_scalars(jax.random.PRNGKey(2), lattice_sizes)
+    vs_path = os.path.join(output_dir, "value_scalars.bin")
+    if os.path.exists(vs_path):
+        params['value_scalars'] = _load_value_scalars(vs_path, cfg)
+    else:
+        print("  [WARN] value_scalars.bin missing — re-initialising to zeros")
+        params['value_scalars'] = init_value_scalars(jax.random.PRNGKey(2), lattice_sizes)
 
-    # Self lattice params (re-init)
-    params['self'] = init_self_params(jax.random.PRNGKey(3), d, cfg.n_self_codes)
+    # Self lattice params
+    self_path = os.path.join(output_dir, "self_lattice.bin")
+    if os.path.exists(self_path):
+        params['self'] = _load_self(self_path, cfg)
+    else:
+        print("  [WARN] self_lattice.bin missing — re-initialising self lattice")
+        params['self'] = init_self_params(jax.random.PRNGKey(3), d, cfg.n_self_codes)
 
     # HRQ codebook (flat format — varying M per layer)
     hrq_path = os.path.join(output_dir, "hrq_codebook.bin")
@@ -544,9 +691,14 @@ def load_checkpoint(output_dir, cfg=None, rng=None, load_opt=True):
                 C = jnp.array(flat[pos:pos+M_bind*d].reshape(M_bind, d))
                 pos += M_bind * d
                 lst.append({'A': C, 'W': jnp.eye(d)})
-        # A_k and A_v are not saved in binary; re-init
-        A_k = jax.random.normal(jax.random.PRNGKey(4), (cfg.r_max, d)) * 0.01
-        A_v = jax.random.normal(jax.random.PRNGKey(5), (cfg.r_max, d)) * 0.01
+        proj_path = os.path.join(output_dir, "binding_proj.bin")
+        if os.path.exists(proj_path):
+            A_k, A_v = _load_binding_proj(proj_path, cfg)
+        else:
+            print("  [WARN] binding_proj.bin missing — re-initialising A_k/A_v "
+                  "randomly (checkpoint predates round-trip saving)")
+            A_k = jax.random.normal(jax.random.PRNGKey(4), (cfg.r_max, d)) * 0.01
+            A_v = jax.random.normal(jax.random.PRNGKey(5), (cfg.r_max, d)) * 0.01
         params['binding'] = {
             'A_k': A_k, 'A_v': A_v,
             'key_cb': key_cb, 'val_cb': val_cb, 'bind_cb': bind_cb,

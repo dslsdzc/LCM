@@ -9,18 +9,23 @@ import optax
 from jax import lax
 
 from train.config import LCMConfig
-from train.model import init_all_params, forward, split_trainable_frozen
-from train.losses import compute_total_loss
-from train.lattices import (
-    sparse_ema_update, sparse_forward,
-    manifold_ema_update, manifold_orth_loss,
-    init_value_scalars,
+from train.model import (
+    init_all_params, forward,
+    get_frozen_param_names, restore_frozen_params,
 )
+from train.encoder import encoder_forward
 from train.gvalue import GValueCodebook, make_global_value_vectors
+from train.losses import (
+    compute_lm_loss, compute_vq_loss, compute_orth_loss, commit_loss,
+    contrast_info_nce_loss, contrast_value_biased_nce_loss,
+    value_contrast_loss,
+)
 from train.continual import (
-    ContinualState, init_continual_state, detect_new_task,
-    expand_lattice_codebooks, snapshot_protected_params,
-    compute_ewc_loss, compute_fisher_diag_flat,
+    init_continual_state, detect_new_task,
+    expand_lattice_codebooks, expand_ema_state, expand_value_scalars,
+    expand_seen_masks, expand_access_counters, pad_stats_to_params,
+    snapshot_protected_params,
+    compute_ewc_loss, estimate_fisher_diag,
     update_replay_buffer, sample_replay,
     update_access_counters, consolidate_memory,
 )
@@ -104,86 +109,6 @@ def create_train_state(cfg: LCMConfig, rng, enable_continual=True):
     }
 
 
-def _jitted_compute(params, opt_state, gvalue_C_pos, gvalue_C_neg,
-                     inputs, targets, cfg_dict, rng, ewc_loss_val,
-                     ema_state, feature_bank, step):
-    """JAX-jitted core computation: forward, loss, grad, optimizer, EMA, feature bank.
-
-    Args:
-        gvalue_C_pos, gvalue_C_neg: Frozen arrays from GValueCodebook (pass through JIT).
-        cfg_dict: Frozen config dict extracted from LCMConfig.
-    """
-    # Reconstruct minimal config access
-    B, N = inputs.shape
-    d = cfg_dict['d_model']
-
-    rng, *subkeys = jax.random.split(rng, 5)
-
-    # Loss function for gradient computation
-    def loss_fn(p):
-        z, z_q, logits, aux, _ = forward(
-            p, None, inputs, _cfg_from_dict(cfg_dict),
-            training=True, rng=subkeys[0])
-
-        def _pd(x, y):
-            xn2 = jnp.linalg.norm(x, axis=-1, keepdims=True) ** 2
-            yn2 = jnp.linalg.norm(y, axis=-1, keepdims=True) ** 2
-            d2 = jnp.linalg.norm(x - y, axis=-1, keepdims=True) ** 2
-            denom = (1.0 - xn2) * (1.0 - yn2) + 1e-8
-            return jnp.arccosh(1.0 + 2.0 * d2 / denom + 1e-8)
-
-        def _min_dist_to(z_batch, anchors):
-            return jnp.min(jnp.stack(
-                [_pd(z_batch[:, None, :], a[None, :]).squeeze(-1) for a in anchors], axis=-1), axis=-1)
-
-        loss_lm = _lm_loss(logits, targets, cfg_dict['vocab_size'])
-        loss_vq = sum(_vq_losses(p, aux, z, cfg_dict).values())
-        loss_contrast = cfg_dict['lambda_contrast'] * (
-            _value_biased_contrast_loss(
-                p['contrast'], z, gvalue_C_neg[1] if gvalue_C_neg is not None else None,
-                cfg_dict)
-            if (gvalue_C_neg is not None and cfg_dict.get('alpha_val', 0) > 0)
-            else _contrast_nce_loss(p['contrast'], z)
-        )
-        loss_orth = manifold_orth_loss(
-            p['manifold']['T'], aux['man_idx'], cfg_dict['n_orth_samples'],
-            lambda_orth=cfg_dict['lambda_orth'], rng=subkeys[4])
-        loss_val = _value_contrast_loss_inline(
-            aux['lattice_outputs'], gvalue_C_pos, gvalue_C_neg, cfg_dict)
-        total = loss_lm + loss_vq + loss_contrast + loss_orth + loss_val
-
-        if ewc_loss_val is not None:
-            total = total + ewc_loss_val
-
-        margin = cfg_dict.get('safety_margin_loss_weight', 0.0) * (
-            _safety_margin_loss_inline(z_q, gvalue_C_pos, gvalue_C_neg, cfg_dict))
-
-        components = {
-            'lm': loss_lm, 'vq': loss_vq, 'contrast': loss_contrast,
-            'orth': loss_orth, 'val': loss_val,
-            'ewc': ewc_loss_val if ewc_loss_val is not None else jnp.array(0.0),
-            'margin': margin,
-            'world_dev': aux.get('world_dev', jnp.array(0.0)),
-        }
-        return total, (z, z_q, logits, aux, components)
-
-    (total, (z, z_q, logits, aux, components)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
-
-    # Optimizer update
-    updates, opt_state_new = cfg_dict['_optimizer'].update(grads, opt_state, params)
-    params_new = optax.apply_updates(params, updates)
-
-    # EMA updates
-    params_new, ema_state_new = _jitted_ema(
-        params_new, ema_state, z, cfg_dict)
-
-    # Feature bank update
-    feature_bank_new = _jitted_feature_bank(
-        feature_bank, z, step, cfg_dict)
-
-    return params_new, opt_state_new, ema_state_new, feature_bank_new, components, aux, z
-
-
 def _cfg_from_dict(d):
     """Build minimal config with necessary fields for forward()."""
     from train.config import LCMConfig
@@ -194,95 +119,33 @@ def _cfg_from_dict(d):
     return cfg
 
 
-def _lm_loss(logits, targets, vocab_size):
-    return optax.softmax_cross_entropy_with_integer_labels(
-        logits.reshape(-1, vocab_size),
-        targets.reshape(-1)).mean()
+def _assign(C, q):
+    """Nearest-code assignment of q (B,d) onto the rows of C (M,d)."""
+    dists = jnp.sum((q[:, None, :] - C[None, :, :]) ** 2, axis=-1)  # (B, M)
+    onehot = jax.nn.one_hot(jnp.argmin(dists, axis=-1), C.shape[0],
+                            dtype=jnp.float32)
+    return onehot.sum(axis=0), onehot.T @ q  # counts (M,), sums (M, d)
 
 
-def _vq_losses(params, aux, z, cfg):
-    from train.losses import compute_vq_loss
-    return compute_vq_loss(params, aux, z, _cfg_from_dict(cfg))
-
-
-def _contrast_nce_loss(contrast_params, z):
-    from train.lattices import contrast_info_nce_loss
-    return contrast_info_nce_loss(contrast_params, z, tau=0.5)
-
-
-def _value_biased_contrast_loss(contrast_params, z, v_harm, cfg_dict):
-    """Value-biased contrast loss for jitted path."""
-    if v_harm is None:
-        return _contrast_nce_loss(contrast_params, z)
-    from train.lattices import contrast_value_biased_nce_loss
-    tau_val = cfg_dict.get('tau_val_signal', 0.1)
-    return contrast_value_biased_nce_loss(
-        contrast_params, z, v_harm, tau=0.5, tau_val=tau_val)
-
-
-def _euclidean_dist(x, y):
-    """Euclidean distance between x(B,d) and y(1,d)."""
-    return jnp.linalg.norm(x - y, axis=-1)  # (B,)
-
-
-def _min_ed_to(x, anchors):
-    """Minimum Euclidean distance from x to a set of anchors."""
-    return jnp.min(jnp.stack(
-        [_euclidean_dist(x, a[None, :]) for a in anchors], axis=-1), axis=-1)
-
-
-def _value_contrast_loss_inline(lattice_outputs, C_pos, C_neg, cfg):
-    """Value contrast loss (Euclidean distance, safe for any norm)."""
-    if lattice_outputs is None or C_pos is None or C_neg is None:
-        return jnp.array(0.0)
-    v_harm = C_neg[1:2]  # (1, d)
-    tau = cfg.get('tau_val_signal', 0.1)
-    lam = cfg.get('lambda_val', 0.01)
-    if lam == 0:
-        return jnp.array(0.0)
-    loss = 0.0
-    n = len(lattice_outputs)
-    for o in lattice_outputs:
-        d_pos = _min_ed_to(o, C_pos)
-        d_neg_vals = []
-        for j in range(4):
-            d_j = _min_ed_to(o, C_neg[j:j+1])[:, None]
-            hd = _min_ed_to(o, v_harm)[:, None]
-            w_harm = jnp.exp(-hd / tau)
-            d_neg_vals.append(w_harm * d_j)
-        d_neg_w = jnp.concatenate(d_neg_vals, axis=-1).mean(axis=-1, keepdims=True)
-        logit = (d_neg_w.squeeze(-1) - d_pos) / tau
-        loss = loss + jnp.mean(jax.nn.softplus(logit))
-    return lam * loss / n
-
-
-def _safety_margin_loss_inline(z_q, C_pos, C_neg, cfg):
-    margin = cfg.get('safety_margin_relative', 0.5)
-    thresh = cfg.get('margin_penalty_threshold', 0.2)
-    weight = cfg.get('safety_margin_loss_weight', 0.001)
-    d_pos = _min_pd_to(z_q, C_pos)
-    d_neg = _min_pd_to(z_q, C_neg)
-    margins = d_neg - margin - d_pos
-    excess = jnp.clip(thresh - margins, 0)
-    return weight * jnp.mean(excess ** 2)
-
-
-def _jitted_ema(params, ema_state, z, cfg):
+def _jitted_ema(params, ema_state, z, aux, cfg):
     """Per-codebook EMA (nearest-code assignment).
 
     Broadcasting the batch sum onto every codebook row made all codes
     converge to the same centroid (same bug train_memory.py's _jitted_ema
-    used to have). Each z updates only its nearest code.
+    used to have). Each query updates only its nearest code.
+
+    Every codebook is updated **in the space it quantises**: sparse/manifold
+    see the encoder latent ``z`` directly, while each binding layer sees its own
+    residual from the HRR chain (``aux['binding_residuals']``). Feeding ``z`` to
+    the binding codebooks — what the old, unused ``_update_ema`` did — moved
+    them toward a distribution they never see.
     """
     g_s = cfg.get('gamma_sparse', 0.99)
     g_m = cfg.get('gamma_man', 0.99)
+    g_b = cfg.get('gamma_bind', 0.99)
 
-    def _per_code_ema(C, N, m, gamma):
-        dists = jnp.sum((z[:, None, :] - C[None, :, :]) ** 2, axis=-1)  # (B, M)
-        nearest = jnp.argmin(dists, axis=-1)  # (B,)
-        onehot = jax.nn.one_hot(nearest, C.shape[0], dtype=jnp.float32)
-        counts = onehot.sum(axis=0)  # (M,)
-        sums = onehot.T @ z  # (M, d)
+    def _per_code_ema(C, N, m, gamma, q):
+        counts, sums = _assign(C, q)
         N_new = gamma * N + (1 - gamma) * counts
         m_new = gamma * m + (1 - gamma) * sums
         return N_new, m_new, m_new / jnp.clip(N_new, 1.0)[:, None]
@@ -290,22 +153,50 @@ def _jitted_ema(params, ema_state, z, cfg):
     # Sparse
     N_s, m_s = ema_state['sparse']['N'], ema_state['sparse']['m']
     N_s_new, m_s_new, C_s_new = _per_code_ema(
-        params['sparse']['C'], N_s, m_s, g_s)
+        params['sparse']['C'], N_s, m_s, g_s, z)
     lam = cfg.get('lambda_sparse', 1e-4)
-    C_s_new = jnp.sign(C_s_new) * jnp.clip(jnp.abs(C_s_new) - lam, 0)
-    params['sparse']['C'] = C_s_new
+    params['sparse']['C'] = jnp.sign(C_s_new) * jnp.clip(jnp.abs(C_s_new) - lam, 0)
 
-    # Manifold
+    # Manifold — params['manifold']['C'] is TANGENT-space coordinates (the
+    # forward pass applies exp_map itself). Storing exp_map(EMA) here put ball
+    # coordinates into a tangent slot, so every later forward mapped twice and
+    # the codebook crept toward the boundary. Store the raw EMA.
     N_m, m_m = ema_state['manifold']['N'], ema_state['manifold']['m']
     N_m_new, m_m_new, C_m_new = _per_code_ema(
-        params['manifold']['C'], N_m, m_m, g_m)
-    from train.hyp import exp_map
-    params['manifold']['C'] = exp_map(C_m_new)
+        params['manifold']['C'], N_m, m_m, g_m, z)
+    params['manifold']['C'] = C_m_new
+
+    # Binding — one accumulator per sub-codebook per layer, in that layer's
+    # own residual space. Each codebook is SimVQ (C = A @ W); the EMA contracts
+    # A toward the mean of its assigned residuals. Solving A = C_new @ pinv(W)
+    # would be the exact centroid but W starts near-singular, so the direct
+    # parameter-space contraction is used instead.
+    residuals = (aux or {}).get('binding_residuals')
+    binding_state = ema_state.get('binding', {})
+    binding_new = {}
+    for fam, key in ((('key_cb', 'key'), ('val_cb', 'val'), ('bind_cb', 'bind'))
+                     if 'binding' in params else ()):
+        states = []
+        fam_states = binding_state.get(key) or []
+        for l, cb in enumerate(params['binding'][fam]):
+            prev = fam_states[l] if l < len(fam_states) else None
+            if prev is None:
+                states.append({'N': jnp.zeros(cb['A'].shape[0]),
+                               'm': jnp.zeros_like(cb['A'])})
+                continue
+            q = z if residuals is None else residuals[key][l]
+            counts, sums = _assign(cb['A'] @ cb['W'], q)
+            N_new = g_b * prev['N'] + (1 - g_b) * counts
+            m_new = g_b * prev['m'] + (1 - g_b) * sums
+            params['binding'][fam][l] = dict(
+                cb, A=m_new / jnp.clip(N_new, 1.0)[:, None])
+            states.append({'N': N_new, 'm': m_new})
+        binding_new[key] = states
 
     ema_state_new = {
         'sparse': {'N': N_s_new, 'm': m_s_new},
         'manifold': {'N': N_m_new, 'm': m_m_new},
-        'binding': ema_state.get('binding', {}),
+        'binding': binding_new,
     }
     return params, ema_state_new
 
@@ -325,72 +216,88 @@ def _jitted_feature_bank(feature_bank, z, step, cfg):
     return {'bank': bank, 'ptr': ptr, 'last_used': last_used}
 
 
-def _build_loss_grad_fn(params, gvalue, inputs, targets, cfg, rng, ewc_loss_val):
-    """Build loss function returning (loss, (components, aux, z))."""
-    def loss_fn(p):
-        z, z_q, logits, aux, _ = forward(
-            p, gvalue, inputs, cfg, training=True, rng=rng)
-        total_loss, components = compute_total_loss(
-            p, gvalue, logits, targets, z, aux, cfg,
-            ewc_loss_val=ewc_loss_val)
-        if gvalue is not None and cfg.safety_margin_loss_weight > 0:
-            margin_loss = gvalue.safety_margin_loss(
-                z_q, cfg.safety_margin_relative,
-                weight=cfg.safety_margin_loss_weight)
-            total_loss = total_loss + margin_loss
-            components['margin'] = margin_loss
-        else:
-            components['margin'] = jnp.array(0.0)
-        return total_loss, (components, aux, z)
-    return loss_fn
-
-
 def _jitted_step(params, opt_state, gvalue_C_pos, gvalue_C_neg,
-                 inputs, targets, cfg_dict, rng, ewc_loss_val,
+                 inputs, targets, cfg_dict, rng, ewc, replay,
                  ema_state, feature_bank, step,
-                 self_state=None):
+                 self_state=None, frozen_names=()):
     """Training step with jax.grad (auto-jitted) — outer function not jit-decorated
     because cfg_dict contains shape-determining values (n_heads, d_model) that
     must be concrete for reshape ops.
 
-    self_state is a dict (from init_self_state) — it flows through the trace
-    because JAX can trace dicts whose leaves are arrays."""
-    from train.model import forward as fwd
+    Args:
+        ewc: ``None`` or ``{'protected': ..., 'fisher': ..., 'lambda': ...}``.
+            Passed *into* the traced loss — computing it outside and adding the
+            scalar would contribute no gradient at all.
+        replay: ``None`` or (B_r, d) latents sampled from previous tasks.
+        frozen_names: parameter paths the optimizer must leave untouched.
+        self_state is a dict (from init_self_state) — it flows through the trace
+        because JAX can trace dicts whose leaves are arrays.
+    """
     from train.self_lattice import self_lattice_reg_loss
-    from train.hyp import poincare_distance
-    B, N = inputs.shape
-    d = cfg_dict['d_model']
-    rng, *subkeys = jax.random.split(rng, 4)
+    cfg_obj = _cfg_from_dict(cfg_dict)
+    # split(n) yields n keys; the first seeds `rng`, so `subkeys` has n-1
+    # entries. subkeys[3] is used below (orthogonality sampling), hence 5.
+    rng, *subkeys = jax.random.split(rng, 5)
+
+    def _euclidean_batch(x, y):
+        return jnp.linalg.norm(x[:, None, :] - y[None, :], axis=-1)
+
+    def _d_min(x, anchors):
+        return jnp.min(
+            jnp.stack([_euclidean_batch(x, a) for a in anchors], axis=-1), axis=-1)
+
+    def _replay_anchor_loss(p, q):
+        """Pull the latent-space codebooks back onto previously-seen tasks.
+
+        Only codebooks that quantise the encoder latent directly are anchored;
+        binding's layers quantise their own projected residuals and never see
+        ``z``, so replaying ``z`` into them would be meaningless.
+        """
+        C_list = [p['hrq']['top']['A'] @ p['hrq']['top']['W']]
+        C_list += [fb['A'] @ fb['W'] for fb in p['hrq']['fine']]
+        C_list.append(p['sparse']['C'])
+        C_list.append(p['manifold']['C'])
+        V = p['lowrank']['A_V'] @ p['lowrank']['W_V']
+        C_list += [u @ V[:, :u.shape[-1]].T for u in p['lowrank']['U']]
+        C_list.append(p['route']['C_route'])
+        return sum(commit_loss(q, C, cfg_dict['beta_vq'])
+                   for C in C_list) / len(C_list)
 
     # Loss function for gradient computation (traced by jax.grad)
     def loss_fn(p):
-        z, z_q, logits, aux, _ = fwd(
-            p, None, inputs, _cfg_from_dict(cfg_dict),
+        z, z_q, logits, aux, _ = forward(
+            p, None, inputs, cfg_obj,
             training=True, rng=subkeys[0],
             self_state=self_state)
 
-        def _euclidean_batch(x, y):
-            return jnp.linalg.norm(x[:, None, :] - y[None, :], axis=-1)
-
-        def _d_min(x, anchors):
-            return jnp.min(
-                jnp.stack([_euclidean_batch(x, a) for a in anchors], axis=-1),
-                axis=-1)
-
-        loss_lm = _lm_loss(logits, targets, cfg_dict['vocab_size'])
-        loss_vq = sum(_vq_losses(p, aux, z, cfg_dict).values())
+        loss_lm = compute_lm_loss(logits, targets, cfg_dict['vocab_size'])
+        loss_vq = sum(compute_vq_loss(p, aux, z, cfg_obj).values())
         loss_contrast = cfg_dict['lambda_contrast'] * (
-            _value_biased_contrast_loss(
-                p['contrast'], z, gvalue_C_neg[1] if gvalue_C_neg is not None else None,
-                cfg_dict)
+            contrast_value_biased_nce_loss(
+                p['contrast'], z, gvalue_C_neg[1], tau=0.5,
+                tau_val=cfg_dict.get('tau_val_signal', 0.1))
             if (gvalue_C_neg is not None and cfg_dict.get('alpha_val', 0) > 0)
-            else _contrast_nce_loss(p['contrast'], z)
+            else contrast_info_nce_loss(p['contrast'], z, tau=0.5)
         )
-        loss_orth = cfg_dict['lambda_orth'] * jnp.mean(
-            jnp.sum(p['manifold']['T'] ** 2, axis=(-2, -1)))
-        loss_val = cfg_dict['lambda_val'] * _value_contrast_loss_inline(
-            aux['lattice_outputs'], gvalue_C_pos, gvalue_C_neg, cfg_dict)
+        loss_orth = compute_orth_loss(p, aux, cfg_obj, rng=subkeys[3])
+        loss_val = value_contrast_loss(
+            aux['lattice_outputs'], gvalue_C_pos, gvalue_C_neg,
+            cfg_dict.get('tau_val_signal', 0.1), cfg_dict['lambda_val'])
         total = loss_lm + loss_vq + loss_contrast + loss_orth + loss_val
+
+        # EWC — inside the gradient, so it can actually hold parameters back.
+        loss_ewc = jnp.array(0.0)
+        if ewc is not None:
+            loss_ewc = compute_ewc_loss(
+                p, ewc['protected'], ewc['fisher'], ewc['lambda'])
+            total = total + loss_ewc
+
+        # Experience replay across task boundaries.
+        loss_replay = jnp.array(0.0)
+        if replay is not None:
+            loss_replay = (cfg_dict.get('replay_weight', 0.0)
+                           * _replay_anchor_loss(p, replay))
+            total = total + loss_replay
 
         # Self lattice regularization loss (if self_state is active)
         loss_self = jnp.array(0.0)
@@ -398,11 +305,9 @@ def _jitted_step(params, opt_state, gvalue_C_pos, gvalue_C_neg,
             loss_self = self_lattice_reg_loss(p['self'], aux.get('self_state', self_state))
             total = total + loss_self
 
-        if ewc_loss_val is not None:
-            total = total + ewc_loss_val
-
         margin_loss = jnp.array(0.0)
-        if cfg_dict.get('safety_margin_loss_weight', 0.0) > 0:
+        if (cfg_dict.get('safety_margin_loss_weight', 0.0) > 0
+                and gvalue_C_pos is not None):
             d_pm = _d_min(z_q, gvalue_C_pos)
             d_nm = _d_min(z_q, gvalue_C_neg)
             margins = d_nm - cfg_dict['safety_margin_relative'] - d_pm
@@ -414,8 +319,7 @@ def _jitted_step(params, opt_state, gvalue_C_pos, gvalue_C_neg,
         components = {
             'lm': loss_lm, 'vq': loss_vq, 'contrast': loss_contrast,
             'orth': loss_orth, 'val': loss_val,
-            'ewc': ewc_loss_val if ewc_loss_val is not None else jnp.array(0.0),
-            'margin': margin_loss,
+            'ewc': loss_ewc, 'replay': loss_replay, 'margin': margin_loss,
             'world_dev': aux.get('world_dev', jnp.array(0.0)),
             'soft_mask': aux.get('soft_mask'),
             'hrq_top_sim': aux.get('hrq_top_sim'),
@@ -437,8 +341,13 @@ def _jitted_step(params, opt_state, gvalue_C_pos, gvalue_C_neg,
     updates, opt_state_new = opt.update(grads, opt_state, params)
     params_new = optax.apply_updates(params, updates)
 
+    # Permanently-frozen layers (danger) must not move at all. AdamW's decoupled
+    # weight decay touches every leaf regardless of its gradient, so a layer
+    # documented as "never trained" still shrinks without this.
+    params_new = restore_frozen_params(params_new, params, frozen_names)
+
     # EMA
-    params_new, ema_state_new = _jitted_ema(params_new, ema_state, z, cfg_dict)
+    params_new, ema_state_new = _jitted_ema(params_new, ema_state, z, aux, cfg_dict)
 
     # Feature bank
     feature_bank_new = _jitted_feature_bank(feature_bank, z, step, cfg_dict)
@@ -462,27 +371,40 @@ def train_step(state, batch, rng):
     # Build cfg_dict for JIT (all primitive types / arrays, no optimizer object)
     cfg_dict = {f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)}
 
-    # ── Continual Learning: EWC loss ──
+    # ── Continual Learning: EWC + replay ──
     cl_state = state.get('continual')
-    ewc_val = None
-    if cl_state is not None and cl_state.protected_params:
-        ewc_val = compute_ewc_loss(
-            state['params'], cl_state.protected_params,
-            cl_state.fisher_diag, cfg.ewc_lambda)
-
-    # ── Core jitted step ──
     inputs, targets = batch
     rng, *subkeys = jax.random.split(rng, 4)
 
+    # EWC has to be evaluated on the parameters being differentiated, i.e.
+    # inside the traced loss. Computing it out here and adding the resulting
+    # scalar makes it a constant: ∇(L + c) = ∇L, so the log shows a healthy
+    # `ewc=…` while the optimizer receives exactly zero EWC gradient.
+    ewc = None
+    if cl_state is not None and cl_state.protected_params:
+        ewc = {'protected': cl_state.protected_params,
+               'fisher': cl_state.fisher_diag,
+               'lambda': cfg.ewc_lambda}
+
+    # Sample old-task latents for experience replay (None until a task switch).
+    replay = None
+    if cl_state is not None:
+        rep, _w = sample_replay(cl_state, cl_state.task_id,
+                                inputs.shape[0], cfg.replay_ratio, subkeys[2])
+        if rep is not None:
+            replay = rep['z']
+
+    # ── Core jitted step ──
     (params_new, opt_state_new, ema_state_new,
      feature_bank_new, components, aux, z) = _jitted_step(
         state['params'], state['opt_state'],
         gvalue_C_pos, gvalue_C_neg,
         inputs, targets, cfg_dict, subkeys[0],
-        ewc_val,
+        ewc, replay,
         state['ema_state'], state['feature_bank'],
         state['step'],
-        self_state=state.get('self_state'))
+        self_state=state.get('self_state'),
+        frozen_names=tuple(get_frozen_param_names()))
 
     new_state = {
         'params': params_new,
@@ -505,7 +427,6 @@ def train_step(state, batch, rng):
         cl_state = update_access_counters(cl_state, params_new, aux)
         cl_state = update_replay_buffer(
             cl_state, cl_state.task_id, z,
-            jnp.zeros((z.shape[0], cfg.vocab_size)),
             aux['soft_mask'], cfg.replay_capacity)
         if (state['step'] > 0
                 and state['step'] % cfg.consolidate_interval == 0):
@@ -534,45 +455,78 @@ def train_step(state, batch, rng):
     return new_state, components
 
 
-def _make_jit_optimizer(cfg):
-    """Build optimizer for use inside JIT (as a static object)."""
-    schedule = optax.cosine_decay_schedule(
-        init_value=cfg.learning_rate, decay_steps=100_000, alpha=0.1)
-    return optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adamw(
-            learning_rate=schedule,
-            b1=cfg.adam_beta1,
-            b2=cfg.adam_beta2,
-            eps=cfg.adam_eps,
-            weight_decay=cfg.weight_decay),
-    )
+def expand_for_new_task(state, cfg, rng, batch=None):
+    """Expand all codebooks for a new task and protect the old parameters.
 
+    This is a *transaction*: every structure whose shape is tied to a codebook
+    size has to grow in the same step. Expanding only ``params`` leaves the EMA
+    accumulators, the local value scalars, the utilisation mask and the access
+    counters one size short, and the very next training step fails on a shape
+    mismatch — after the expansion has already been committed.
 
-def expand_for_new_task(state, cfg, rng):
-    """Expand all codebooks for a new task and protect old params."""
+    Args:
+        batch: Optional ``(inputs, targets)`` used to estimate the Fisher
+            diagonal on real data. Without it the Fisher is unavailable and
+            EWC protection is skipped (with a warning) rather than silently
+            filled with a placeholder.
+    """
     if state.get('continual') is None:
         return state
 
     cl_state = state['continual']
     task_id = cl_state.task_id + 1
-    rng, exp_rng = jax.random.split(rng)
+    rng, exp_rng, fisher_rng = jax.random.split(rng, 3)
+    n_new = cfg.n_new_codebook_entries
 
     print(f"[LCM] Expanding codebooks for task {task_id} "
-          f"(+{cfg.n_new_codebook_entries} entries per lattice)...")
+          f"(+{n_new} entries per lattice)...")
 
     # Snapshot current params for EWC
     cl_state.protected_params = snapshot_protected_params(state['params'])
 
-    # Compute Fisher diagonal for protected params
-    # (In practice: run a few batches to estimate; here we use placeholder)
-    cl_state.fisher_diag = {}
-    for path, val in cl_state.protected_params.items():
-        cl_state.fisher_diag[path] = jnp.ones_like(val) * 1e-4  # placeholder
+    # Fisher diagonal, estimated from the loss on real data. The alternative —
+    # a constant placeholder — makes EWC weight every parameter equally, i.e.
+    # a plain L2 pull toward the previous task with no notion of importance.
+    if batch is not None:
+        cfg_obj = _get_global_cfg()
+        inputs, targets = batch
+        old_params = jax.tree_util.tree_map(lax.stop_gradient, state['params'])
 
-    # Expand codebooks
-    new_params = expand_lattice_codebooks(
-        state['params'], cfg.n_new_codebook_entries, exp_rng, cfg)
+        def _fisher_grads(p, sub_rng):
+            def _loss(pp):
+                z, _zq, logits, aux, _ = forward(
+                    pp, None, inputs, cfg_obj, training=True, rng=sub_rng)
+                return (compute_lm_loss(logits, targets, cfg_obj.vocab_size)
+                        + sum(compute_vq_loss(pp, aux, z, cfg_obj).values()))
+            return jax.grad(_loss)(p)
+
+        print(f"[LCM]   estimating Fisher diagonal "
+              f"({cfg.ewc_fisher_samples} MC samples)...")
+        cl_state.fisher_diag = jax.tree_util.tree_map(
+            jax.device_get,
+            estimate_fisher_diag(_fisher_grads, old_params, fisher_rng,
+                                 cfg.ewc_fisher_samples))
+    else:
+        print("[LCM]   WARNING: no batch supplied — EWC Fisher unavailable, "
+              "task protection is OFF for this expansion")
+        cl_state.fisher_diag = {}
+
+    # ── Transactional resize: params + everything shaped like a codebook ──
+    new_params = expand_lattice_codebooks(state['params'], n_new, exp_rng, cfg)
+    new_params['value_scalars'] = expand_value_scalars(
+        state['params']['value_scalars'], n_new)
+
+    cl_state.access_counters = expand_access_counters(
+        cl_state.access_counters, n_new)
+
+    state['ema_state'] = expand_ema_state(state['ema_state'], n_new, cfg)
+    state['seen_masks'] = expand_seen_masks(state.get('seen_masks', {}), n_new)
+
+    # EWC bookkeeping was snapshotted at the pre-expansion shapes; pad it to the
+    # new codebooks so the next `compute_ewc_loss` does not broadcast-fail.
+    cl_state.protected_params = pad_stats_to_params(
+        cl_state.protected_params, new_params)
+    cl_state.fisher_diag = pad_stats_to_params(cl_state.fisher_diag, new_params)
 
     # Reset optimizer state for expanded params
     optimizer = make_optimizer(cfg)
@@ -590,81 +544,6 @@ def expand_for_new_task(state, cfg, rng):
     print(f"[LCM] Task {task_id} expansion complete. "
           f"Params protected via EWC.")
     return state
-
-
-def _update_ema(params, ema_state, z, aux, cfg):
-    """Update EMA-managed codebooks."""
-    z_sum = z.sum(axis=0)
-    count = z.shape[0]
-
-    # Sparse EMA
-    C_new, N_new, m_new = sparse_ema_update(
-        params['sparse']['C'],
-        z_sum, count,
-        ema_state['sparse']['N'],
-        ema_state['sparse']['m'],
-        gamma=cfg.gamma_sparse,
-        lambda_s=cfg.lambda_sparse)
-    params['sparse']['C'] = C_new
-    ema_state['sparse']['N'] = N_new
-    ema_state['sparse']['m'] = m_new
-
-    # Manifold EMA
-    C_man_new, N_man_new, m_man_new = manifold_ema_update(
-        params['manifold']['C'],
-        z_sum, count,
-        ema_state['manifold']['N'],
-        ema_state['manifold']['m'],
-        gamma=cfg.gamma_man)
-    params['manifold']['C'] = C_man_new
-    ema_state['manifold']['N'] = N_man_new
-    ema_state['manifold']['m'] = m_man_new
-
-    # Binding EMA (all sub-codebooks)
-    for cb_type in ['key_cb', 'val_cb', 'bind_cb']:
-        ema_key = 'key' if cb_type == 'key_cb' else ('val' if cb_type == 'val_cb' else 'bind')
-        for l in range(cfg.n_bind_layers):
-            C_bind = params['binding'][cb_type][l]['A'] @ params['binding'][cb_type][l]['W']
-            N_bind = ema_state['binding'][ema_key][l]['N']
-            m_bind = ema_state['binding'][ema_key][l]['m']
-            N_new_v = cfg.gamma_bind * N_bind + (1 - cfg.gamma_bind) * count
-            m_new_v = cfg.gamma_bind * m_bind + (1 - cfg.gamma_bind) * z_sum
-            C_new_v = m_new_v / jnp.clip(N_new_v, 1.0)[:, None]
-            params['binding'][cb_type][l]['A'] = C_new_v
-            ema_state['binding'][ema_key][l]['N'] = N_new_v
-            ema_state['binding'][ema_key][l]['m'] = m_new_v
-
-    return params, ema_state
-
-
-def _update_feature_bank(feature_bank, z, aux, cfg, step):
-    """Update feature bank and reset dead vectors."""
-    B = z.shape[0]
-    bank = feature_bank['bank']
-    ptr = feature_bank['ptr']
-    last_used = feature_bank['last_used']
-
-    # Add current batch to bank (FIFO)
-    z_detach = lax.stop_gradient(z)
-    for i in range(B):
-        bank = bank.at[ptr % cfg.bank_capacity].set(z_detach[i])
-        last_used = last_used.at[ptr % cfg.bank_capacity].set(step)
-        ptr += 1
-
-    # Dead vector reset (every bank_check_interval steps)
-    if step > 0 and step % cfg.bank_check_interval == 0:
-        dead_mask = (step - last_used) > cfg.bank_dead_threshold
-        for idx in jnp.where(dead_mask)[0]:
-            rng = jax.random.PRNGKey(step + idx)
-            repl = jax.random.choice(rng, bank[:min(ptr, cfg.bank_capacity)])
-            _ = repl  # In practice: params['sparse']['C'] = repl
-            last_used = last_used.at[idx].set(step)
-
-    return {
-        'bank': bank,
-        'ptr': ptr,
-        'last_used': last_used,
-    }
 
 
 def compute_codebook_utilization(params, aux, ema_state=None, seen_masks=None):
@@ -728,6 +607,23 @@ def compute_codebook_utilization(params, aux, ema_state=None, seen_masks=None):
 def _get_global_cfg():
     """Get global config singleton."""
     return LCMConfig()
+
+
+def encoder_latent(params, inputs, cfg):
+    """Encoder output in the same space the lattices see.
+
+    ``detect_new_task`` models the distribution of the *latent* state: it keeps
+    a running mean of shape (d_model,) and a covariance of shape
+    (d_model, d_model). Passing raw token ids (B, seq_len) silently adopted
+    ``seq_len`` as the latent dimension on the first call — ``n_seen == 0``
+    just copies the batch mean — and the next call died reshaping the
+    still-(d_model, d_model) covariance. Normalisation matches
+    ``model.forward`` so the statistics describe the same distribution the
+    lattices actually see.
+    """
+    z = encoder_forward(params['encoder'], inputs, cfg.n_heads)
+    z = z / (jnp.linalg.norm(z, axis=-1, keepdims=True) + 1e-8)
+    return lax.stop_gradient(z)
 
 
 def train_loop(state, data_iter, num_steps, log_every=100,
@@ -812,13 +708,14 @@ def train_loop(state, data_iter, num_steps, log_every=100,
         cl_state = state.get('continual')
         if (cl_state is not None and step > 0
                 and step % detect_shift_every == 0):
-            z_sample = batch[0][:min(16, batch[0].shape[0])]
-            z_for_detect = jnp.mean(z_sample, axis=0, keepdims=True)
+            # Latents, not token ids — detect_new_task's contract is (B, d_model).
+            z_for_detect = encoder_latent(state['params'], batch[0], cfg)
             is_new, cl_state = detect_new_task(
-                z_for_detect, cl_state, cfg.shift_detection_threshold)
+                z_for_detect, cl_state, cfg.shift_detection_threshold,
+                min_samples=cfg.shift_detection_min_samples)
             if is_new:
                 print(f"[LCM] Distribution shift detected at step {step}!")
-                state = expand_for_new_task(state, cfg, rng)
+                state = expand_for_new_task(state, cfg, rng, batch=batch)
             state['continual'] = cl_state
 
         # Training step

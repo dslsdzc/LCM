@@ -270,8 +270,12 @@ def export(ckpt_dir: str, out_dir: str, data_dir: str = "data"):
     from train.gvalue import make_global_value_vectors
     C_pos, C_neg = make_global_value_vectors(d_model)
     C_p = np.asarray(C_pos, dtype=np.float32) if hasattr(C_pos, 'numpy') else np.array(C_pos, dtype=np.float32)
-    # Placeholder: identical halves → the C engine's margin check never fires
-    # (see cog_train export). Real anchors are NOT trained yet.
+    # PLACEHOLDER — NOT A WORKING SAFETY LAYER.
+    # Identical halves → pos_d_min == neg_d_min → the C engine's margin check
+    # never fires, and lcm.py detects the equality and disables gvalue
+    # outright. Real anchors are NOT trained yet (see cog_train export).
+    print("[EXPORT] WARNING: gvalue is a PLACEHOLDER (pos == neg) — "
+          "the global value safety check will be DISABLED")
     C_n = C_p.copy()
     data_gv = C_p.tobytes() + C_n.tobytes()
     sha_gv = hashlib.sha256(data_gv).digest()
@@ -284,10 +288,12 @@ def export(ckpt_dir: str, out_dir: str, data_dir: str = "data"):
         f.write(sha_gv)
     print(f"[EXPORT] gvalue_codebook.bin → {out_dir}/")
 
-    # danger codebook (dummy placeholder, values NOT trained; the danger
-    # lattice is not part of cognitive training yet). Identical halves with a
-    # fixed seed → danger_score ≡ 0 → no spurious blocks, deterministic export.
+    # danger codebook — PLACEHOLDER, same as gvalue above. Identical halves with
+    # a fixed seed → danger_score ≡ 0 → the danger lattice never fires. The
+    # danger lattice is not part of cognitive training yet.
     # Matches checkpoint._save_danger and cog_train's export.
+    print("[EXPORT] WARNING: danger is a PLACEHOLDER (threat == normal) — "
+          "the danger lattice is INACTIVE")
     M_danger = cfg.get('M_danger', 256)
     np.random.seed(0)
     danger_t = np.random.randn(M_danger, d_model).astype(np.float32) * 0.02

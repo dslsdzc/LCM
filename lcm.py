@@ -1437,7 +1437,12 @@ def gen_head_new_single(params, z_q, token_ids, kv_cache=None):
         glu_out = _sigmoid(attn_out @ params['w_1']) * (attn_out @ params['w_2'])
         return glu_out @ params['w_3'], (kv_sum, k_sum)
     kv_sum, k_sum = kv_cache
-    token_embed = params['w_embed'][token_ids[-1]]
+    # Continuous cognitive-state injection, matching gen_head_forward: training
+    # adds 0.5*z_q to EVERY token embedding (LCM-v2.1), so inference must too or
+    # the trained weights are evaluated on a different function. The first step
+    # (above) is deliberately excluded — there the position IS z_q, used raw,
+    # exactly as gen_head_forward uses z_q raw at position 0.
+    token_embed = params['w_embed'][token_ids[-1]] + 0.5 * z_q
     q = _elu_plus_one(token_embed @ params['w_q'])
     k = _elu_plus_one(token_embed @ params['w_k'])
     v = token_embed @ params['w_v']

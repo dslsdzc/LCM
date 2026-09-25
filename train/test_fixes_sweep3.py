@@ -62,9 +62,13 @@ def test_gen_head_einsum_matches_matmul():
 
     logits = gen_head_forward(params, z_q, x)
 
-    # Reference: explicit Q @ kv_cs matmul
+    # Reference: explicit Q @ kv_cs matmul.
+    # The `+ 0.5 * z_q` term mirrors gen_head_forward's continuous state
+    # injection (LCM-v2.1, commit 303a708). This reference predated that patch
+    # and was never updated, so it was comparing against a function that no
+    # longer existed.
     B_, N_ = x.shape
-    emb = params['w_embed'][x]
+    emb = params['w_embed'][x] + 0.5 * z_q[:, None, :]
     inputs = jnp.concatenate([z_q[:, None, :], emb], axis=1)
     Q = jax.nn.elu(inputs @ params['w_q']) + 1.0
     K = jax.nn.elu(inputs @ params['w_k']) + 1.0

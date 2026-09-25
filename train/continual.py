@@ -40,30 +40,60 @@ def init_continual_state(d_model: int) -> ContinualState:
 # ── 1. Distribution Shift Detection ──────────────────────────────────────────
 
 def detect_new_task(z: jnp.ndarray, state: ContinualState,
-                    threshold: float) -> Tuple[bool, ContinualState]:
-    """Detect distribution shift via Mahalanobis distance on z.
+                    threshold: float,
+                    min_samples: int = 32) -> Tuple[bool, ContinualState]:
+    """Detect distribution shift via Mahalanobis distance on the latent z.
 
-    Updates running EMA of mean and covariance. If batch mean exceeds
-    threshold Mahalanobis distance from EMA mean, signals new task.
+    Updates a running EMA of the latent mean and covariance. If the batch mean
+    sits more than ``threshold`` Mahalanobis standard deviations from the EMA
+    mean, the batch is declared a new task.
+
+    Args:
+        z: (B, d_model) encoder latents — NOT token ids. The running statistics
+            are (d_model,) and (d_model, d_model); feeding a (B, seq_len) token
+            batch silently redefines d_model as seq_len on the first call and
+            then fails on the covariance shape.
+        state: Continual state to update.
+        threshold: Mahalanobis distance threshold.
+        min_samples: Latents to accumulate before a shift may fire. With only a
+            handful of samples the covariance estimate is noise and every batch
+            looks like a new task. A covariance also needs B >= 2 to be
+            estimable at all, so single-sample batches never update it.
     """
     B, d = z.shape
     batch_mean = z.mean(axis=0)
 
-    if state.n_seen == 0:
-        state.z_mean_ema = batch_mean
-        state.n_seen = B
+    if state.z_mean_ema is None or state.z_mean_ema.shape[0] != d:
+        raise ValueError(
+            f"detect_new_task expects latents of width d_model="
+            f"{None if state.z_mean_ema is None else state.z_mean_ema.shape[0]}, "
+            f"got {d}. Pass encoder latents, not token ids.")
+
+    if state.n_seen < min_samples:
+        # Still warming up: accumulate statistics but never signal a task change.
+        decay = jnp.clip(1.0 - 1.0 / (state.n_seen + B), 0.9, 0.999)
+        state.z_mean_ema = (batch_mean if state.n_seen == 0
+                            else decay * state.z_mean_ema + (1 - decay) * batch_mean)
+        if B >= 2:
+            batch_cov = jnp.cov(z.T)
+            if jnp.ndim(batch_cov) == 2:
+                state.z_cov_ema = decay * state.z_cov_ema + (1 - decay) * batch_cov
+        state.n_seen += B
         return False, state
 
     # Mahalanobis distance
     diff = batch_mean - state.z_mean_ema
     cov_inv = jnp.linalg.pinv(state.z_cov_ema + 1e-6 * jnp.eye(d))
-    m_dist = jnp.sqrt(diff @ cov_inv @ diff)
+    m_dist = jnp.sqrt(jnp.maximum(diff @ cov_inv @ diff, 0.0))
 
     # Update EMA statistics
     decay = jnp.clip(1.0 - 1.0 / state.n_seen, 0.9, 0.999)
     new_mean = decay * state.z_mean_ema + (1 - decay) * batch_mean
-    batch_cov = jnp.cov(z.T)
-    new_cov = decay * state.z_cov_ema + (1 - decay) * batch_cov
+    new_cov = state.z_cov_ema
+    if B >= 2:
+        batch_cov = jnp.cov(z.T)
+        if jnp.ndim(batch_cov) == 2:
+            new_cov = decay * state.z_cov_ema + (1 - decay) * batch_cov
     is_new = m_dist > threshold
 
     state.z_mean_ema = new_mean
@@ -83,10 +113,28 @@ def expand_codebook(param: jnp.ndarray, n_new: int, rng: jax.Array,
     return jnp.concatenate([param, new_entries], axis=0)
 
 
+def expansion_key_count(cfg) -> int:
+    """Number of RNG keys a full expansion consumes.
+
+    Must stay in step with ``expand_lattice_codebooks``: one key per expanded
+    tensor. A hardcoded split count that drifts below this indexes past the end
+    of the key array and raises, and the failure lands on whichever codebook
+    happens to cross the boundary rather than on the miscount.
+    """
+    return (1                                   # hrq top
+            + cfg.n_hrq_layers                  # hrq fine layers
+            + 1                                 # sparse
+            + len(cfg.ranks)                    # lowrank U per rank
+            + 2                                 # manifold C + T
+            + 3 * cfg.n_bind_layers             # binding key/val/bind
+            + 2 * cfg.n_contrast_layers)        # contrast C_a + C_b
+
+
 def expand_lattice_codebooks(params: dict, n_new: int, rng: jax.Array,
                              cfg) -> dict:
     """Expand all lattice codebooks for a new task."""
-    keys = jax.random.split(rng, 10)
+    n_keys = expansion_key_count(cfg)
+    keys = jax.random.split(rng, n_keys)
     ki = 0
 
     # HRQ: top + fine layers
@@ -129,17 +177,94 @@ def expand_lattice_codebooks(params: dict, n_new: int, rng: jax.Array,
         params['contrast']['C_b'][l]['A'] = expand_codebook(
             params['contrast']['C_b'][l]['A'], n_new, keys[ki]); ki += 1
 
+    assert ki == n_keys, (
+        f"expansion consumed {ki} RNG keys but split {n_keys} — "
+        f"expansion_key_count() is out of sync with the expansion body")
     return params
 
 
-def expand_value_scalars(value_scalars: dict, lattice_name: str,
-                         n_new: int) -> dict:
-    """Expand local value scalars for a lattice."""
-    if lattice_name in value_scalars:
-        new_v = jnp.zeros(n_new)
-        value_scalars[lattice_name] = jnp.concatenate(
-            [value_scalars[lattice_name], new_v])
-    return value_scalars
+def _grow(vec: jnp.ndarray, n_new: int) -> jnp.ndarray:
+    """Append ``n_new`` zero entries to a per-code accumulator."""
+    return jnp.concatenate([vec, jnp.zeros(n_new, dtype=vec.dtype)])
+
+
+def expand_ema_state(ema_state: dict, n_new: int, cfg) -> dict:
+    """Resize every EMA accumulator alongside its codebook.
+
+    Growing only the codebooks leaves ``N``/``m`` one size short, and the next
+    ``_jitted_ema`` call then fails on a shape mismatch — or, worse, silently
+    broadcasts. Called from the same transaction as the codebook expansion.
+    """
+    out = {}
+    for name in ('sparse', 'manifold'):
+        if name in ema_state:
+            out[name] = {
+                'N': _grow(ema_state[name]['N'], n_new),
+                'm': jnp.concatenate(
+                    [ema_state[name]['m'], jnp.zeros((n_new, ema_state[name]['m'].shape[-1]),
+                                                     dtype=ema_state[name]['m'].dtype)],
+                    axis=0),
+            }
+    if 'binding' in ema_state:
+        out['binding'] = {}
+        for fam in ('key', 'val', 'bind'):
+            out['binding'][fam] = [
+                {'N': _grow(st['N'], n_new),
+                 'm': jnp.concatenate(
+                     [st['m'], jnp.zeros((n_new, st['m'].shape[-1]), dtype=st['m'].dtype)],
+                     axis=0)}
+                for st in ema_state['binding'].get(fam, [])
+            ]
+    return out
+
+
+def expand_value_scalars(value_scalars: dict, n_new: int) -> dict:
+    """Expand local value scalars for every lattice."""
+    return {k: _grow(v, n_new) for k, v in value_scalars.items()}
+
+
+def pad_to_shape(old: jnp.ndarray, new_shape) -> jnp.ndarray:
+    """Zero-pad ``old`` along every axis to ``new_shape`` (never truncates)."""
+    pads = [(0, max(int(n) - int(o), 0)) for o, n in zip(old.shape, new_shape)]
+    return jnp.pad(old, pads) if any(p[1] for p in pads) else old
+
+
+def pad_stats_to_params(stats: Dict[str, jnp.ndarray], params: dict
+                        ) -> Dict[str, jnp.ndarray]:
+    """Re-shape EWC bookkeeping to match expanded params.
+
+    ``protected_params`` / ``fisher_diag`` are flat ``path -> array`` maps
+    snapshotted before the codebooks grew. ``compute_ewc_loss`` subtracts them
+    from the *current* parameters, so leaving them at the old shape makes the
+    first post-expansion step fail on a broadcast — after the expansion has
+    already been committed. Zero-padding is the semantically correct resize:
+    the added rows get Fisher 0, i.e. no protection, which is exactly what a
+    freshly initialised codebook entry should have.
+    """
+    flat = dict(_param_groups(params))
+    out = {}
+    for path, arr in stats.items():
+        cur = flat.get(path)
+        out[path] = arr if cur is None else pad_to_shape(arr, cur.shape)
+    return out
+
+
+def expand_seen_masks(seen_masks: dict, n_new: int) -> dict:
+    """Grow the cumulative HRQ utilisation mask."""
+    out = dict(seen_masks)
+    if 'hrq' in out:
+        out['hrq'] = jnp.concatenate(
+            [out['hrq'], jnp.zeros(n_new, dtype=out['hrq'].dtype)])
+    return out
+
+
+def expand_access_counters(counters: dict, n_new: int) -> dict:
+    """Grow the per-codebook access counters used by memory consolidation.
+
+    Every counter is a 1-D per-code array (hrq_top / sparse / manifold), so all
+    of them follow their codebook by ``n_new`` entries.
+    """
+    return {k: _grow(v, n_new) for k, v in counters.items()}
 
 
 # ── 3. Elastic Weight Consolidation (EWC) ────────────────────────────────────
@@ -170,45 +295,39 @@ def snapshot_protected_params(params: dict) -> Dict[str, jnp.ndarray]:
     return protected
 
 
-def compute_fisher_diag_flat(grad_fn, params: dict, z: jnp.ndarray,
-                              aux: dict, rng: jax.Array,
-                              n_samples: int) -> Dict[str, jnp.ndarray]:
-    """Estimate Fisher diagonal via Monte Carlo gradient outer product.
+def estimate_fisher_diag(loss_grad_fn, params: dict, rng: jax.Array,
+                         n_samples: int) -> Dict[str, jnp.ndarray]:
+    """Estimate the diagonal Fisher by Monte-Carlo squared gradients.
+
+    ``F_i ≈ E[(∂L/∂θ_i)²]`` over samples of the data distribution. The squared
+    gradient of a single batch is a very high-variance estimator — it is only
+    usable because EWC's job is to rank parameters by importance, not to be
+    calibrated — but it must at least be computed *from the loss*, on the
+    current parameters. The previous implementation here was never called: the
+    training loop filled ``fisher_diag`` with ``jnp.ones_like(val) * 1e-4``.
 
     Args:
-        grad_fn: Callable taking (params, z, aux) returning (loss, aux_output).
-        params: Current model parameters.
-        z: Encoder output for a batch.
-        aux: Auxiliary outputs.
+        loss_grad_fn: ``(params, rng) -> grads pytree`` for one sample.
+        params: Parameters the Fisher is taken at.
         rng: PRNG key.
-        n_samples: Number of MC samples (small, ~50).
+        n_samples: Number of Monte-Carlo draws.
 
     Returns:
-        fisher: dict of path -> Fisher diagonal array.
+        dict path -> Fisher diagonal, using the same paths as
+        ``snapshot_protected_params`` so ``compute_ewc_loss`` can pair them.
     """
-    groups = _param_groups(params)
-
-    # Get grads once
-    (_, _), grads = grad_fn(params, z, aux)
-    grad_groups = _param_groups(grads)
-
-    fisher = {}
-    for (path, _), (_, g) in zip(groups, grad_groups):
-        fisher[path] = g ** 2
-
-    # Additional MC samples with input noise
-    for _ in range(1, n_samples):
-        rng, subkey = jax.random.split(rng)
-        z_noisy = z + jax.random.normal(subkey, z.shape) * 1e-3
-        (_, _), grads = grad_fn(params, z_noisy, aux)
-        _, g_groups = _param_groups(grads), None
-        for (path, _), (_, g) in zip(groups, _param_groups(grads)):
-            fisher[path] = fisher[path] + g ** 2
-
-    for path in fisher:
-        fisher[path] = fisher[path] / n_samples
-
-    return fisher
+    acc = None
+    n = max(int(n_samples), 1)
+    for _ in range(n):
+        rng, sub = jax.random.split(rng)
+        grads = loss_grad_fn(params, sub)
+        flat = dict(_param_groups(grads))
+        if acc is None:
+            acc = {k: jnp.square(v) for k, v in flat.items()}
+        else:
+            for k, v in flat.items():
+                acc[k] = acc[k] + jnp.square(v)
+    return {k: v / n for k, v in acc.items()}
 
 
 def compute_ewc_loss(params: dict, protected_params: Dict[str, jnp.ndarray],
@@ -226,29 +345,30 @@ def compute_ewc_loss(params: dict, protected_params: Dict[str, jnp.ndarray],
 # ── 4. Experience Replay ─────────────────────────────────────────────────────
 
 def update_replay_buffer(state: ContinualState, task_id: int,
-                         z: jnp.ndarray, logits: jnp.ndarray,
-                         soft_mask: jnp.ndarray, capacity: int) -> ContinualState:
-    """Update per-domain replay buffer with current batch."""
+                         z: jnp.ndarray, soft_mask: jnp.ndarray,
+                         capacity: int) -> ContinualState:
+    """Update the per-domain replay buffer with the current batch.
+
+    Only the encoder latents and the routing mask are stored. The previous
+    signature also took ``logits``, but the only call site passed
+    ``jnp.zeros((B, vocab_size))`` — a (B, 30000) allocation per step whose
+    contents were never populated and never read.
+    """
     if task_id not in state.replay_buffers:
         state.replay_buffers[task_id] = {
             'z': z[:capacity],
-            'logits': logits[:capacity],
             'soft_mask': soft_mask[:capacity],
             'ptr': 0,
             'full': False,
         }
 
     buf = state.replay_buffers[task_id]
-    B = z.shape[0]
-    cap = capacity
-
-    for i in range(B):
-        idx = buf['ptr'] % cap
+    for i in range(z.shape[0]):
+        idx = buf['ptr'] % capacity
         buf['z'] = buf['z'].at[idx].set(z[i])
-        buf['logits'] = buf['logits'].at[idx].set(logits[i])
         buf['soft_mask'] = buf['soft_mask'].at[idx].set(soft_mask[i])
         buf['ptr'] += 1
-    buf['full'] = buf['ptr'] >= cap
+    buf['full'] = buf['ptr'] >= capacity
 
     return state
 
@@ -271,7 +391,7 @@ def sample_replay(state: ContinualState, task_id: int,
 
     # Uniform across old tasks
     n_per_task = max(1, n_replay // len(old_tasks))
-    all_z, all_logits, all_masks = [], [], []
+    all_z, all_masks = [], []
 
     for t in old_tasks:
         buf = state.replay_buffers[t]
@@ -280,10 +400,9 @@ def sample_replay(state: ContinualState, task_id: int,
             continue
 
         rng, subkey = jax.random.split(rng)
-        indices = jax.random.choice(subkey, n_avail, (min(n_per_task, n_avail),),
-                                    replace=False)
+        indices = jax.random.choice(subkey, n_avail,
+                                    (min(n_per_task, n_avail),), replace=False)
         all_z.append(buf['z'][indices])
-        all_logits.append(buf['logits'][indices])
         all_masks.append(buf['soft_mask'][indices])
 
     if not all_z:
@@ -291,7 +410,6 @@ def sample_replay(state: ContinualState, task_id: int,
 
     return {
         'z': jnp.concatenate(all_z, axis=0),
-        'logits': jnp.concatenate(all_logits, axis=0),
         'soft_mask': jnp.concatenate(all_masks, axis=0),
     }, n_replay / batch_size
 

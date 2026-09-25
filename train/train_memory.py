@@ -32,7 +32,7 @@ from jax import lax
 
 from train.config import LCMConfig
 from train.data import WikiDataIter
-from train.model import init_all_params, forward, split_trainable_frozen
+from train.model import init_all_params, forward
 from train.losses import compute_vq_loss
 from train.lattices import manifold_orth_loss
 
@@ -78,8 +78,12 @@ def make_memory_step(cfg, gvalue_C_pos, gvalue_C_neg):
                 p['contrast'], z, tau=0.5)
 
             if cfg.lambda_orth > 0:
-                loss_orth = cfg.lambda_orth * jnp.mean(
-                    jnp.sum(p['manifold']['T'] ** 2, axis=(-2, -1)))
+                # λ·‖Tᵀ T − I‖² (not λ·mean(Σ T²), which is just weight decay
+                # on the tangent basis and drives T → 0).
+                loss_orth = manifold_orth_loss(
+                    p['manifold']['T'], aux['man_idx'],
+                    cfg.n_orth_samples, lambda_orth=cfg.lambda_orth,
+                    rng=subkeys[1])
             else:
                 loss_orth = 0.0
 
@@ -145,7 +149,9 @@ def _jitted_ema(params, ema_state, z):
     C_s_new = jnp.sign(C_s_new) * jnp.clip(jnp.abs(C_s_new) - lam, 0)
     params['sparse']['C'] = C_s_new
 
-    # Manifold（同上，更新 C 后用 exp_map 回到 Poincaré 球）
+    # Manifold（同上。params['manifold']['C'] 是切空间坐标 —— 前向自己会做
+    # exp_map；这里再 exp_map 一次会变成双曲坐标被当成切空间用，码本每步往
+    # 边界漂。存原始 EMA。）
     C_m = params['manifold']['C']
     M_m = C_m.shape[0]
     dists_m = jnp.sum((z[:, None, :] - C_m[None, :, :]) ** 2, axis=-1)  # (B, M)
@@ -157,9 +163,7 @@ def _jitted_ema(params, ema_state, z):
     N_m, m_m = ema_state['manifold']['N'], ema_state['manifold']['m']
     N_m_new = 0.99 * N_m + 0.01 * counts_m
     m_m_new = 0.99 * m_m + 0.01 * sums_m
-    from train.hyp import exp_map
-    C_m_new = exp_map(m_m_new / jnp.clip(N_m_new, 1.0)[:, None])
-    params['manifold']['C'] = C_m_new
+    params['manifold']['C'] = m_m_new / jnp.clip(N_m_new, 1.0)[:, None]
 
     new_ema = {
         'sparse': {'N': N_s_new, 'm': m_s_new},

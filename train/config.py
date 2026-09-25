@@ -22,6 +22,14 @@ class LCMConfig:
     # Active channel: Qwen2.5-0.5B (frozen) or Language LCM
     use_qwen: bool = True           # Use frozen Qwen as active channel
 
+    # Cognitive training: context / generation split for the active channel.
+    # z is computed from the first `cog_context_frac` of the sequence only, and
+    # the active channel is supervised on the remainder. A global z supervising
+    # the whole shifted sequence leaks every target through z.
+    cog_context_frac: float = 0.5   # Fraction of the sequence used as context
+    active_z_margin: float = 0.5    # Required logit advantage of z over z=0
+    active_z_margin_weight: float = 1.0  # Weight of the z-dependence hinge
+
     # V4: Multi-Token Prediction (MTP)
     n_mtp_depth: int = 2            # D: predict current + D-1 future tokens
     mtp_loss_weight: float = 0.3    # λ weight for future-token prediction loss
@@ -101,7 +109,9 @@ class LCMConfig:
     ewc_lambda: float = 100.0        # EWC regularization strength
     ewc_fisher_samples: int = 200    # Fisher estimation samples per task
     replay_capacity: int = 1000      # Per-domain replay buffer capacity
-    replay_ratio: float = 0.3        # Fraction of batch from replay
+    replay_ratio: float = 0.3        # Fraction of batch drawn from replay
+    replay_weight: float = 0.1       # Weight of the replayed-latent anchoring loss
+    shift_detection_min_samples: int = 32  # Latents required before a shift can fire
     n_new_codebook_entries: int = 64 # Codebook entries to add on expansion
     consolidate_interval: int = 500  # Steps between memory consolidation
     shift_detection_threshold: float = 2.0  # Mahalanobis distance for new task detection

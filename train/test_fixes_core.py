@@ -3,8 +3,9 @@
 Covers:
   1. --use-qwen active channel actually trains (a_loss > 0, z_proj gradient
      nonzero, frozen qwen untouched by the optimizer).
-  2. Passive channel predicts targets[:, -1] (the true next token) — not
-     targets[:, 0], which the bidirectional encoder already sees.
+  2. Passive channel reads out inputs[:, ctx_len] — the token right after the
+     context segment z was computed from. The batch's `targets` feeds the
+     active channel's generation segment only (context/generation split).
   4. Supervisor.step no longer raises "multiple values for argument 'lr'"
      and rolls back to the BEST params on spikes.
   7. load_decoder handles a bare d×V decoder.bin (w_proj = identity).
@@ -147,32 +148,69 @@ def test_qwen_active_channel_trains():
 # ── #2: passive channel must predict the true next token ─────────────────────
 
 def test_passive_target_is_next_token():
+    """Passive channel reads out inputs[:, ctx_len] — the token after the context.
+
+    Under the context/generation split, z comes from inputs[:, :ctx_len] and
+    both channels are supervised on what follows. The passive readout target is
+    therefore a token *inside* the batch's `inputs`, and the `targets` tensor
+    carries the generation-segment supervision consumed by the active channel
+    only. (Reading targets[:, -1] instead asked the converged state to jump
+    ctx_len tokens ahead; it leaked nothing, but it was no longer the same
+    "next step" the active channel is trained on.)
+    """
     cfg, opt, train_step = _shared_train_step()
     params, self_state = init_cog_params(
         cfg, jax.random.split(jax.random.PRNGKey(1))[1], lang_ckpt=None)
 
     inputs = jnp.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+    ctx_len = max(1, min(int(inputs.shape[1] * cfg.cog_context_frac),
+                         inputs.shape[1] - 1))
     t1 = jnp.array([[2, 3, 4, 5, 6, 7, 8, 9]])
-    t2 = jnp.array([[2, 3, 4, 5, 6, 7, 8, 42]])  # ONLY the last target differs
+    t2 = jnp.array([[2, 3, 4, 5, 6, 7, 8, 42]])   # ONLY the last target differs
+    i2 = inputs.at[0, ctx_len].set(9)             # ONLY the readout token differs
 
     opt_state = opt.init({k: v for k, v in params.items() if k != 'qwen'})
-    # SAME rng for both calls: the self-lattice uses rng (Gumbel-Softmax), so
-    # a differing rng would muddy the discriminator. Only targets may differ.
+    # SAME rng for all calls: the self-lattice uses rng (Gumbel-Softmax), so a
+    # differing rng would muddy the discriminator.
     rng = jax.random.PRNGKey(5)
-    _, _, loss1, _ = train_step(params, opt_state, (inputs, t1), 3e-4, rng,
-                                self_state=self_state)
-    _, _, loss2, _ = train_step(params, opt_state, (inputs, t2), 3e-4, rng,
-                                self_state=self_state)
-    # Identical inputs/rng → only p_target can differ, and it must:
-    # targets[:, -1] == x[N] (true next token), not targets[:, 0] == x[1].
-    assert abs(float(loss1) - float(loss2)) > 1e-4, \
-        f"loss insensitive to targets[:, -1] (loss1={loss1:.6f}, loss2={loss2:.6f})"
+    _, _, loss_a, _ = train_step(params, opt_state, (inputs, t1), 3e-4, rng,
+                                 self_state=self_state)
+    _, _, loss_b, _ = train_step(params, opt_state, (inputs, t2), 3e-4, rng,
+                                 self_state=self_state)
+    _, _, loss_c, _ = train_step(params, opt_state, (i2, t1), 3e-4, rng,
+                                 self_state=self_state)
+    # The passive readout target must move the loss...
+    assert abs(float(loss_a) - float(loss_c)) > 1e-4, \
+        f"loss insensitive to inputs[:, {ctx_len}] (the passive readout target)"
+    # ...and with the active channel disabled, `targets` is not read at all.
+    assert abs(float(loss_a) - float(loss_b)) < 1e-6, \
+        f"targets changed the loss with the active channel disabled " \
+        f"({float(loss_a):.6f} vs {float(loss_b):.6f}); only the active " \
+        f"channel consumes them"
+
+    # With the active channel present, the generation-segment targets DO matter.
+    params_q, self_state_q = init_cog_params(
+        cfg, jax.random.split(jax.random.PRNGKey(1))[1], lang_ckpt=None)
+    params_q['qwen'] = _fake_qwen()
+    params_q['z_proj'] = jax.random.normal(
+        jax.random.PRNGKey(7), (896, cfg.d_model)) * (cfg.d_model ** -0.5)
+    opt_state_q = opt.init({k: v for k, v in params_q.items() if k != 'qwen'})
+    _, _, q1, _ = train_step(params_q, opt_state_q, (inputs, t1), 3e-4, rng,
+                             self_state=self_state_q)
+    _, _, q2, _ = train_step(params_q, opt_state_q, (inputs, t2), 3e-4, rng,
+                             self_state=self_state_q)
+    assert abs(float(q1) - float(q2)) > 1e-4, \
+        f"active channel insensitive to the generation-segment targets " \
+        f"({float(q1):.6f} vs {float(q2):.6f})"
 
     # 2-step smoke: finite, non-degenerate loss
     losses, _, _ = _run_steps(train_step, cfg, params, self_state,
                               (inputs, t1), n_steps=2, seed=99)
     assert all(np.isfinite(l) and l > 0.1 for l in losses), f"losses: {losses}"
-    print(f"  #2 OK: last-target sensitivity {float(loss1):.4f} vs {float(loss2):.4f}; "
+    print(f"  #2 OK: readout-token sensitivity {float(loss_a):.4f} vs "
+          f"{float(loss_c):.4f}; targets inert without active channel "
+          f"({float(loss_a):.6f} == {float(loss_b):.6f}); active-channel "
+          f"target sensitivity {float(q1):.4f} vs {float(q2):.4f}; "
           f"2-step smoke {[f'{l:.3f}' for l in losses]}")
 
 

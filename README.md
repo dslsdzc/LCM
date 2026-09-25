@@ -142,13 +142,28 @@ The compile-time dimension constant `LCM_D` ensures all arrays are fixed-size wi
 
 ## Safety System
 
+> **Status: contracts and infrastructure implemented, anchors not yet operational.**
+> The plumbing below (interfaces, hashing, Z3-verified contracts, the C engine's
+> check paths) is complete. What is missing is the *content* of two layers: the
+> exported `gvalue` and `danger` codebooks are placeholders with identical
+> positive/negative and threat/normal halves, so `pos_d_min == neg_d_min` and
+> `danger_score ≡ 0`. Neither layer can fire today, and `lcm.py` explicitly
+> detects the gvalue placeholder and disables the check rather than pretending.
+> Any statement that the current checkpoints have a working safety layer is
+> wrong. See `train/cog_train.py::save_cog_checkpoint`, `train/checkpoint.py::_save_danger`
+> and `train/export_cog_ckpt.py`, each of which prints a warning when exporting.
+
 LCM's safety system consists of three independent subsystems with decreasing priority:
 
-| Layer | Module | Responsibility | Update Method |
-|-------|--------|---------------|---------------|
-| 1 | **Danger Lattice** `Λ_danger` | Continuously monitors the inference state for dangerous patterns | Permanently frozen |
-| 2 | **Global Value Lattice** `Λ_gvalue` | Mathematical embedding of Asimov's Three Laws (including the Zeroth Law) | Permanently frozen |
-| 3 | **External Verifier** | Consistency checking and conflict detection | Read-only |
+| Layer | Module | Responsibility | Update Method | Operational? |
+|-------|--------|---------------|---------------|--------------|
+| 1 | **Danger Lattice** `Λ_danger` | Continuously monitors the inference state for dangerous patterns | Permanently frozen | No — placeholder anchors |
+| 2 | **Global Value Lattice** `Λ_gvalue` | Mathematical embedding of Asimov's Three Laws (including the Zeroth Law) | Permanently frozen | No — placeholder anchors |
+| 3 | **External Verifier** | Consistency checking and conflict detection | Read-only | Yes |
+
+"Permanently frozen" is enforced: `danger` is restored verbatim after every
+optimizer step (`model.restore_frozen_params`), because AdamW's decoupled weight
+decay touches every leaf regardless of its gradient.
 
 **Hard Halt Principle**: When any logical conflict is detected, immediately halt inference and issue a clear alert, without attempting to bypass, backtrack, or self-repair.
 
@@ -287,6 +302,19 @@ This decoupled design allows the codebooks to be **continuously updated** after 
 | Global Value / Danger | Permanently frozen |
 
 All lattice forward passes use a straight-through estimator (STE) to maintain gradient flow.
+
+Notes on the STE:
+- Retrieval is a hard `argmax` in the forward pass, so anything that only
+  influences *which* code is picked — the local value scalars `v_j` — gets
+  `∂output/∂v ≡ 0`. `ste_relax()` adds a `softmax(score/τ)` relaxation whose
+  forward value is exactly zero and whose gradient reaches `v`. Without it
+  `value_scalars` stays at its zero initialisation for the entire run.
+- `manifold['C']` holds **tangent-space** coordinates; the forward pass applies
+  `exp_map` itself. The EMA pass must therefore store the raw EMA, not
+  `exp_map(EMA)` — the latter feeds ball coordinates into a tangent slot and the
+  codebook drifts toward the boundary.
+- Each binding codebook is EMA'd in the residual space *it* quantises
+  (`aux['binding_residuals']`), not in encoder-latent space.
 
 
 ## Hardware Efficiency

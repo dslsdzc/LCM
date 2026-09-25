@@ -77,10 +77,14 @@ def test_wikidataiter_shift_contract():
     # In-window shift: targets[:, i] == inputs[:, i+1] for i < N-1.
     assert np.array_equal(targets[:, :-1], inputs[:, 1:]), \
         "targets[:, i] must be inputs[:, i+1]"
-    # Out-of-window: targets[:, -1] == x[N] (the next token AFTER the window
-    # — what the passive channel predicts; it must NOT be in the inputs).
-    assert not np.isin(targets[:, -1], inputs).any(), \
-        "targets[:, -1] must be outside the input window"
+    # Out-of-window: targets[:, -1] is x[start+N] — the token immediately after
+    # the window, which is what the passive channel reads out. Asserted as index
+    # arithmetic, not set membership: WikiDataIter draws random window starts
+    # (`np.random.randint`, unseeded), so on a dense ramp another window's
+    # inputs routinely contain this window's successor and an `isin` check
+    # failed ~50% of runs (measured 21/40) for reasons unrelated to the code.
+    assert np.array_equal(targets[:, -1], inputs[:, -1] + 1), \
+        "targets[:, -1] must be the token immediately after inputs[:, -1]"
 
 
 def test_wikidataiter_window_bounds():

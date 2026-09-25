@@ -340,14 +340,18 @@ def genhead_step_cy(
     cdef int i, j
     cdef float s, q_dot, inv_norm
 
-    # ── Token embed (z_q on first step, lookup thereafter) ──────────────
+    # ── Token embed (z_q on first step, lookup + state injection after) ──
+    # MUST mirror train/fusion.py::gen_head_forward and lcm.py::gen_head_new_single:
+    # LCM-v2.1 adds 0.5*z_q to every token embedding, first position (raw z_q)
+    # excluded. Changing this in fewer than all three places evaluates the
+    # trained weights on a function they were not fit to.
     cdef np.ndarray[float, ndim=1] tok = np.empty(d, dtype=np.float32)
     if is_first:
         for i in range(d):
             tok[i] = z_q[i]
     else:
         for i in range(d):
-            tok[i] = w_embed[last_token_id, i]
+            tok[i] = w_embed[last_token_id, i] + 0.5 * z_q[i]
 
     # ── QKV with fused φ (ELU+1) ────────────────────────────────────────
     cdef np.ndarray[float, ndim=1] q = np.empty(d, dtype=np.float32)

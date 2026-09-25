@@ -39,21 +39,27 @@ def hrr_unbind(bound, key):
 # ─── Poincaré hyperbolic ops ─────────────────────────────────────────────────
 
 def poincare_exp_map(x, v, eps=1e-6):
-    """Exponential map in Poincaré ball: push tangent vector v onto ball."""
+    """Exponential map in Poincaré ball: push tangent vector v onto ball.
+
+    exp_x(v) = tanh(λ_x·‖v‖/2) · v / (λ_x·‖v‖), λ_x = 2/(1-‖x‖²).
+    (The old code dropped the 1/λ_x factor — outputs were λ_x× too long.)
+    """
     x_norm = jnp.sum(x ** 2)
     lam = 2.0 / (1.0 - x_norm + eps)
     v_norm = jnp.sqrt(jnp.sum(v ** 2) + eps)
-    return jnp.tanh(lam * v_norm / 2.0 + eps) * v / (v_norm + eps)
+    return jnp.tanh(lam * v_norm / 2.0) * v / (lam * v_norm + eps)
 
 
 def poincare_log_map(x, y, eps=1e-6):
-    """Logarithmic map in Poincaré ball."""
-    x_norm = jnp.sum(x ** 2)
-    lam_x = 2.0 / (1.0 - x_norm + eps)
-    diff = y - x
-    num = diff - 2 * jnp.dot(x, diff) * x / (1.0 - x_norm + eps)
-    den = 1.0 - 2 * jnp.dot(x, y) + jnp.sum(y ** 2)
-    return (2.0 / lam_x + eps) * num / (den + eps)
+    """Logarithmic map in Poincaré ball: log_x(y) = atanh(‖u‖)·u/‖u‖ with
+    u = -x ⊕ y (Möbius subtraction). At x=0: atanh(‖y‖)·y/‖y‖."""
+    x_norm2 = jnp.sum(x ** 2)
+    y_norm2 = jnp.sum(y ** 2)
+    xy = jnp.dot(x, y)
+    denom = 1 - 2 * xy + x_norm2 * y_norm2 + eps
+    u = ((1 - 2 * xy + y_norm2) * x + (1 - x_norm2) * y) / denom
+    u_norm = jnp.sqrt(jnp.sum(u ** 2) + eps)
+    return jnp.arctanh(jnp.clip(u_norm, 0.0, 0.999)) * u / (u_norm + eps)
 
 
 def poincare_dist(x, y, eps=1e-6):

@@ -9,7 +9,9 @@ import jax.numpy as jnp
 from jax import lax
 import jax.nn as jnn
 
-from train.hyp import poincare_similarity, exp_map, log_map, mobius_add
+from train.hyp import (
+    poincare_similarity, exp_map, log_map, mobius_add, safe_unit,
+)
 from train.config import LCMConfig
 
 
@@ -41,6 +43,68 @@ def value_biased_score(z, C, v, avg_dist2, alpha_val):
     """
     dist2 = jnp.sum((z[:, None, :] - C[None, :, :]) ** 2, axis=-1)  # (B, M)
     return -dist2 + alpha_val * v[None, :] * avg_dist2  # (B, M)
+
+
+def value_biased_scores(z, C, v, alpha_val):
+    """Retrieval scores for the value-biased path (higher = better, ``argmax``).
+
+    Identical in forward value to
+    ``value_biased_score(z, C, v, mean(||z - c||²), alpha_val)``, but the
+    distance terms are stop_gradient'ed so the only differentiable input is the
+    local value vector ``v`` (see ``ste_relax``). The distances are the
+    selection *criterion*, not a training target — letting gradient through
+    them would drag every codebook toward the current batch centroid.
+    """
+    dist2 = jnp.sum((z[:, None, :] - C[None, :, :]) ** 2, axis=-1)  # (B, M)
+    avg_d2 = lax.stop_gradient(jnp.mean(dist2))
+    # The stored scalars are unbounded parameters; tanh makes the *effective*
+    # bias saturate at ±1 as documented, with a non-zero gradient everywhere
+    # (a hard clip would leave a railed scalar with no way back).
+    return -lax.stop_gradient(dist2) + alpha_val * jnp.tanh(v)[None, :] * avg_d2
+
+
+def ste_relax(scores, C_out, tau=1.0):
+    """Softmax-relaxation correction for a straight-through retrieval.
+
+    ``p - sg(p)`` is **exactly zero in the forward pass**, so adding this
+    anywhere leaves every forward number bit-identical. Its gradient w.r.t. the
+    retrieval scores is ``(∂p/∂scores) @ C_out`` — which is the only path by
+    which the local value scalars ``v_j`` can learn at all. ``v_j`` influences
+    nothing but *which* code an ``argmax`` picks, so
+    ``∂output/∂v ≡ 0`` without this relaxation and ``value_scalars`` stays at
+    its zero initialisation for the whole run. Its gradient w.r.t. ``C_out`` is
+    ``p - sg(p)``, i.e. numerically zero, so codebook gradients are unchanged.
+
+    Apply this **after** the caller's ``base + stop_gradient(o - base)``
+    wrapper: those wrappers block the entire branch, relaxation included.
+    """
+    p = jax.nn.softmax(
+        (scores - jnp.max(scores, axis=-1, keepdims=True)) / tau, axis=-1)
+    return (p - lax.stop_gradient(p)) @ C_out
+
+
+def value_biased_retrieve(z, C, v, alpha_val, C_out=None):
+    """Value-biased retrieval with a straight-through selection.
+
+    Forward is bit-identical to ``C_out[argmax(score)]``. The caller is expected
+    to add ``ste_relax(scores, C_out)`` after its own STE wrapper to give the
+    local value scalars a gradient.
+
+    Args:
+        z: (B, d) query.
+        C: (M, d) codebook the score is computed against.
+        v: (M,) local value scalars in [-1, +1].
+        alpha_val: Value bias strength.
+        C_out: (M, d) codebook to select from; defaults to ``C``. Hyperbolic
+            lattices score in tangent space but retrieve the ``exp_map`` of the
+            prototype, so the two differ.
+
+    Returns:
+        (o, idx, scores): o (B, d) = ``C_out[idx]``, idx (B,), scores (B, M).
+    """
+    scores = value_biased_scores(z, C, v, alpha_val)
+    idx = jnp.argmax(scores, axis=-1)  # (B,)
+    return (C if C_out is None else C_out)[idx], idx, scores
 
 
 # ── 4.0 Routing Gate ─────────────────────────────────────────────────────────
@@ -87,10 +151,22 @@ def _sample_gumbel(rng, shape):
     return -jnp.log(-jnp.log(u))
 
 
-def route_commit_loss(z, z_route, beta=0.25):
-    """VQ commitment loss for routing gate (unit-sphere normalized)."""
-    z_n = z / (jnp.linalg.norm(z, axis=-1, keepdims=True) + 1e-8)
-    zr_n = z_route / (jnp.linalg.norm(z_route, axis=-1, keepdims=True) + 1e-8)
+def route_commit_loss(z, z_code, beta=0.25):
+    """Codebook loss for the routing gate (unit-sphere normalized).
+
+    ``z_code`` MUST be the raw codebook vector ``C_route[idx]``, not
+    ``routing_gate``'s STE output. The STE output is
+    ``z + stop_gradient(C_route[idx] - z)``, i.e. constant w.r.t. ``C_route``,
+    so using it here leaves ``C_route`` with exactly zero gradient and only
+    AdamW's decoupled weight decay touching it. Passing the raw vector makes
+    this the ordinary VQ codebook loss and gives ``C_route`` the gradient
+    ``∂/∂C_route = 2β(zr_n - sg(z_n))`` on the selected row.
+
+    Forward value is identical either way (the STE output *is* ``C_route[idx]``
+    in the forward pass), so this only changes the backward pass.
+    """
+    z_n = safe_unit(z)
+    zr_n = safe_unit(z_code)
     return beta * jnp.mean((lax.stop_gradient(z_n) - zr_n) ** 2)
 
 
@@ -118,18 +194,19 @@ def hrq_forward(params, z, tau_fallback=0.1, value_scalars=None, alpha_val=0.0):
     C_top = params['top']['A'] @ params['top']['W']
     C_top_P = exp_map(C_top)
 
+    sims = poincare_similarity(z_P[:, None, :], C_top_P[None, :, :]).squeeze(-1)  # (B, M_top)
+
     if value_scalars is not None and alpha_val > 0:
-        avg_dist2 = jnp.mean(jnp.linalg.norm(z[:, None, :] - C_top[None, :, :], axis=-1) ** 2)
-        scores = value_biased_score(z, C_top, value_scalars, avg_dist2, alpha_val)
-        top_idx = scores.argmax(axis=-1)
-        sims = poincare_similarity(z_P[:, None, :], C_top_P[None, :, :]).squeeze(-1)
-        top_sim = jnp.take_along_axis(sims, top_idx[:, None], axis=-1).squeeze(-1)
+        # Score in tangent space, retrieve the ball prototype.
+        c_top, top_idx, top_scores = value_biased_retrieve(
+            z, C_top, value_scalars, alpha_val, C_out=C_top_P)
     else:
-        sims = poincare_similarity(z_P[:, None, :], C_top_P[None, :, :])
-        sims = sims.squeeze(-1)  # (B, M_top)
         # poincare_similarity is distance-monotone (larger = farther): nearest = argmin
         top_idx = sims.argmin(axis=-1)
-        top_sim = jnp.take_along_axis(sims, top_idx[:, None], axis=-1).squeeze(-1)
+        c_top = C_top_P[top_idx]  # (B, d)
+        top_scores = None
+
+    top_sim = jnp.take_along_axis(sims, top_idx[:, None], axis=-1).squeeze(-1)
 
     # Check if we need fallback (top-1 / top-2 gap < threshold)
     # Ascending: closest first; gap = second-closest minus closest
@@ -137,35 +214,32 @@ def hrq_forward(params, z, tau_fallback=0.1, value_scalars=None, alpha_val=0.0):
     gap = sorted_sims[:, 1] - sorted_sims[:, 0]
     use_fallback = gap < tau_fallback
 
-    # Hard route or fallback
-    def hard_route(z_P, top_idx, C_top_P, fine_params):
-        c_top = C_top_P[top_idx]  # (B, d)
-        r = mobius_add(z_P, -c_top)
+    # Möbius residual through the fine layers, shared by both routing branches
+    # (they were duplicated verbatim; a fix to one silently missed the other).
+    def fine_residual(r, fine_params):
         for fb in fine_params:
-            C_fb = fb['A'] @ fb['W']
-            C_fb_P = exp_map(C_fb)
+            C_fb_P = exp_map(fb['A'] @ fb['W'])
             vr_sims = poincare_similarity(r[:, None, :], C_fb_P[None, :, :]).squeeze(-1)
-            fi = vr_sims.argmin(axis=-1)
-            c_f = C_fb_P[fi]
-            r = mobius_add(r, -c_f)
-        return log_map(mobius_add(c_top, r))
+            r = mobius_add(r, -C_fb_P[vr_sims.argmin(axis=-1)])
+        return r
+
+    def hard_route(z_P, c_top, fine_params):
+        return log_map(mobius_add(c_top, fine_residual(mobius_add(z_P, -c_top), fine_params)))
 
     def fallback_route(z_P, sims, C_top_P, fine_params):
         weights = jax.nn.softmax(-sims, axis=-1)  # (B, M_top)
         c_top_w = jnp.einsum('bm,md->bd', weights, C_top_P)  # weighted
-        r = mobius_add(z_P, -c_top_w)
-        for fb in fine_params:
-            C_fb = fb['A'] @ fb['W']
-            C_fb_P = exp_map(C_fb)
-            vr_sims = poincare_similarity(r[:, None, :], C_fb_P[None, :, :]).squeeze(-1)
-            fi = vr_sims.argmin(axis=-1)
-            c_f = C_fb_P[fi]
-            r = mobius_add(r, -c_f)
-        return log_map(mobius_add(c_top_w, r))
+        return log_map(mobius_add(c_top_w,
+                                  fine_residual(mobius_add(z_P, -c_top_w), fine_params)))
 
     o_hrq = jnp.where(use_fallback[:, None],
                       fallback_route(z_P, sims, C_top_P, params['fine']),
-                      hard_route(z_P, top_idx, C_top_P, params['fine']))
+                      hard_route(z_P, c_top, params['fine']))
+
+    # Value-scalar gradient path (forward ≡ 0), added after all routing so it
+    # cannot be swallowed by an upstream stop_gradient.
+    if top_scores is not None:
+        o_hrq = o_hrq + ste_relax(top_scores, C_top_P)
 
     return o_hrq, top_idx, top_sim
 
@@ -192,17 +266,18 @@ def sparse_forward(params, z, training=True, lambda_sparse=1e-4, d_top=None,
         C_search = jnp.concatenate([params['zero_vec'], params['C']], axis=0)
 
     if value_scalars is not None and alpha_val > 0:
-        # Value-biased retrieval
-        # Pad value_scalars for zero_vec in non-training mode
+        # Value-biased retrieval. Pad value_scalars for zero_vec in non-training
+        # mode. The selection is straight-through w.r.t. value_scalars, so the
+        # index below may still be overridden by LFQ before materialisation.
         if not training and 'zero_vec' in params:
             vs = jnp.concatenate([jnp.zeros(1), value_scalars], axis=0)
         else:
             vs = value_scalars
-        avg_dist2 = jnp.mean(jnp.linalg.norm(z[:, None, :] - C_search[None, :, :], axis=-1) ** 2)
-        scores = value_biased_score(z, C_search, vs, avg_dist2, alpha_val)
+        scores = value_biased_scores(z, C_search, vs, alpha_val)
         idx = scores.argmax(axis=-1)
         dist = -scores  # convert to distance-like for LFQ
     else:
+        scores = None
         dist = jnp.linalg.norm(z[:, None, :] - C_search[None, :, :], axis=-1)
         idx = dist.argmin(axis=-1)
 
@@ -213,8 +288,9 @@ def sparse_forward(params, z, training=True, lambda_sparse=1e-4, d_top=None,
         zero_idx = jnp.zeros_like(idx)  # index of zero_vec (0 in C_search)
         idx = jnp.where(d_min > threshold, zero_idx, idx)
 
-    o_sparse = C_search[idx]
-    o_sparse = z + lax.stop_gradient(o_sparse - z)  # STE
+    o_sparse = z + lax.stop_gradient(C_search[idx] - z)  # STE
+    if scores is not None:
+        o_sparse = o_sparse + ste_relax(scores, C_search)  # value-scalar gradient
     return o_sparse, idx
 
 
@@ -247,13 +323,15 @@ def lowrank_forward(params, z, ranks, value_scalars=None, alpha_val=0.0):
     """Incremental rank VQ with shared base V."""
     V = params['A_V'] @ params['W_V']  # (d, r_max)
     o_total = jnp.zeros_like(z)
+    relax = None
     r = z
     for l, (u_k, r_k) in enumerate(zip(params['U'], ranks)):
         C_k = u_k @ V[:, :r_k].T  # (M_lr, d)
         if value_scalars is not None and alpha_val > 0:
-            avg_dist2 = jnp.mean(jnp.linalg.norm(r[:, None, :] - C_k[None, :, :], axis=-1) ** 2)
-            scores = value_biased_score(r, C_k, value_scalars, avg_dist2, alpha_val)
+            scores = value_biased_scores(r, C_k, value_scalars, alpha_val)
             idx = scores.argmax(axis=-1)
+            step = ste_relax(scores, C_k)
+            relax = step if relax is None else relax + step
         else:
             dist = jnp.linalg.norm(r[:, None, :] - C_k[None, :, :], axis=-1)
             idx = dist.argmin(axis=-1)
@@ -261,6 +339,8 @@ def lowrank_forward(params, z, ranks, value_scalars=None, alpha_val=0.0):
         o_total = o_total + c_k
         r = r - c_k
     o_total = z + lax.stop_gradient(o_total - z)  # STE
+    if relax is not None:
+        o_total = o_total + relax  # value-scalar gradient (forward ≡ 0)
     return o_total
 
 
@@ -281,14 +361,14 @@ def manifold_forward(params, z, value_scalars=None, alpha_val=0.0):
     C_P = exp_map(params['C'])
 
     if value_scalars is not None and alpha_val > 0:
-        # Value-biased in tangent space
-        avg_dist2 = jnp.mean(jnp.linalg.norm(z[:, None, :] - params['C'][None, :, :], axis=-1) ** 2)
-        scores = value_biased_score(z, params['C'], value_scalars, avg_dist2, alpha_val)
-        idx = scores.argmax(axis=-1)
+        # Value-biased in tangent space; retrieve the ball prototype.
+        _, idx, scores = value_biased_retrieve(
+            z, params['C'], value_scalars, alpha_val, C_out=C_P)
     else:
         # Nearest neighbor in Poincaré ball
         sims = poincare_similarity(z_P[:, None, :], C_P[None, :, :]).squeeze(-1)
         idx = sims.argmin(axis=-1)
+        scores = None
     c_idx = C_P[idx]  # (B, d)
     T_idx = params['T'][idx]  # (B, d, t)
 
@@ -302,6 +382,8 @@ def manifold_forward(params, z, value_scalars=None, alpha_val=0.0):
 
     o_manifold = log_map(c_idx + proj)
     o_manifold = z + lax.stop_gradient(o_manifold - z)  # STE
+    if scores is not None:
+        o_manifold = o_manifold + ste_relax(scores, C_P)  # value-scalar gradient
     return o_manifold, idx
 
 
@@ -310,13 +392,20 @@ def manifold_orth_loss(T, indices, k, lambda_orth=0.01, rng=None):
 
     Computes ‖T_j^T T_j - I‖² averaged over active + randomly sampled codebooks.
     Vectorized for JIT compatibility.
+
+    ``k`` is the number of *sampled* codebooks (static): the sample shape must
+    be a compile-time constant, since ``jax.random.choice`` cannot take a
+    shape derived from a traced value. The previous form sized the draw by
+    ``k - len(unique(indices))``, and ``indices`` is a traced array under
+    ``jax.grad``/``jit`` — ``jnp.unique(...).shape[0]`` is not concrete, so the
+    call raised a shape error whenever this was used inside a jitted step.
+    Active codebooks are added on top of the draw and de-duplicated.
     """
     if rng is None:
         rng = jax.random.PRNGKey(0)
-    active = jnp.unique(indices)
-    n_active = active.shape[0]
-    n_needed = jnp.maximum(k - n_active, 0)
-    sampled = jax.random.choice(rng, T.shape[0], (n_needed,), replace=False)
+    k = max(1, min(int(k), T.shape[0]))  # choice(replace=False) needs k <= M
+    sampled = jax.random.choice(rng, T.shape[0], (k,), replace=False)
+    active = jnp.unique(jnp.asarray(indices, dtype=sampled.dtype))
     target = jnp.unique(jnp.concatenate([active, sampled]))
 
     # Vectorized: T[target] -> (n, d, t)
@@ -330,11 +419,18 @@ def manifold_orth_loss(T, indices, k, lambda_orth=0.01, rng=None):
 
 
 def manifold_ema_update(C, z_sum, count, N, m, gamma=0.99):
-    """EMA update for manifold codebook, re-project to Poincaré ball."""
+    """EMA update for the manifold codebook.
+
+    ``params['manifold']['C']`` is **tangent-space** coordinates: every consumer
+    pushes it onto the ball itself (``manifold_forward`` does
+    ``C_P = exp_map(params['C'])``, ``compute_vq_loss`` compares against
+    ``log_map(exp_map(C))``). Applying ``exp_map`` here stored ball coordinates
+    back into the tangent slot, so the next forward ran the map twice and the
+    codebook drifted toward the boundary on every EMA step. Store the raw EMA.
+    """
     N_new = gamma * N + (1 - gamma) * count
     m_new = gamma * m + (1 - gamma) * z_sum
     C_new = m_new / jnp.clip(N_new, 1.0)[:, None]
-    C_new = exp_map(C_new)
     return C_new, N_new, m_new
 
 
@@ -359,8 +455,40 @@ def normalize_fft(x):
     return X / mag
 
 
+def _residual_vq_chain(codebooks, r, value_scalars, alpha_val):
+    """Multi-layer residual VQ over a list of SimVQ codebooks.
+
+    Returns:
+        (quantised list, residual inputs list, accumulated ste_relax or None).
+        The residual inputs are the per-layer query vectors; they are what the
+        per-codebook EMA must accumulate, since each layer quantises its own
+        residual and not the raw lattice input.
+    """
+    quantised, inputs = [], []
+    relax = None
+    for cb in codebooks:
+        inputs.append(r)
+        if value_scalars is not None and alpha_val > 0:
+            C = cb['A'] @ cb['W']  # (M, d)
+            scores = value_biased_scores(r, C, value_scalars, alpha_val)
+            z_q = r + lax.stop_gradient(C[scores.argmax(axis=-1)] - r)
+            step = ste_relax(scores, C)
+            relax = step if relax is None else relax + step
+        else:
+            z_q, _, _ = simvq_codebook(cb, r)
+        quantised.append(z_q)
+        r = r - z_q
+    return quantised, inputs, relax
+
+
 def binding_forward(params, z, V, value_scalars=None, alpha_val=0.0):
-    """HRR binding/unbinding with cross-layer superposition."""
+    """HRR binding/unbinding with cross-layer superposition.
+
+    Returns:
+        (o_bind, residuals): residuals maps 'key'/'val'/'bind' to the list of
+        per-layer query vectors, so the EMA pass can update each binding
+        codebook in the space it actually quantises.
+    """
     # Key/value projections: W_k = V @ A_k, z_k = z @ W_k.T
     # (d, r_max) @ (r_max, d) = (d, d); (B, d) @ (d, d) = (B, d)
     W_k = V @ params['A_k']
@@ -368,65 +496,31 @@ def binding_forward(params, z, V, value_scalars=None, alpha_val=0.0):
     z_k = z @ W_k.T  # (B, d)
     z_v = z @ W_v.T  # (B, d)
 
-    # Multi-layer residual VQ for key (with value bias)
-    k_q_list = []
-    r_k = z_k
-    for cb in params['key_cb']:
-        if value_scalars is not None and alpha_val > 0:
-            C = cb['A'] @ cb['W']  # (M_bind, d)
-            avg_dist2 = jnp.mean(jnp.linalg.norm(r_k[:, None, :] - C[None, :, :], axis=-1) ** 2)
-            scores = value_biased_score(r_k, C, value_scalars, avg_dist2, alpha_val)
-            idx = scores.argmax(axis=-1)
-            z_q = C[idx]
-            z_q = r_k + lax.stop_gradient(z_q - r_k)
-        else:
-            z_q, idx, _ = simvq_codebook(cb, r_k)
-        k_q_list.append(z_q)
-        r_k = r_k - z_q
-
-    # Multi-layer residual VQ for value (with value bias)
-    v_q_list = []
-    r_v = z_v
-    for cb in params['val_cb']:
-        if value_scalars is not None and alpha_val > 0:
-            C = cb['A'] @ cb['W']
-            avg_dist2 = jnp.mean(jnp.linalg.norm(r_v[:, None, :] - C[None, :, :], axis=-1) ** 2)
-            scores = value_biased_score(r_v, C, value_scalars, avg_dist2, alpha_val)
-            idx = scores.argmax(axis=-1)
-            z_q = C[idx]
-            z_q = r_v + lax.stop_gradient(z_q - r_v)
-        else:
-            z_q, idx, _ = simvq_codebook(cb, r_v)
-        v_q_list.append(z_q)
-        r_v = r_v - z_q
+    # Multi-layer residual VQ for key / value
+    k_q_list, key_inputs, relax_k = _residual_vq_chain(
+        params['key_cb'], z_k, value_scalars, alpha_val)
+    v_q_list, val_inputs, relax_v = _residual_vq_chain(
+        params['val_cb'], z_v, value_scalars, alpha_val)
 
     # Cross-layer HRR binding (9 pairs for 3 layers)
     b_raw = 0.0
-    for i, k_i in enumerate(k_q_list):
-        for j, v_j in enumerate(v_q_list):
-            k_norm = normalize_fft(k_i)
-            v_norm = normalize_fft(v_j)
-            b_raw = b_raw + jnp.fft.irfft(k_norm * v_norm, n=z.shape[-1])
+    for k_i in k_q_list:
+        for v_j in v_q_list:
+            b_raw = b_raw + jnp.fft.irfft(
+                normalize_fft(k_i) * normalize_fft(v_j), n=z.shape[-1])
 
-    # Quantize the bound representation (with value bias)
-    r_b = b_raw
-    b_q_list = []
-    for cb in params['bind_cb']:
-        if value_scalars is not None and alpha_val > 0:
-            C = cb['A'] @ cb['W']
-            avg_dist2 = jnp.mean(jnp.linalg.norm(r_b[:, None, :] - C[None, :, :], axis=-1) ** 2)
-            scores = value_biased_score(r_b, C, value_scalars, avg_dist2, alpha_val)
-            idx = scores.argmax(axis=-1)
-            z_q = C[idx]
-            z_q = r_b + lax.stop_gradient(z_q - r_b)
-        else:
-            z_q, idx, _ = simvq_codebook(cb, r_b)
-        b_q_list.append(z_q)
-        r_b = r_b - z_q
+    # Quantize the bound representation
+    b_q_list, bind_inputs, relax_b = _residual_vq_chain(
+        params['bind_cb'], b_raw, value_scalars, alpha_val)
 
     o_bind = jnp.sum(jnp.stack(b_q_list), axis=0)
     o_bind = z + lax.stop_gradient(o_bind - z)  # STE
-    return o_bind
+    for step in (relax_k, relax_v, relax_b):
+        if step is not None:
+            o_bind = o_bind + step  # value-scalar gradient (forward ≡ 0)
+
+    residuals = {'key': key_inputs, 'val': val_inputs, 'bind': bind_inputs}
+    return o_bind, residuals
 
 
 # ── 4.6 Contrast Lattice (Λ_contrast) ───────────────────────────────────────
@@ -443,38 +537,18 @@ def init_contrast_params(rng, d, M_contrast, n_layers):
 
 def contrast_forward(params, z, value_scalars=None, alpha_val=0.0):
     """Dual codebook contrast lattice."""
-    o_a = jnp.zeros_like(z)
-    r_a = z
-    for cb in params['C_a']:
-        if value_scalars is not None and alpha_val > 0:
-            C = cb['A'] @ cb['W']
-            avg_dist2 = jnp.mean(jnp.linalg.norm(r_a[:, None, :] - C[None, :, :], axis=-1) ** 2)
-            scores = value_biased_score(r_a, C, value_scalars, avg_dist2, alpha_val)
-            idx = scores.argmax(axis=-1)
-            z_q = C[idx]
-            z_q = r_a + lax.stop_gradient(z_q - r_a)
-        else:
-            z_q, idx, _ = simvq_codebook(cb, r_a)
-        o_a = o_a + z_q
-        r_a = r_a - z_q
+    a_q_list, _, relax_a = _residual_vq_chain(
+        params['C_a'], z, value_scalars, alpha_val)
+    b_q_list, _, relax_b = _residual_vq_chain(
+        params['C_b'], z, value_scalars, alpha_val)
 
-    o_b = jnp.zeros_like(z)
-    r_b = z
-    for cb in params['C_b']:
-        if value_scalars is not None and alpha_val > 0:
-            C = cb['A'] @ cb['W']
-            avg_dist2 = jnp.mean(jnp.linalg.norm(r_b[:, None, :] - C[None, :, :], axis=-1) ** 2)
-            scores = value_biased_score(r_b, C, value_scalars, avg_dist2, alpha_val)
-            idx = scores.argmax(axis=-1)
-            z_q = C[idx]
-            z_q = r_b + lax.stop_gradient(z_q - r_b)
-        else:
-            z_q, idx, _ = simvq_codebook(cb, r_b)
-        o_b = o_b + z_q
-        r_b = r_b - z_q
-
-    o_contrast = (o_a + o_b) / 2.0
+    o_contrast = (jnp.sum(jnp.stack(a_q_list), axis=0)
+                  + jnp.sum(jnp.stack(b_q_list), axis=0)) / 2.0
     o_contrast = z + lax.stop_gradient(o_contrast - z)  # STE
+    for step in (relax_a, relax_b):
+        if step is not None:
+            o_contrast = o_contrast + step / 2.0  # value-scalar gradient
+
     return o_contrast
 
 
@@ -592,17 +666,13 @@ def init_danger_params(rng, M_danger, d):
 
 
 def init_value_scalars(rng, lattice_sizes):
-    """Initialize local value scalars v_j ∈ [-1, +1] for each lattice."""
+    """Initialize local value scalars v_j for each lattice.
+
+    Stored unnormalised; ``value_biased_scores`` applies ``tanh`` so the
+    *effective* local value bias saturates at ±1 as the design specifies while
+    keeping a non-zero gradient everywhere.
+    """
     params = {}
     for name, M in lattice_sizes:
         params[name] = jnp.zeros(M)  # initialized to 0
     return params
-
-
-def value_biased_retrieve(z, C, v, alpha_val):
-    """Retrieve with local value bias."""
-    avg_z_norm = jnp.mean(jnp.linalg.norm(z, axis=-1) ** 2)
-    avg_C_dist2 = jnp.mean(jnp.linalg.norm(z[:, None, :] - C[None, :, :], axis=-1) ** 2)
-    scores = value_biased_score(z, C, v, avg_C_dist2, alpha_val)
-    idx = scores.argmax(axis=-1)
-    return C[idx], idx
