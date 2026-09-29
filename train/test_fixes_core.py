@@ -317,6 +317,32 @@ def test_crc_mismatch_raises():
     print("  #13 OK: corrupt CRC raises ValueError; valid file loads")
 
 
+class _FakeSpec:
+    """Duck-typed stand-in for TokenizerSpec — this test only needs the path
+    that gets copied into the checkpoint and the extent it claims."""
+
+    def __init__(self, tokenizer_id, path, sha256, model_vocab_size):
+        self.tokenizer_id = tokenizer_id
+        self.path = path
+        self.sha256 = sha256
+        self.model_vocab_size = model_vocab_size
+
+
+def _fake_run_identity(tmp, vocab_size):
+    """A RunIdentity whose extent matches the params being exported."""
+    from train.cog_train import RunIdentity
+    from train.tokenizer_spec import sha256_file
+
+    tok = os.path.join(tmp, "source_tokenizer.json")
+    with open(tok, "w") as f:
+        f.write("{}")
+    return RunIdentity(
+        _FakeSpec("fake", tok, sha256_file(tok), vocab_size),
+        {"model_vocab_size": vocab_size, "token_data_sha256": "aa",
+         "document_spans_sha256": "bb", "n_tokens": 1, "n_docs": 1},
+    )
+
+
 # ── #9/#13: exported codebook .bin files round-trip through lcm.py ────────────
 
 def test_export_roundtrip_through_lcm():
@@ -329,7 +355,9 @@ def test_export_roundtrip_through_lcm():
     params, self_state = init_cog_params(
         cfg, jax.random.split(jax.random.PRNGKey(3))[1], qwen_ckpt=None)
     out = tempfile.mkdtemp(prefix="lcm_export_")
-    save_cog_checkpoint(params, out, 1, self_state=self_state)
+    save_cog_checkpoint(params, out, 1, self_state=self_state,
+                        run_identity=_fake_run_identity(out, cfg.vocab_size),
+                        train_cfg=cfg)
 
     for fname in ["hrq_codebook.bin", "sparse_codebook.bin",
                   "manifold_codebook.bin", "gvalue_codebook.bin",

@@ -3,10 +3,13 @@
 The cognitive loop IS the process of subconscious concepts "surfacing" into
 conscious thought. Codebook entries (memory) are retrieved by their embeddings,
 fused into a conscious state z_q, and z_q is transparently projected to tokens
-via a single shared matrix W_out — no per-entry decoder, no deception gap.
+through a single shared matrix — no per-entry decoder, no deception gap.
 
-The only "decoder" is z_q @ W_out. Every dimension of z_q contributes to every
-token — the mapping is fully readable from W_out's columns.
+That matrix is the encoder's token embedding E, used transposed: the readout is
+z_q @ E.T. It is tied rather than separate so the passive channel reads out in
+the same token space the encoder reads in, and so there is exactly one trainable
+token table (and one set of Adam moments) rather than two. Every dimension of
+z_q contributes to every token — the mapping is fully readable from E's rows.
 
 Operations mirror infer/engine.c, lattice.c, hyp.c:
   - build_dag: distance routing, active set selection

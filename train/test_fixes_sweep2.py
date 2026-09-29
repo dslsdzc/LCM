@@ -23,12 +23,16 @@ from train.cog_train import init_cog_params
 
 
 def test_resume_keeps_trained_z_proj():
-    """--resume without lang_ckpt must keep z_proj, disable only qwen."""
+    """--resume without qwen_ckpt must keep z_proj, disable only qwen.
+
+    The fixture no longer carries W_out: that key predates the tied readout and
+    init_cog_params now refuses it outright, since resuming it would mix two
+    token spaces. W_out was never what this test was about.
+    """
     cfg = LCMConfig()
     d, V = 64, 32
     with tempfile.TemporaryDirectory() as tmp:
         params_min = {
-            'W_out': np.ones((d, V), dtype=np.float32),
             'z_proj': np.ones((896, d), dtype=np.float32),
             'encoder': {'embed': np.ones((V, d), dtype=np.float32)},
         }
@@ -38,7 +42,7 @@ def test_resume_keeps_trained_z_proj():
                          'self_state': None}, f)
         params, _ = init_cog_params(cfg, jax.random.PRNGKey(0), resume=tmp)
     assert params['z_proj'] is not None, "trained z_proj must survive resume"
-    assert params['qwen'] is None, "no lang_ckpt → no active channel"
+    assert params['qwen'] is None, "no qwen_ckpt → no active channel"
     print("  [PASS] resume keeps trained z_proj, qwen disabled")
 
 

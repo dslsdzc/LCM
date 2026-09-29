@@ -2284,6 +2284,22 @@ If an in-repo caller exists, stop this task and report the caller rather than
 silently maintaining a second exporter. Do not retarget or duplicate the config
 logic inside this plan.
 
+**Resolved 2026-09-29: deleted.** A caller did exist (`lcm.py --mode export`),
+and it was reported rather than worked around. Two facts settled it:
+
+- the exporter took an arbitrary `--data-dir` and copied
+  `<data-dir>/tokenizer.json`, so it could export a checkpoint against a
+  tokenizer that never built its corpus — the same bypass this plan exists to
+  close, in a second implementation;
+- once `W_out` was removed it did not fail. Its `elif "W_out" in params` branch
+  went false and control fell through to a fallback that writes a **random**
+  decoder, so it would have produced a plausible-looking, wrong inference
+  artifact.
+
+`train/export_cog_ckpt.py` is now gone, `lcm.py --mode export` raises with a
+pointer to `save_cog_checkpoint`, and the README paragraph that listed it as one
+of three warning emitters no longer does.
+
 - [ ] **Step 9: Run the whole suite**
 
 ```bash

@@ -222,18 +222,24 @@ class Supervisor:
               f"LR={self.last_lr:.6e} (x{self.lr_scale:.3f}) | "
               f"cog conv={rate:.0f}%")
 
-    def save_best(self, params, opt_state, step, self_state=None):
+    def save_best(self, params, opt_state, step, self_state=None,
+                  run_identity=None):
         """Save the best checkpoint so far.
 
         Uses save_cog_checkpoint (cog parameter layout). The legacy
         checkpoint.save_checkpoint expects a gen_head that cog params don't
         have — it always raised KeyError here, silently dropping the best
         checkpoint.
+
+        run_identity is the run's own; the supervisor must not build one of its
+        own, or an auto-saved checkpoint would be indistinguishable from a
+        hand-saved one in name only.
         """
         path = os.path.join(self.output_dir, f"best_step_{step:06d}")
         from train.cog_train import save_cog_checkpoint
         try:
-            save_cog_checkpoint(params, path, step, self_state=self_state)
+            save_cog_checkpoint(params, path, step, self_state=self_state,
+                                run_identity=run_identity, train_cfg=self.cfg)
             self.last_save_path = path
             self.saved_steps.add(step)
             print(f"[SUPERVISOR] Best checkpoint saved -> {path} (loss={self.best_loss:.4f})")

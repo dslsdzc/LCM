@@ -150,8 +150,9 @@ The compile-time dimension constant `LCM_D` ensures all arrays are fixed-size wi
 > `danger_score ≡ 0`. Neither layer can fire today, and `lcm.py` explicitly
 > detects the gvalue placeholder and disables the check rather than pretending.
 > Any statement that the current checkpoints have a working safety layer is
-> wrong. See `train/cog_train.py::save_cog_checkpoint`, `train/checkpoint.py::_save_danger`
-> and `train/export_cog_ckpt.py`, each of which prints a warning when exporting.
+> wrong. See `train/cog_train.py::save_cog_checkpoint` and
+> `train/checkpoint.py::_save_danger`, each of which prints a warning when
+> exporting.
 
 LCM's safety system consists of three independent subsystems with decreasing priority:
 

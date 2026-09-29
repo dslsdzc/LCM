@@ -249,7 +249,8 @@ def init_cog_params(cfg, rng, qwen_ckpt=None, resume=None):
     """Initialize all trainable params for dual-channel cognitive training.
 
     Params:
-        encoder + codebooks + W_out: trained in Stage 2 (cognitive).
+        encoder + codebooks: trained in Stage 2 (cognitive). The encoder's
+            `embed` is also the passive readout — one token table, not two.
         qwen: the frozen bridge, loaded from its `.npz` (stop_gradient).
 
     Args:
@@ -265,10 +266,13 @@ def init_cog_params(cfg, rng, qwen_ckpt=None, resume=None):
 
     if resume:
         params, self_state = load_stage2_params(resume, cfg, rng)
-        # Only initialise W_out when the checkpoint lacks it (resume must not
-        # silently discard the trained readout).
-        if 'W_out' not in params:
-            params['W_out'] = jax.random.normal(keys[7], (d, cfg.vocab_size)) * (d ** -0.5)
+        # A checkpoint carrying W_out predates the tied readout. It is not
+        # migrated: W_out was a second token table trained against a different
+        # token space, so resuming it would silently mix the two.
+        if 'W_out' in params:
+            raise ValueError(
+                "checkpoint carries W_out, which predates the tied readout; "
+                "old cognitive checkpoints are not migrated")
     else:
         # ── Init from scratch ──
         params = {}
@@ -285,8 +289,6 @@ def init_cog_params(cfg, rng, qwen_ckpt=None, resume=None):
 
         params['self'] = init_self_params(keys[10], d, cfg.n_self_codes)
         self_state = init_self_state(cfg.n_self_codes, d)
-
-        params['W_out'] = jax.random.normal(keys[7], (d, cfg.vocab_size)) * (d ** -0.5)
 
     # Load the frozen Qwen bridge for the active channel. Language LCM is
     # retired: it is not an alternative backend, and a path that is not a .npz
@@ -370,7 +372,7 @@ def passive_loss(logits_1d, target_token):
     """Single-token CE loss for passive introspection channel.
 
     Args:
-        logits_1d: (V,) predicted logits from z_q @ W_out.
+        logits_1d: (V,) predicted logits from z_q @ E.T.
         target_token: int scalar — the next token.
     """
     return optax.softmax_cross_entropy_with_integer_labels(
@@ -394,7 +396,7 @@ def make_train_step(cfg, optimizer, joint=False):
     The sequence is split at ``cog_context_frac``. z is computed from the
     **context** half only; both channels are then supervised on what follows:
 
-      - Passive (introspection): z_q @ W_out → the first token after the context
+      - Passive (introspection): z_q @ E.T → the first token after the context
       - Active (expression):     active_channel(z_q, generation segment)
 
     The generation segment is fed to the active channel on its own, so z is the
@@ -476,8 +478,12 @@ def make_train_step(cfg, optimizer, joint=False):
                     rng=rng_self, training=True)
                 loss_self = self_lattice_reg_loss(p['self'], self_state_out)
 
-            # ── Passive channel: z_q @ W_out ────────────────────────────
-            p_logits = jnp.einsum('bsd,dv->bsv', z_qs, p['W_out'])
+            # ── Passive channel: z_q @ E.T (tied to the encoder embedding) ──
+            # One trainable token table: E is both the encoder's input
+            # embedding and the readout matrix. That is what puts the passive
+            # channel in the same token space as the active channel, and it is
+            # what removes a second optimizer leaf (and its Adam state).
+            p_logits = jnp.einsum('bsd,vd->bsv', z_qs, p['encoder']['embed'])
             # The honest readout is the token that follows the context. It is
             # outside the encoder's input by construction, so the passive
             # channel cannot degenerate into copying. (Reading targets[:, -1]
@@ -699,7 +705,7 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
         active_name = f"Qwen2.5-0.5B (frozen, {len(params['qwen'])//12} layers)"
     else:
         active_name = "DISABLED"
-    print(f"[COG] Dual-channel: passive (z_q @ W_out) + active ({active_name})")
+    print(f"[COG] Dual-channel: passive (z_q @ E.T) + active ({active_name})")
 
     # Vocabulary agreement used to be checked here and merely printed. It is now
     # enforced before allocation by resolve_dataset_identity (tokenizer digest +
@@ -725,7 +731,8 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
 
     def _handler(sig, frame):
         print(f"\n[COG] Interrupt at step {step}, saving checkpoint...")
-        save_cog_checkpoint(params, output_dir, step, self_state=self_state)
+        save_cog_checkpoint(params, output_dir, step, self_state=self_state,
+                            run_identity=run_identity, train_cfg=cfg)
         print(f"[COG] Saved → {output_dir}/cog_params.pkl")
         sys.exit(0)
 
@@ -772,7 +779,8 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
         # Save checkpoint (only with a clean step — never on poisoned params)
         if save_every > 0 and step % save_every == 0 and step > 0:
             ckpt_dir = os.path.join(output_dir, f"step_{step:06d}")
-            save_cog_checkpoint(params, ckpt_dir, step, self_state=self_state)
+            save_cog_checkpoint(params, ckpt_dir, step, self_state=self_state,
+                                run_identity=run_identity, train_cfg=cfg)
 
         running_loss += loss_f
 
@@ -797,10 +805,11 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     pbar.close()
     pbar.refresh()
     final_dir = os.path.join(output_dir, f"step_{steps:06d}")
-    save_cog_checkpoint(params, final_dir, steps, self_state=self_state)
+    save_cog_checkpoint(params, final_dir, steps, self_state=self_state,
+                        run_identity=run_identity, train_cfg=cfg)
     if sup and sup.best_params is not None:
         sup.save_best(sup.best_params, sup.best_opt_state, sup.best_step,
-                      self_state=self_state)
+                      self_state=self_state, run_identity=run_identity)
     print(f"[COG] Training complete → {output_dir}/")
 
 
@@ -852,13 +861,29 @@ def _to_np(x):
     return _np.asarray(x)
 
 
-def save_cog_checkpoint(params, output_dir, step, self_state=None):
-    """Save full checkpoint + export codebooks + W_out for C engine."""
+def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
+                        self_state=None):
+    """Save full checkpoint + export codebooks + tied readout for C engine.
+
+    run_identity is required: the checkpoint must record the tokenizer and
+    corpus it was actually trained with, never a probed global default.
+    train_cfg is required because the exported config feeds Python inference,
+    which reshapes attention by n_heads.
+    """
     import json, os, pickle, struct
     import numpy as _np
     from train.gvalue import make_global_value_vectors
 
     os.makedirs(output_dir, exist_ok=True)
+
+    # Refuse to write a checkpoint whose identity disagrees with its own tied
+    # table. Cheap, and it catches a caller that threaded the wrong identity.
+    _meta = run_identity.dataset_meta
+    _E = _to_np(params['encoder']['embed'])
+    if int(_meta["model_vocab_size"]) != _E.shape[0]:
+        raise ValueError(
+            f"tied table E has {_E.shape[0]} rows but run_identity says "
+            f"model_vocab_size={_meta['model_vocab_size']}")
     os.makedirs(output_dir, exist_ok=True)
 
     # Exclude the frozen Qwen weights from the pickle (≈2GB): they are
@@ -874,16 +899,24 @@ def save_cog_checkpoint(params, output_dir, step, self_state=None):
     def _simvq_cb(simvq):
         return _to_np(simvq['A']) @ _to_np(simvq['W'])
 
-    d = _to_np(params['W_out']).shape[0]
-    V = _to_np(params['W_out']).shape[1]
+    # No W_out: the readout is the encoder embedding, tied.
+    E = _to_np(params['encoder']['embed'])
+    d = E.shape[1]
+    V = E.shape[0]
 
     # config.json
     enc = params.get('encoder', {})
-    cfg = {
-        'd_model': d, 'vocab_size': V, 'max_seq_len': 512, 'n_heads': 4,
-        'n_encoder_layers': len(enc.get('layers', [])) if enc else 2,
-        'n_lattices': 6,
-        'd_ff': int(1.5 * d),
+    # Renamed from the local `cfg` it used to be: a parameter of that name
+    # would have been shadowed, which is how n_heads stayed hardcoded at 4
+    # against a training default of 8. Inference reshapes attention with
+    # n_heads, so that was a wrong inference artifact, not a metadata quirk.
+    # Nothing here is a literal any more: every entry is either a real tensor
+    # shape or a training choice taken from train_cfg.
+    export_cfg = {
+        # Shape facts, from the tensors actually being saved.
+        'd_model': d,
+        'vocab_size': V,
+        'n_encoder_layers': len(enc.get('layers', [])) if enc else train_cfg.n_encoder_layers,
         'M_top': _to_np(params['hrq']['top']['A']).shape[0],
         'M_fine': _to_np(params['hrq']['fine'][0]['A']).shape[0],
         'n_hrq_layers': len(params['hrq']['fine']),
@@ -894,14 +927,24 @@ def save_cog_checkpoint(params, output_dir, step, self_state=None):
         'M_contrast': _to_np(params['contrast']['C_a'][0]['A']).shape[0],
         'n_bind_layers': len(params['binding']['key_cb']),
         'n_contrast_layers': len(params['contrast']['C_a']),
-        'n_lr_layers': 3, 'r_max': 8, 't_dim': 4,
-        'n_value_pairs': 4, 'M_danger': 256,
         'n_self_codes': _to_np(params['self']['modes']).shape[0],
-        'max_inference_steps': 32, 'convergence_tol': 1e-3,
-        'entropy_threshold': 2.0,
+
+        # Training choices, from train_cfg.
+        'max_seq_len': train_cfg.max_seq_len,
+        'n_heads': train_cfg.n_heads,
+        'd_ff': train_cfg.d_ff,
+        'n_lattices': train_cfg.n_lattices,
+        'n_lr_layers': train_cfg.n_lr_layers,
+        'r_max': train_cfg.r_max,
+        't_dim': train_cfg.t_dim,
+        'n_value_pairs': train_cfg.n_value_pairs,
+        'M_danger': train_cfg.M_danger,
+        'max_inference_steps': train_cfg.max_inference_steps,
+        'convergence_tol': train_cfg.convergence_tol,
+        'entropy_threshold': train_cfg.entropy_threshold,
     }
     with open(os.path.join(output_dir, "config.json"), "w") as f:
-        json.dump(cfg, f)
+        json.dump(export_cfg, f)
 
     # encoder.bin
     if enc:
@@ -931,7 +974,11 @@ def save_cog_checkpoint(params, output_dir, step, self_state=None):
         parts.append(_to_np(gh['w_3']).ravel())
         dec = _np.concatenate(parts).astype(_np.float32)
     else:
-        dec = _to_np(params['W_out']).copy()  # fallback
+        # Phase 1: write E.T so the existing inference loader keeps working.
+        # This duplicates bytes already in encoder.bin; it is not a second
+        # training parameter and not a second Adam state. Dropping it requires
+        # changing the loader, which is deliberately out of scope.
+        dec = E.T.copy()
     dec.tofile(os.path.join(output_dir, "decoder.bin"))
 
     # 导出所有 codebook .bin 文件（带 LCM_CB 头部）
@@ -981,12 +1028,24 @@ def save_cog_checkpoint(params, output_dir, step, self_state=None):
     _np.concatenate(parts_ct).astype(_np.float32).tofile(
         os.path.join(codebooks_dir, "contrast_codebook.bin"))
 
-    # tokenizer.json — 从 data/ 复制
+    # The tokenizer this run actually trained with, not a probed default.
+    # The old code copied data/tokenizer.json — the legacy 30k BPE — no matter
+    # which tokenizer built the corpus.
     import shutil
-    for cand in ['data/tokenizer.json', '../data/tokenizer.json']:
-        if os.path.exists(cand):
-            shutil.copy2(cand, os.path.join(output_dir, "tokenizer.json"))
-            break
+    _spec = run_identity.tokenizer_spec
+    shutil.copy2(_spec.path, os.path.join(output_dir, "tokenizer.json"))
+
+    with open(os.path.join(output_dir, "run_identity.json"), "w") as f:
+        json.dump({
+            "tokenizer_id": _spec.tokenizer_id,
+            "tokenizer_sha256": _spec.sha256,
+            "token_data_sha256": _meta["token_data_sha256"],
+            "document_spans_sha256": _meta["document_spans_sha256"],
+            "model_vocab_size": int(_meta["model_vocab_size"]),
+            "n_tokens": int(_meta["n_tokens"]),
+            "n_docs": int(_meta["n_docs"]),
+            "step": int(step),
+        }, f, indent=2)
 
     # gvalue codebooks — standard 24-byte header. The old 36-byte custom
     # header made lcm.py parse M as garbage (gv_n wrong → C engine got
@@ -1022,7 +1081,7 @@ def save_cog_checkpoint(params, output_dir, step, self_state=None):
         print("[CKPT] WARNING: exporting PLACEHOLDER danger codebook "
               "(threat == normal) — the danger lattice is INACTIVE")
         import zlib as _zl
-        M_d = cfg.get("M_danger", 256)
+        M_d = export_cfg["M_danger"]
         _np.random.seed(0)
         danger_t = _np.random.randn(M_d, d).astype(_np.float32) * 0.02
         danger_n = danger_t.copy()

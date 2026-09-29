@@ -2468,10 +2468,16 @@ def main():
         _build_cython(d_model=getattr(args, 'd_model', None) or getattr(args, 'dm', None) or 256)
         return
     elif args.mode == "export":
-        from train.export_cog_ckpt import export
-        out = args.out or args.ckpt_dir.rstrip("/") + "_infer"
-        export(args.ckpt_dir, out, args.data_dir)
-        return
+        # The standalone exporter was removed with the tokenizer unification.
+        # It took an arbitrary --data-dir and copied <data-dir>/tokenizer.json,
+        # so it could export a checkpoint against a tokenizer that never built
+        # its corpus — and after W_out was removed it fell through to a branch
+        # that wrote a RANDOM decoder rather than failing.
+        raise SystemExit(
+            "The standalone exporter (train/export_cog_ckpt.py) has been "
+            "removed. Inference artifacts are written by "
+            "save_cog_checkpoint() during training, from the run's own "
+            "identity.")
     elif args.show_arch:
         LCMInferEngine.print_architecture()
 
