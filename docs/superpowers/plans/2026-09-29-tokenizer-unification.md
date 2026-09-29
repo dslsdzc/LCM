@@ -19,6 +19,40 @@
 - `TOKENIZER_REGISTRY` entries contain exactly one key, `separator`. Nothing derivable from a file goes in it.
 - **Unit tests must not require the real Qwen artifacts.** A clean CI machine or a fresh cloud instance runs `pytest` with no download. Synthetic tokenizer via `tests/conftest.py`; the one real-Qwen test lives in `tests/test_qwen_integration.py` and skips when the artifacts are absent.
 - **Language LCM is retired.** It is not a current active backend, not a fallback, and must not be preserved in `train_cog()` as an interchangeable alternative to Qwen. Historical Language-LCM files may remain outside this plan, but they do not define current LCM architecture.
+- **Test paths and commands in this plan are written against a `tests/` directory that does not exist.** Read every path and command below through this table:
+
+  | this plan writes | this repo actually uses |
+  |---|---|
+  | `tests/conftest.py` | `train/conftest.py` |
+  | `tests/test_foo.py` | `train/test_foo.py` |
+  | `from conftest import X` | `from train.conftest import X` |
+  | `python -m pytest tests/test_foo.py -v` | `JAX_PLATFORMS=cpu be/bin/python -m pytest train/test_foo.py -v` |
+  | `python -m pytest -q` | `JAX_PLATFORMS=cpu be/bin/python -m pytest train/ -q` |
+
+  Existing tests live in `train/test_*.py` and are conventionally run as modules
+  (`be/bin/python -m train.test_fixes_core`); that keeps working. pytest 9.1.1 is
+  installed, so the pytest-style tests this plan specifies are fine once
+  relocated.
+
+  Three non-obvious requirements:
+
+  - **`be/bin/python` is the repo environment** (3.14.7, jax 0.10.0, numpy 2.5.3,
+    pytest 9.1.1). `.venv/` also has jax but is unusable here: with no CUDA
+    device it aborts with `Unable to initialize backend 'cuda'`.
+  - **`JAX_PLATFORMS=cpu` is mandatory — and note the plural.** The singular
+    `JAX_PLATFORM` is silently ignored by jax 0.10: tests carrying it ran on the
+    GPU without anyone choosing that. What that costs is not theoretical. The
+    local GPU is a GTX 1650 with 4096 MiB, and a single 0.5B forward pass dies
+    on it with `RESOURCE_EXHAUSTED ... Failed to profile configs: Out of memory
+    while trying to allocate 535.31MiB` on the `[4,151936]` logits matmul. Any
+    local verification of the Qwen path must run on CPU.
+
+    Set it in `train/conftest.py` at import time with
+    `os.environ.setdefault("JAX_PLATFORMS", "cpu")`. pytest imports conftest
+    before the test modules, so it lands before jax is first imported.
+  - **`train/` is a package** (it has `__init__.py`), so pytest puts the repo root
+    on `sys.path`, not `train/`. That is why the import is
+    `from train.conftest import ...` rather than `from conftest import ...`.
 - **An enforcement function that is never called is not enforcement.** Task 7 wires identity checks into `train_cog()` before any parameter is allocated.
 - **A task may only use what earlier tasks have produced.** Each commit must be runnable on its own. `RunIdentity` is constructed in Task 7 but is only a local variable there; the checkpoint lifecycle picks it up in Task 9.
 - No emoji in code, comments, docstrings, commit messages, or docs.
@@ -81,13 +115,18 @@ Add these to `~/.config/fish/config.fish` so they survive. Note `TMPDIR` may not
 `checkpoints/qwen_model/config.json` is currently an HTTP redirect body rather than JSON, so treat that whole directory as suspect. Download everything fresh:
 
 ```bash
-huggingface-cli download Qwen/Qwen2.5-0.5B \
+hf download Qwen/Qwen2.5-0.5B \
   config.json tokenizer.json tokenizer_config.json model.safetensors \
   --local-dir /home/DslsDZC/data/lcm/models/qwen2.5-0.5b
 
 cp /home/DslsDZC/data/lcm/models/qwen2.5-0.5b/tokenizer.json \
    /home/DslsDZC/data/lcm/tokenizers/qwen2.5-0.5b/tokenizer.json
 ```
+
+Use `hf`, not `huggingface-cli`. On this machine `huggingface-cli` is retired
+and **fails silently**: it prints a deprecation notice and help text, downloads
+nothing, and still exits 0. A script that checks only the exit code will believe
+it succeeded.
 
 - [ ] **Step 5: Convert weights to the format the loader expects**
 

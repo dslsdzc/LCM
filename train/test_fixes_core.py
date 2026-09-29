@@ -122,7 +122,7 @@ def test_qwen_active_channel_trains():
 
     # Run A: with frozen fake Qwen + trainable z_proj
     params_q, self_state_q = init_cog_params(
-        cfg, jax.random.split(jax.random.PRNGKey(0))[1], lang_ckpt=None)
+        cfg, jax.random.split(jax.random.PRNGKey(0))[1], qwen_ckpt=None)
     params_q['qwen'] = _fake_qwen()
     params_q['z_proj'] = jax.random.normal(
         jax.random.PRNGKey(7), (896, d)) * (d ** -0.5)
@@ -132,7 +132,7 @@ def test_qwen_active_channel_trains():
 
     # Run B: same everything, but active channel disabled (a_loss ≡ 0)
     params_n, self_state_n = init_cog_params(
-        cfg, jax.random.split(jax.random.PRNGKey(0))[1], lang_ckpt=None)
+        cfg, jax.random.split(jax.random.PRNGKey(0))[1], qwen_ckpt=None)
     losses_n, _, _ = _run_steps(train_step, cfg, params_n, self_state_n, batch)
 
     # a_loss > 0: qwen run must be strictly worse (CE ≈ log(64) ≈ 4.16)
@@ -169,7 +169,7 @@ def test_passive_target_is_next_token():
     """
     cfg, opt, train_step = _shared_train_step()
     params, self_state = init_cog_params(
-        cfg, jax.random.split(jax.random.PRNGKey(1))[1], lang_ckpt=None)
+        cfg, jax.random.split(jax.random.PRNGKey(1))[1], qwen_ckpt=None)
 
     inputs = jnp.array([[1, 2, 3, 4, 5, 6, 7, 8]])
     ctx_len = max(1, min(int(inputs.shape[1] * cfg.cog_context_frac),
@@ -199,7 +199,7 @@ def test_passive_target_is_next_token():
 
     # With the active channel present, the generation-segment targets DO matter.
     params_q, self_state_q = init_cog_params(
-        cfg, jax.random.split(jax.random.PRNGKey(1))[1], lang_ckpt=None)
+        cfg, jax.random.split(jax.random.PRNGKey(1))[1], qwen_ckpt=None)
     params_q['qwen'] = _fake_qwen()
     params_q['z_proj'] = jax.random.normal(
         jax.random.PRNGKey(7), (896, cfg.d_model)) * (cfg.d_model ** -0.5)
@@ -327,7 +327,7 @@ def test_export_roundtrip_through_lcm():
 
     cfg = _small_cfg()
     params, self_state = init_cog_params(
-        cfg, jax.random.split(jax.random.PRNGKey(3))[1], lang_ckpt=None)
+        cfg, jax.random.split(jax.random.PRNGKey(3))[1], qwen_ckpt=None)
     out = tempfile.mkdtemp(prefix="lcm_export_")
     save_cog_checkpoint(params, out, 1, self_state=self_state)
 

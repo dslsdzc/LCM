@@ -1,17 +1,18 @@
 """Dual-channel cognitive training: passive introspection + active expression.
 
 Two output channels from the same conscious state z_q:
-  - Passive: z_q @ W_out — transparent, always readable, no deception gap
-  - Active:  Language LCM — fluent language model conditioned on cognitive state
+  - Passive: z_q @ E.T — the tied encoder embedding, transparent readout
+  - Active:  Qwen2.5-0.5B (frozen bridge; the only current active channel)
 
 The passive channel keeps the model honest (cognitive state is directly readable).
-The active channel uses the Stage 1 Language LCM as a frozen decoder that
-generates fluent text from cognitive state z_q (injected as start token).
+The active channel is a frozen pretrained model the cognitive state must learn to
+drive. Language LCM is retired and is not an alternative backend.
 
 Usage (Stage 2):
-    python lcm.py --cog-train -d zhwiki_tokens.dat \\
-      --from-lang-ckpt checkpoints/lang_lm/lang_final.pkl
+    python lcm.py --cog-train -d zhwiki_qwen.dat --qwen-ckpt <qwen_params.npz>
 """
+import dataclasses
+import json
 import os
 import pickle
 import sys
@@ -23,6 +24,12 @@ import numpy as np
 import optax
 
 from train.config import LCMConfig
+from train.dataset_meta import (
+    check_data_size, load_dataset_meta, token_dtype, validate_spans,
+)
+from train.tokenizer_spec import (
+    TOKENIZER_REGISTRY, resolve_tokenizer_spec, sha256_file, tokenizer_path_for,
+)
 from train.encoder import init_encoder_params, encoder_forward
 from train.lattices import (
     init_hrq_params, init_sparse_params, init_lowrank_params,
@@ -34,11 +41,141 @@ from train.self_lattice import (
 )
 from train.cog_loop import cog_loop_scan
 from train.lattices import contrast_info_nce_loss, manifold_orth_loss
-from train.lang_lcm import lang_lcm_forward
 from train.qwen_lm import qwen_forward, load_qwen_params, QWEN_CONFIG
 
 # Global Qwen params cache (load once, reuse across calls)
 _QWEN_PARAMS = None
+
+
+# ─── Dataset / model identity enforcement ───────────────────────────────────
+#
+# Every check below raises. There is no warning path: no active-channel metric
+# from a run whose token space cannot be verified is interpretable. The failure
+# this guards against is silent — a 30k-token corpus full of ids below 151936
+# looks entirely legal against a Qwen vocabulary, and the only thing that
+# distinguishes it is the tokenizer's own digest.
+
+@dataclasses.dataclass(frozen=True)
+class RunIdentity:
+    """What a training run was: its tokenizer and its corpus.
+
+    Constructed once at startup and handed to every checkpoint save, so no save
+    path can guess a tokenizer from a global default.
+    """
+    tokenizer_spec: object      # TokenizerSpec
+    dataset_meta: dict
+
+
+def resolve_dataset_identity(data_path, shape_path, spans_path,
+                             full_verify=False, tokenizer_path=None):
+    """Verify the tokenizer, corpus, spans and metadata all agree.
+
+    Returns (TokenizerSpec, metadata). Deliberately does not require a Qwen
+    artifact: metadata is the authority for the tensor extent. Qwen is the
+    current training bridge, but tokenizer/corpus identity is not owned by the
+    bridge implementation.
+    """
+    meta = load_dataset_meta(shape_path)
+
+    tokenizer_id = meta["tokenizer_id"]
+    if tokenizer_id not in TOKENIZER_REGISTRY:
+        raise ValueError(f"unknown tokenizer_id {tokenizer_id!r} in metadata")
+    entry = TOKENIZER_REGISTRY[tokenizer_id]
+
+    spec = resolve_tokenizer_spec(
+        path=tokenizer_path or tokenizer_path_for(tokenizer_id),
+        document_separator=entry["separator"],
+        model_vocab_size=meta["model_vocab_size"],
+        tokenizer_id=tokenizer_id,
+    )
+
+    if spec.sha256 != meta["tokenizer_sha256"]:
+        raise ValueError("tokenizer file changed since the corpus was built")
+    if spec.document_separator_id != meta["separator_id"]:
+        raise ValueError(
+            f"separator is {spec.document_separator_id} but metadata says "
+            f"{meta['separator_id']}")
+    if spec.max_token_id != meta["token_id_max"]:
+        raise ValueError(
+            f"tokenizer max id is {spec.max_token_id} but metadata says "
+            f"{meta['token_id_max']}")
+    if meta["dtype"] not in ("uint16", "uint32"):
+        raise ValueError(f"unsupported token dtype {meta['dtype']!r}")
+    if np.dtype(meta["dtype"]) != np.dtype(spec.dtype):
+        raise ValueError(
+            f"dataset dtype is {meta['dtype']} but tokenizer identity requires "
+            f"{spec.dtype}")
+
+    # Always on, and cheap: catches a truncated or replaced .dat. Runs after the
+    # dtype identity check so a width drift is reported as identity drift rather
+    # than merely as a byte-size mismatch.
+    check_data_size(meta, data_path)
+
+    if full_verify and sha256_file(data_path) != meta["token_data_sha256"]:
+        raise ValueError(
+            f"{data_path} does not match token_data_sha256; the corpus content "
+            f"changed since this metadata was written")
+
+    spans = validate_spans(spans_path, meta)
+
+    tokens = np.memmap(data_path, dtype=token_dtype(meta), mode="r",
+                       shape=(int(meta["n_tokens"]),))
+
+    # Structure does not imply semantics: a builder that wrote wrong-but-
+    # contiguous offsets passes every partition check above.
+    if np.any(tokens[spans[:, 1] - 1] != meta["separator_id"]):
+        raise ValueError(
+            "some document span does not end on the separator; the boundary "
+            "set is not what the metadata claims")
+
+    if full_verify:
+        n_sep = int(np.count_nonzero(tokens == meta["separator_id"]))
+        if n_sep != int(meta["n_docs"]):
+            raise ValueError(
+                f"found {n_sep} separators but metadata claims "
+                f"{meta['n_docs']} documents; the separator is not a unique "
+                f"boundary marker")
+
+    return spec, meta
+
+
+def verify_tied_table(params, meta, cfg):
+    """Assert the tied table was built at the metadata's extent.
+
+    An assertion, not a derivation: the resume path can carry a checkpoint
+    built under a different config.
+    """
+    E = params["encoder"]["embed"]
+    want = (int(meta["model_vocab_size"]), cfg.d_model)
+    if tuple(E.shape) != want:
+        raise ValueError(
+            f"tied table E has shape {tuple(E.shape)}, expected {want}")
+
+
+def verify_qwen_extent(params, meta):
+    """If the Qwen bridge is loaded, its tensor vocabulary must match metadata.
+
+    Qwen is the only current cognitive active bridge. If it is absent the run is
+    passive-only, and there is no Qwen extent to verify.
+    """
+    qwen = params.get("qwen")
+    if qwen is None:
+        return
+
+    embed_vocab = int(qwen["model.embed_tokens.weight"].shape[0])
+    if embed_vocab != int(meta["model_vocab_size"]):
+        raise ValueError(
+            f"Qwen embed_tokens has {embed_vocab} rows but the corpus was built "
+            f"for model_vocab_size={meta['model_vocab_size']}")
+
+    # Mirror train/qwen_lm.py: the head is weight-tied to the embedding when
+    # lm_head.weight is absent. An lm_head-less checkpoint is valid.
+    lm_weight = qwen.get("lm_head.weight", qwen["model.embed_tokens.weight"])
+    logit_vocab = int(lm_weight.shape[0])
+    if logit_vocab != int(meta["model_vocab_size"]):
+        raise ValueError(
+            f"Qwen lm_head has {logit_vocab} rows but the corpus was built for "
+            f"model_vocab_size={meta['model_vocab_size']}")
 
 
 # ─── Load Stage 2 memory checkpoint ─────────────────────────────────────────
@@ -47,13 +184,13 @@ def load_stage2_params(resume, cfg, rng):
     """Load params from Stage 2 checkpoint (full pickle or legacy .bin format).
 
     Two formats:
-      1. cog_params.pkl (new) — full params dict with lang_lcm, self_state.
-      2. .bin files (old) — loaded via checkpoint.load_checkpoint, no lang_lcm.
+      1. cog_params.pkl (new) — full params dict with self_state.
+      2. .bin files (old) — loaded via checkpoint.load_checkpoint.
 
     Returns:
         (params, self_state)
     """
-    # Try new pickle format first (preserves lang_lcm + self_state)
+    # Try new pickle format first (preserves self_state)
     pkl_path = os.path.join(resume, "cog_params.pkl")
     if os.path.exists(pkl_path):
         with open(pkl_path, 'rb') as f:
@@ -65,12 +202,10 @@ def load_stage2_params(resume, cfg, rng):
         self_state = ckpt.get('self_state')
         if self_state is None:
             self_state = init_self_state(cfg.n_self_codes, cfg.d_model)
-        has_lang = 'lang_lcm' in params and params['lang_lcm'] is not None
-        print(f"[COG] Loaded from cog_params.pkl (step {step}, "
-              f"{'incl. lang_lcm' if has_lang else 'no lang_lcm'})")
+        print(f"[COG] Loaded from cog_params.pkl (step {step})")
         return params, self_state
 
-    # Fallback: legacy .bin format — no lang_lcm, caller must provide --from-lang-ckpt
+    # Fallback: legacy .bin format — caller must supply --qwen-ckpt separately
     from train.checkpoint import load_checkpoint as bin_load
     loaded, _, _, step = bin_load(resume, cfg=cfg, rng=rng, load_opt=False)
 
@@ -87,39 +222,6 @@ def load_stage2_params(resume, cfg, rng):
 
 
 # ─── Init full params ───────────────────────────────────────────────────────
-
-def _load_lang_lm_checkpoint(lang_ckpt, params):
-    """Load Language LCM params from Stage 1 .pkl checkpoint.
-
-    The Language LCM replaces the old gen_head as the active channel.
-    Its parameters will be frozen (stop_gradient) during cognitive training
-    so the cognitive state z_q must learn to drive the frozen language model.
-    """
-    print(f"[COG] Loading Language LCM from Stage 1: {lang_ckpt}")
-    with open(lang_ckpt, 'rb') as f:
-        ckpt = pickle.load(f)
-    lang_params = jax.tree_util.tree_map(
-        lambda x: jnp.array(x) if hasattr(x, 'numpy') else x,
-        ckpt['lang_params'])
-    # Strip codebook entries (not used in pure-transformer Language LCM)
-    lang_params.pop('codebook_entries', None)
-    for layer in lang_params.get('decoder', []):
-        layer.pop('cb_read', None)
-        layer.pop('ln3_scale', None)
-        layer.pop('ln3_bias', None)
-    # Make sure pos_embed exists
-    if 'pos_embed' not in lang_params:
-        msg = (
-            f"Checkpoint {lang_ckpt} has no pos_embed!\n"
-            f"  Old checkpoints (before the pos_embed fix) were trained without\n"
-            f"  position encoding and CANNOT be used for cognitive training.\n"
-            f"  Train a new Language LCM first:\n"
-            f"    python lcm.py --lang-train --lang-steps 1000 ..."
-        )
-        raise ValueError(msg)
-    params['lang_lcm'] = lang_params
-    print(f"[COG]  Language LCM loaded: {sum(p.size for p in jax.tree_util.tree_leaves(lang_params) if hasattr(p, 'size')):,} params")
-
 
 def _load_qwen_checkpoint(qwen_path, params, d=256):
     """Load frozen Qwen2.5-0.5B as active channel.
@@ -143,15 +245,15 @@ def _load_qwen_checkpoint(qwen_path, params, d=256):
     print(f"[COG]  z_proj: {'kept from checkpoint' if 'z_proj' in params else 'initialised'}")
 
 
-def init_cog_params(cfg, rng, lang_ckpt=None, resume=None):
+def init_cog_params(cfg, rng, qwen_ckpt=None, resume=None):
     """Initialize all trainable params for dual-channel cognitive training.
 
     Params:
         encoder + codebooks + W_out: trained in Stage 2 (cognitive).
-        lang_lcm: loaded from Stage 1, frozen (stop_gradient).
+        qwen: the frozen bridge, loaded from its `.npz` (stop_gradient).
 
     Args:
-        lang_ckpt: Path to Language LCM .pkl checkpoint (Stage 1).
+        qwen_ckpt: Path to the Qwen `.npz` bridge, or None for passive-only.
         resume: Optional Stage 2 checkpoint dir.
 
     Returns:
@@ -186,16 +288,18 @@ def init_cog_params(cfg, rng, lang_ckpt=None, resume=None):
 
         params['W_out'] = jax.random.normal(keys[7], (d, cfg.vocab_size)) * (d ** -0.5)
 
-    # Load frozen Language LCM for active channel
-    use_qwen = getattr(cfg, 'use_qwen', True)
-    if lang_ckpt:
-        if use_qwen and lang_ckpt.endswith('.npz'):
-            _load_qwen_checkpoint(lang_ckpt, params, d)
-        else:
-            _load_lang_lm_checkpoint(lang_ckpt, params)
+    # Load the frozen Qwen bridge for the active channel. Language LCM is
+    # retired: it is not an alternative backend, and a path that is not a .npz
+    # fails rather than silently reviving it.
+    if qwen_ckpt:
+        if not qwen_ckpt.endswith('.npz'):
+            raise ValueError(
+                "Language LCM is retired; cognitive training accepts only the "
+                "Qwen .npz bridge (or no bridge for passive-only runs), got "
+                f"{qwen_ckpt!r}")
+        _load_qwen_checkpoint(qwen_ckpt, params, d)
     else:
-        print("[COG] Warning: no Language LCM checkpoint provided; active channel disabled")
-        params['lang_lcm'] = None
+        print("[COG] No active bridge provided; active channel disabled")
         params['qwen'] = None
         # Keep a trained z_proj from a resumed checkpoint: a later resume with
         # a Qwen npz must not discard the projection it already trained.
@@ -273,30 +377,7 @@ def passive_loss(logits_1d, target_token):
         logits_1d[None, :], jnp.array([target_token])).mean()
 
 
-# ─── Active channel: Language LCM conditioned on cognitive state ────────────
-
-def active_channel_forward(lang_params, z_q, x, cfg):
-    """Active channel: Language LM from cognitive state z_q.
-
-    The Language LCM (4-layer transformer) is conditioned on z_q by
-    replacing the first position's token embedding with z_q.
-    Language LCM parameters are frozen (caller should use stop_gradient).
-
-    Args:
-        lang_params: Frozen Language LCM parameters.
-        z_q: (B, d) cognitive state.
-        x: (B, N) input token IDs.
-        cfg: LCMConfig.
-
-    Returns:
-        logits: (B, N, V) next-token predictions.
-    """
-    # lang_lcm_forward returns (logits, h, aux)
-    logits, _, _ = lang_lcm_forward(
-        lang_params, x, cfg, rng=None, training=False,
-        dropout_rate=0.0, z_q=z_q)
-    return logits  # (B, N, V) — aligns with targets directly
-
+# ─── Active channel: frozen Qwen bridge conditioned on z_q ──────────────────
 
 def active_loss(logits, targets):
     """Cross-entropy for active channel (full sequence)."""
@@ -324,7 +405,7 @@ def make_train_step(cfg, optimizer, joint=False):
     nothing. A hinge on ``logit(true | z) − logit(true | z=0)`` stops the active
     channel from ignoring z and degenerating into a plain causal LM.
 
-    The Language LCM / Qwen bridge is frozen (stop_gradient) so the gradient
+    The Qwen bridge is frozen (stop_gradient) so the gradient
     forces the cognitive state z_q to adapt to it.
 
     Self-lattice provides internal state machine (mode selection, self output).
@@ -409,7 +490,7 @@ def make_train_step(cfg, optimizer, joint=False):
                 p_target[:, None].repeat(cfg.max_inference_steps, axis=1).reshape(-1),
             ).mean()
 
-            # ── Active channel: Qwen or Language LCM (frozen) ───────────
+            # ── Active channel: frozen Qwen bridge ──────────────────────
             #
             # z is the ONLY channel carrying the context: the generation
             # segment is fed on its own, so the active channel cannot read the
@@ -433,10 +514,6 @@ def make_train_step(cfg, optimizer, joint=False):
                 a_logits = qwen_forward(qwen_params, gen_in,
                                          z_q=z_final, z_proj=z_proj,
                                          n_layers=4)
-            elif p.get('lang_lcm') is not None:
-                lang_params = jax.lax.stop_gradient(p['lang_lcm'])
-                a_logits = active_channel_forward(
-                    lang_params, z_final, gen_in, cfg)
             else:
                 a_logits = None
 
@@ -447,12 +524,8 @@ def make_train_step(cfg, optimizer, joint=False):
                 # solution is to ignore z entirely and behave like a plain
                 # causal LM. Penalise any step where zeroing z does not hurt.
                 z0 = jax.lax.stop_gradient(jnp.zeros_like(z_final))
-                if use_qwen:
-                    b_logits = qwen_forward(qwen_params, gen_in, z_q=z0,
-                                            z_proj=p['z_proj'], n_layers=4)
-                else:
-                    b_logits = active_channel_forward(
-                        lang_params, z0, gen_in, cfg)
+                b_logits = qwen_forward(qwen_params, gen_in, z_q=z0,
+                                        z_proj=p['z_proj'], n_layers=4)
                 tgt = a_targets[:, :, None]
                 with_z = jnp.take_along_axis(a_logits, tgt, axis=-1).squeeze(-1)
                 without_z = jnp.take_along_axis(b_logits, tgt, axis=-1).squeeze(-1)
@@ -542,29 +615,53 @@ def make_train_step(cfg, optimizer, joint=False):
 
 def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
               seq_len=256, log_every=100, save_every=1000,
-              data_path=None, shape_path=None, lang_ckpt=None,
-              resume=None, joint=False, auto_mode=False):
+              data_path=None, shape_path=None, spans_path=None,
+              qwen_ckpt=None, resume=None, joint=False, auto_mode=False,
+              full_verify=True):
     """Run dual-channel cognitive training (Stage 2).
 
     Dual channels from cognitive state z_q:
-      - Passive: z_q @ W_out (transparent introspection)
-      - Active:  Language LCM(z_q) (fluent language from frozen Stage 1 model)
+      - Passive: z_q @ E.T (the encoder embedding, tied; honest readout)
+      - Active:  Qwen2.5-0.5B (frozen bridge; the only current active channel)
 
     Args:
-        lang_ckpt: Path to Stage 1 Language LCM .pkl checkpoint.
-        resume: Optional Stage 2 checkpoint dir.
+        data_path / shape_path / spans_path: the three files that constitute a
+            corpus. Identity is verified before any parameter is allocated.
+        qwen_ckpt: Path to the Qwen `.npz` bridge, or None for passive-only.
+        resume: Optional checkpoint dir carrying a matching run identity.
         joint: When True, adds Stage 3 losses.
         auto_mode: When True, enables Supervisor.
+        full_verify: Re-read the corpus and check its content hash. On by
+            default: a production run must verify the corpus, not just its size.
     """
     from train.data import WikiDataIter
     from tqdm import tqdm
 
     os.makedirs(output_dir, exist_ok=True)
-    rng = jax.random.PRNGKey(42)
 
+    # 1. Verify corpus/tokenizer BEFORE allocating model parameters.
+    spec, meta = resolve_dataset_identity(
+        data_path, shape_path, spans_path, full_verify=full_verify,
+    )
+
+    # 2. The dataset owns the tensor vocabulary extent. Deliberately does not
+    #    need a Qwen artifact: metadata is authoritative.
+    cfg = dataclasses.replace(cfg, vocab_size=int(meta["model_vocab_size"]))
+
+    # 3. Identity for this run. The resume check (added with
+    #    verify_resume_identity) goes immediately after this line and before
+    #    step 4, so a mismatched resume fails before anything is loaded.
+    run_identity = RunIdentity(spec, meta)
+
+    # 4. Only now is model allocation allowed.
+    rng = jax.random.PRNGKey(42)
     rng, init_rng = jax.random.split(rng)
-    params, self_state = init_cog_params(cfg, init_rng, lang_ckpt=lang_ckpt,
+    params, self_state = init_cog_params(cfg, init_rng, qwen_ckpt=qwen_ckpt,
                                           resume=resume)
+
+    # 5. Assert the actual tensors, do not assume init did the right thing.
+    verify_tied_table(params, meta, cfg)
+    verify_qwen_extent(params, meta)
 
     schedule = optax.cosine_decay_schedule(
         init_value=lr, decay_steps=steps, alpha=0.1)
@@ -584,7 +681,9 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     # erode the frozen bridge). train_step() filters it out of the update tree.
     opt_state = optimizer.init({k: v for k, v in params.items() if k != 'qwen'})
 
-    data_iter = WikiDataIter(data_path, shape_path, B=batch_size, N=seq_len)
+    # 6. Sampling must consume the same dataset identity.
+    data_iter = WikiDataIter(data_path, shape_path, spans_path,
+                             B=batch_size, N=seq_len)
     train_step = make_train_step(cfg, optimizer, joint=joint)
 
     codebooks_flat = pack_codebooks_for_c(params)
@@ -595,39 +694,17 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     d = cfg.d_model
     total_params = sum(p.size for p in jax.tree_util.tree_leaves(params)
                        if hasattr(p, 'size'))
-    has_lang = 'lang_lcm' in params and params['lang_lcm'] is not None
     has_qwen = 'qwen' in params and params['qwen'] is not None
     if has_qwen:
         active_name = f"Qwen2.5-0.5B (frozen, {len(params['qwen'])//12} layers)"
-    elif has_lang:
-        active_name = "Language LCM (frozen)"
     else:
         active_name = "DISABLED"
     print(f"[COG] Dual-channel: passive (z_q @ W_out) + active ({active_name})")
 
-    # ── Active-channel vocabulary check ──────────────────────────────────
-    # The batch supplies token ids from the *local* BPE tokenizer
-    # (cfg.vocab_size entries), but the active channel's logits are indexed by
-    # its own vocabulary. If the two differ, every cross-entropy above scores a
-    # local id against an unrelated column of the bridge's output: training
-    # runs, the loss falls, and nothing is being learned. Checked here, once,
-    # because nothing downstream can detect it.
-    if has_qwen:
-        bridge_vocab = int(params['qwen']['model.embed_tokens.weight'].shape[0])
-    elif has_lang:
-        bridge_vocab = int(params['lang_lcm']['W_out'].shape[-1])
-    else:
-        bridge_vocab = None
-    if bridge_vocab is not None and bridge_vocab != cfg.vocab_size:
-        print(f"[COG] *** VOCABULARY MISMATCH ***")
-        print(f"      data tokenizer : {cfg.vocab_size} tokens (LocalBPE)")
-        print(f"      active channel : {bridge_vocab} tokens")
-        print(f"      The active-channel loss compares local token ids against "
-              f"the bridge's own vocabulary, so it is optimising the wrong "
-              f"targets. Fix by training the data with the bridge's tokenizer "
-              f"(set cfg.vocab_size = {bridge_vocab} and re-run preprocess), or "
-              f"by remapping the ids. Until then the active channel learns "
-              f"nothing and `loss` is not a meaningful metric.")
+    # Vocabulary agreement used to be checked here and merely printed. It is now
+    # enforced before allocation by resolve_dataset_identity (tokenizer digest +
+    # metadata + tensors) and verify_qwen_extent, which raise instead of warn:
+    # a run whose token space cannot be verified has no interpretable metric.
     print(f"[COG] Self-lattice: {cfg.n_self_codes} modes")
     print(f"[COG] Steps: {steps}, B={batch_size}, N={seq_len}, lr={lr}")
     if joint:

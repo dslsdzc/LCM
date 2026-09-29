@@ -316,13 +316,16 @@ def train(args):
         print("\nStage 2: encoder + codebook training")
         if args.use_qwen:
             from train.cog_train import train_cog
+            from train.dataset_meta import spans_path_for
             qp = "checkpoints/qwen_model/qwen_params.npz"
             shp = args.shape or (args.data.replace('.dat', '_shape.json') if args.data else None)
             train_cog(cfg=LCMConfig(), output_dir=args.save_dir or "checkpoints/cog_qwen",
                        steps=args.steps or args.memory_steps or 50000, lr=args.lr or args.lr_stage2 or 3e-4,
                        batch_size=args.batch_size or 12, seq_len=args.seq_len or 256,
                        log_every=100, save_every=args.save or 1000,
-                       data_path=args.data, shape_path=shp, lang_ckpt=qp)
+                       data_path=args.data, shape_path=shp,
+                       spans_path=spans_path_for(args.data),
+                       qwen_ckpt=qp, full_verify=True)
         else:
             from train.train_memory import train_memory
             resume = args.resume
@@ -2245,7 +2248,10 @@ def main():
     p.add_argument("--lang-batch", type=int, default=16, help="Lang LCM batch (default 16)")
     p.add_argument("--lang-seq", type=int, default=512, help="Lang LCM seq len (default 512)")
     p.add_argument("--lang-save", type=int, default=10000, help="Lang LCM save interval (default 10000)")
-    p.add_argument("--from-lang-ckpt", default=None, help="Load Stage 1 Language LCM for cog training")
+    p.add_argument("--qwen-ckpt", default=None,
+                   help="Qwen .npz bridge for cog training (Language LCM is retired)")
+    p.add_argument("--spans", default=None,
+                   help="Document spans .npy (default: <data>_docs.npy)")
     p.add_argument("--use-qwen", action="store_true",
                    help="Use frozen Qwen2.5-0.5B as active channel (auto-loads weights)")
     p.add_argument("--compile", action="store_true",
@@ -2492,7 +2498,7 @@ def main():
         cfg = LCMConfig()
         rng = jax.random.PRNGKey(42)
         lck = "checkpoints/qwen_model/qwen_params.npz" if args.use_qwen else None
-        p, ss = init_cog_params(cfg, jax.random.split(rng)[1], lang_ckpt=lck)
+        p, ss = init_cog_params(cfg, jax.random.split(rng)[1], qwen_ckpt=lck)
         opt = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(3e-4, weight_decay=0.01))
         ts = make_train_step(cfg, opt)
         # Frozen Qwen is excluded from the optimizer tree (train_step filters
@@ -2553,6 +2559,7 @@ def main():
                     "sd = {k: v.numpy() for k, v in m.state_dict().items()}\n"
                     "    np.savez('checkpoints/qwen_model/qwen_params.npz', **sd)\"")
             print(f"[QWEN] Using frozen Qwen2.5-0.5B as active channel")
+        from train.dataset_meta import spans_path_for
         train_cog(
             cfg=cfg,
             output_dir=out_dir,
@@ -2564,7 +2571,8 @@ def main():
             save_every=args.cog_save,
             data_path=args.data,
             shape_path=shape,
-            lang_ckpt=qwen_ckpt or args.from_lang_ckpt or args.from_lm_ckpt,
+            spans_path=spans_path_for(args.data, getattr(args, "spans", None)),
+            qwen_ckpt=qwen_ckpt or args.qwen_ckpt or args.from_lm_ckpt,
             resume=resume,
             joint=(args.stage == 3),
             auto_mode=args.auto,
@@ -2622,6 +2630,7 @@ def _cmd_train(subargs):
     if stage == "cog":
         from train.config import LCMConfig
         from train.cog_train import train_cog
+        from train.dataset_meta import spans_path_for
         cfg = LCMConfig()
         # Apply architecture overrides from the sub-parser (previously the
         # --d-model/--d-ff/--n-heads flags were silently ignored).
@@ -2636,18 +2645,20 @@ def _cmd_train(subargs):
         resume = subargs.resume
         if not resume:
             resume = _prompt_resume(out_dir, "CogTrain", subargs.yes)
-        lang_ckpt = subargs.from_lm_ckpt
+        qwen_ckpt = subargs.from_lm_ckpt
         if subargs.use_qwen:
             # Same resolution as the top-level --cog-train path.
-            lang_ckpt = "checkpoints/qwen_model/qwen_params.npz"
-            if not os.path.exists(lang_ckpt):
+            qwen_ckpt = "checkpoints/qwen_model/qwen_params.npz"
+            if not os.path.exists(qwen_ckpt):
                 raise SystemExit(
-                    f"[QWEN] Weights not found at {lang_ckpt}. Convert from "
+                    f"[QWEN] Weights not found at {qwen_ckpt}. Convert from "
                     "HuggingFace safetensors to .npz first (see --cog-train help).")
         train_cog(cfg=cfg, output_dir=out_dir, steps=subargs.cog_steps,
                   lr=subargs.cog_lr, batch_size=subargs.cog_batch, seq_len=subargs.cog_seq,
                   log_every=100, save_every=subargs.cog_save, data_path=subargs.data,
-                  shape_path=shape, lang_ckpt=lang_ckpt, resume=resume,
+                  shape_path=shape,
+                  spans_path=spans_path_for(subargs.data, getattr(subargs, "spans", None)),
+                  qwen_ckpt=qwen_ckpt, resume=resume,
                   joint=False, auto_mode=subargs.auto)
     else:
         subargs.stage = int(stage)

@@ -61,17 +61,44 @@ def test_cog_loop_scan_converges():
 
 # ── 2. Data contract ────────────────────────────────────────────────────────
 
+def _mini_corpus(tmp, n, dtype="uint32"):
+    """A one-document corpus with real metadata, for WikiDataIter tests.
+
+    WikiDataIter now takes (data_path, shape_path, spans_path) and reads its
+    width from metadata, so a bare {n_tokens: N} sidecar no longer describes a
+    readable corpus.
+    """
+    from train.dataset_meta import save_dataset_meta
+    from train.tokenizer_spec import sha256_file
+
+    dat = os.path.join(tmp, "tokens.dat")
+    shp = os.path.join(tmp, "tokens_shape.json")
+    spn = os.path.join(tmp, "tokens_docs.npy")
+
+    tokens = np.arange(n, dtype=np.dtype(dtype))
+    tokens.tofile(dat)
+    with open(spn, "wb") as f:
+        np.save(f, np.array([[0, n]], dtype=np.int64))
+    save_dataset_meta(shp, {
+        "n_tokens": int(n), "dtype": dtype,
+        "tokenizer_id": "qwen2.5-0.5b",
+        "tokenizer_sha256": sha256_file(spn),
+        "separator_id": int(tokens[-1]),
+        "token_id_max": int(tokens.max()),
+        "model_vocab_size": 151936,
+        "n_docs": 1,
+        "document_spans_sha256": sha256_file(spn),
+        "token_data_sha256": sha256_file(dat),
+    })
+    return dat, shp, spn
+
+
 def test_wikidataiter_shift_contract():
     """targets[:, i] must equal inputs[:, i+1] (next-token prediction)."""
     from train.data import WikiDataIter
-    tokens = np.arange(100, dtype=np.uint16)
     with tempfile.TemporaryDirectory() as tmp:
-        dat = os.path.join(tmp, "tokens.dat")
-        shp = os.path.join(tmp, "tokens_shape.json")
-        tokens.tofile(dat)
-        with open(shp, "w") as f:
-            json.dump({'n_tokens': 100}, f)
-        it = WikiDataIter(dat, shp, B=3, N=8)
+        dat, shp, spn = _mini_corpus(tmp, 100)
+        it = WikiDataIter(dat, shp, spn, B=3, N=8)
         inputs, targets = next(it)
     assert inputs.shape == (3, 8) and targets.shape == (3, 8)
     # In-window shift: targets[:, i] == inputs[:, i+1] for i < N-1.
@@ -90,14 +117,9 @@ def test_wikidataiter_shift_contract():
 def test_wikidataiter_window_bounds():
     """Sampled windows must stay inside the token array (no OOB reads)."""
     from train.data import WikiDataIter
-    tokens = np.arange(50, dtype=np.uint16)
     with tempfile.TemporaryDirectory() as tmp:
-        dat = os.path.join(tmp, "tokens.dat")
-        shp = os.path.join(tmp, "tokens_shape.json")
-        tokens.tofile(dat)
-        with open(shp, "w") as f:
-            json.dump({'n_tokens': 50}, f)
-        it = WikiDataIter(dat, shp, B=5, N=10)
+        dat, shp, spn = _mini_corpus(tmp, 50)
+        it = WikiDataIter(dat, shp, spn, B=5, N=10)
         for _ in range(20):
             inputs, targets = next(it)
             assert inputs.max() < 50 and targets.max() < 50

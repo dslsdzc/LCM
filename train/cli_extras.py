@@ -28,6 +28,7 @@ def cmd_train(args):
     if stage == "cog":
         from train.cog_train import train_cog
         from train.config import LCMConfig
+        from train.dataset_meta import spans_path_for
         shape = args.shape or (args.data.replace(".dat", "_shape.json")
                                if args.data else None)
         out_dir = args.save_dir or "checkpoints/cog"
@@ -43,9 +44,11 @@ def cmd_train(args):
             save_every=args.cog_save,
             data_path=args.data,
             shape_path=shape,
-            lang_ckpt=args.from_lm_ckpt,
+            spans_path=spans_path_for(args.data, getattr(args, "spans", None)),
+            qwen_ckpt=getattr(args, "qwen_ckpt", None),
             resume=args.resume,
             joint=joint,
+            full_verify=True,
         )
         return
     try:

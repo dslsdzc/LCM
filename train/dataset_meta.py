@@ -42,6 +42,18 @@ def dataset_paths(mmap_dir, name="zhwiki_qwen"):
     )
 
 
+def spans_path_for(data_path, override=None):
+    """<name>.dat -> <name>_docs.npy, the convention build_corpus writes.
+
+    CLI callers derive the spans path from the data path rather than demanding a
+    second flag, but an explicit override always wins.
+    """
+    if override:
+        return override
+    base, _ = os.path.splitext(data_path)
+    return base + "_docs.npy"
+
+
 def save_dataset_meta(path, meta):
     """Write metadata atomically. Only META_KEYS are persisted."""
     missing = [k for k in META_KEYS if k not in meta]
