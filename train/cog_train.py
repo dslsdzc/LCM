@@ -178,6 +178,49 @@ def verify_qwen_extent(params, meta):
             f"model_vocab_size={meta['model_vocab_size']}")
 
 
+# The fields that make a resume identity-preserving. The rest of the metadata
+# (n_tokens, n_docs) is implied by these.
+RESUME_IDENTITY_KEYS = (
+    "tokenizer_sha256",
+    "token_data_sha256",
+    "document_spans_sha256",
+    "model_vocab_size",
+)
+
+
+def verify_resume_identity(resume_dir, run_identity):
+    """A resume must continue the dataset the checkpoint was fitted to.
+
+    Dataset identity only. Optimizer state, RNG and scheduler position are not
+    saved in the checkpoint, so this makes a resume identity-preserving, not
+    state-exact.
+
+    Resuming onto a different corpus is not a warm start with extra steps: the
+    parameters were never fitted to that token space. Warm-starting from
+    mismatched data is a separate, explicit operation and is not supported here.
+    """
+    path = os.path.join(resume_dir, "run_identity.json")
+    if not os.path.exists(path):
+        raise ValueError(
+            f"{resume_dir} has no run identity; legacy cognitive checkpoints "
+            f"cannot be resumed after tokenizer unification")
+
+    with open(path) as f:
+        stored = json.load(f)
+    current = run_identity.dataset_meta
+
+    missing = [k for k in RESUME_IDENTITY_KEYS if k not in stored]
+    if missing:
+        raise ValueError(f"{path} is missing identity keys: {missing}")
+
+    for key in RESUME_IDENTITY_KEYS:
+        if stored[key] != current[key]:
+            raise ValueError(
+                f"resume identity mismatch on {key}: checkpoint has "
+                f"{stored[key]!r}, this run has {current[key]!r}; a resume must "
+                f"continue the same dataset")
+
+
 # ─── Load Stage 2 memory checkpoint ─────────────────────────────────────────
 
 def load_stage2_params(resume, cfg, rng):
@@ -654,10 +697,13 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     #    need a Qwen artifact: metadata is authoritative.
     cfg = dataclasses.replace(cfg, vocab_size=int(meta["model_vocab_size"]))
 
-    # 3. Identity for this run. The resume check (added with
-    #    verify_resume_identity) goes immediately after this line and before
-    #    step 4, so a mismatched resume fails before anything is loaded.
+    # 3. Identity for this run.
     run_identity = RunIdentity(spec, meta)
+
+    # 3b. A resume must continue the same dataset. Checked before allocation so
+    #     a mismatched resume fails before anything is loaded.
+    if resume:
+        verify_resume_identity(resume, run_identity)
 
     # 4. Only now is model allocation allowed.
     rng = jax.random.PRNGKey(42)
