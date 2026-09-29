@@ -46,6 +46,13 @@ def _small_cfg():
         M_sparse=16, M_lr=16, M_man=16, M_bind=16, M_contrast=16,
         n_bind_layers=1, n_contrast_layers=1, n_self_codes=8,
         max_inference_steps=8, ranks=(2, 4),
+        # r_max must equal max(ranks): binding_forward projects the shared
+        # low-rank base V (last dim max(ranks)) through params['A_k'], shaped
+        # (r_max, ...). This config had r_max defaulting to 8 against
+        # ranks=(2, 4), which was unreachable while the cognitive loop ran the
+        # generic codebook path and became a dot_general shape error the moment
+        # it started calling the real binding_forward.
+        r_max=4,
         use_qwen=True,
     )
 

@@ -143,26 +143,49 @@ def dag_fuse(z, codebooks, thresholds, tau=0.1, eps=1e-6):
 
 # ─── Macro loop (compact via lax.scan) ──────────────────────────────────────
 
-def cog_loop_scan(z, codebooks, max_steps=5, thresholds=None, tau=0.1):
-    """Cognitive macro loop via lax.scan — compiles to compact XLA loop.
+def cog_loop_scan(z, params, cfg, max_steps=None, rng=None):
+    """Cognitive macro loop: the canonical six-lattice step, repeated.
 
-    Same math as cog_loop_all_steps but uses lax.scan instead of Python
-    unrolling. The body (one macro step) is compiled once; the loop runs
-    inside XLA. Result is identical, graph is ~1/max_steps the size.
+    The step itself lives in train/cognitive_step.py and is shared with
+    train/model.py::forward. This function only supplies the repetition and the
+    loop's own bookkeeping (stepwise delta, and the fusion entropy that the
+    convergence bonus reads).
+
+    It used to run dag_fuse — a generic nearest-neighbour over flattened
+    codebooks, fused by reciprocal distance. That is not what model.py
+    computes, so the loop was optimising a different model from the one the
+    architecture describes. dag_fuse and soft_retrieve remain as primitives
+    (the C-engine parity tests exercise them) but are no longer the cognitive
+    loop.
+
+    Args:
+        z: (B, d) initial cognitive state.
+        params: carries 'route', 'fusion' and the six lattice param dicts.
+        cfg: LCMConfig.
+        max_steps: loop length; defaults to cfg.max_inference_steps.
+        rng: PRNG key, split into one subkey per step so the routing gate's
+            Gumbel noise is reproducible rather than re-seeded identically.
 
     Returns:
-        z_qs: (max_steps, d) — conscious state after each macro step.
-        diffs: (max_steps,) — stepwise delta ‖z_{t+1} - z_t‖.
-        entropies: (max_steps,) — stepwise fusion entropy.
+        z_qs: (max_steps, B, d) — conscious state after each macro step.
+        diffs: (max_steps, B) — stepwise delta ‖z_{t+1} - z_t‖.
+        entropies: (max_steps, B) — stepwise fusion entropy, in nats.
     """
     from jax import lax
 
-    if thresholds is None:
-        thresholds = [0.5] * len(codebooks)
+    from train.cognitive_step import six_lattice_step
 
-    def macro_step(z_cur, _):
-        z_next, diff, entropy = dag_fuse(z_cur, codebooks, thresholds, tau=tau)
-        return z_next, (z_next, diff, entropy)
+    if max_steps is None:
+        max_steps = cfg.max_inference_steps
+    if rng is None:
+        rng = jax.random.PRNGKey(0)
+    keys = jax.random.split(rng, max_steps)
 
-    _, (z_qs, diffs, entropies) = lax.scan(macro_step, z, None, length=max_steps)
+    def macro_step(z_cur, key):
+        z_next, aux = six_lattice_step(
+            z_cur, params, cfg, training=True, rng=key)
+        diff = jnp.sqrt(jnp.sum((z_next - z_cur) ** 2, axis=-1))
+        return z_next, (z_next, diff, aux['entropy'])
+
+    _, (z_qs, diffs, entropies) = lax.scan(macro_step, z, keys)
     return z_qs, diffs, entropies

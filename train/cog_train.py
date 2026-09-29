@@ -31,10 +31,13 @@ from train.tokenizer_spec import (
     TOKENIZER_REGISTRY, resolve_tokenizer_spec, sha256_file, tokenizer_path_for,
 )
 from train.encoder import init_encoder_params, encoder_forward
+from train.hyp import safe_unit
 from train.lattices import (
     init_hrq_params, init_sparse_params, init_lowrank_params,
     init_manifold_params, init_binding_params, init_contrast_params,
+    init_route_params, init_value_scalars,
 )
+from train.fusion import init_fusion_params
 from train.self_lattice import (
     init_self_params, init_self_state, self_lattice_forward,
     self_lattice_reg_loss,
@@ -333,6 +336,17 @@ def init_cog_params(cfg, rng, qwen_ckpt=None, resume=None):
         params['self'] = init_self_params(keys[10], d, cfg.n_self_codes)
         self_state = init_self_state(cfg.n_self_codes, d)
 
+        # Routing + fusion + per-lattice value scalars. The cognitive loop runs
+        # the canonical six-lattice step, which needs all three; without them
+        # there is no routing mask to fuse by and no per-lattice scaling.
+        params['route'] = init_route_params(keys[8], cfg.n_lattices, d)
+        params['fusion'] = init_fusion_params(keys[9], cfg.n_lattices, d)
+        params['value_scalars'] = init_value_scalars(keys[11], [
+            ('hrq', cfg.M_top), ('sparse', cfg.M_sparse),
+            ('lowrank', cfg.M_lr), ('manifold', cfg.M_man),
+            ('binding', cfg.M_bind), ('contrast', cfg.M_contrast),
+        ])
+
     # Load the frozen Qwen bridge for the active channel. Language LCM is
     # retired: it is not an alternative backend, and a path that is not a .npz
     # fails rather than silently reviving it.
@@ -488,27 +502,25 @@ def make_train_step(cfg, optimizer, joint=False):
             z = encoder_forward(p['encoder'], ctx, cfg.n_heads)  # (B, d)
             codebooks = pack_codebooks_for_c(p)
 
-            # ── Normalise encoder output to codebook scale ────────────────
-            cb_mean_norm = jnp.sqrt(sum(
-                jnp.mean(jnp.sum(cb ** 2, axis=-1)) for cb in codebooks
-            ) / len(codebooks))
-            z_scale = jnp.sqrt(jnp.mean(jnp.sum(z ** 2, axis=-1)))
-            z = z * (cb_mean_norm / (z_scale + 1e-8))
+            # ── Normalise encoder output to the unit sphere ───────────────
+            # The canonical path (model.forward) does exactly this, and the six
+            # lattice forwards were written against unit-scale inputs. The old
+            # codebook-scale normalisation existed to put z at the distance
+            # scale dag_fuse's reciprocal weighting assumed; with the generic
+            # path gone it has no basis.
+            z = safe_unit(z)
 
-            # ── Adaptive tau ──────────────────────────────────────────────
-            sample_cb = codebooks[0]
-            z_sq = jnp.mean(jnp.sum(z ** 2, axis=-1))
-            cb_sq = jnp.mean(jnp.sum(sample_cb ** 2, axis=-1))
-            median_dist2_est = z_sq + cb_sq
-            tau_adaptive = jnp.clip(median_dist2_est / 20.0, 0.1, 10.0)
-
-            # ── Cognitive loop (vmap over batch) ──────────────────────────
-            _cog = lambda zi: cog_loop_scan(
-                zi, codebooks,
-                max_steps=cfg.max_inference_steps,
-                thresholds=None, tau=tau_adaptive)
-            z_qs, diffs, entropies = jax.vmap(_cog, in_axes=0)(z)
-            # z_qs: (B, max_steps, d)
+            # ── Cognitive loop: the canonical six-lattice step, repeated ──
+            # Batched (B, d), not vmapped over single vectors: the step calls
+            # routing_gate, which indexes z[:, None, :]. The scan yields
+            # (max_steps, B, ...), transposed back to the (B, max_steps, ...)
+            # every consumer below expects.
+            z_qs, diffs, entropies = cog_loop_scan(
+                z, p, cfg, max_steps=cfg.max_inference_steps,
+                rng=jax.random.fold_in(rng, 7))
+            z_qs = jnp.transpose(z_qs, (1, 0, 2))     # (B, max_steps, d)
+            diffs = jnp.transpose(diffs, (1, 0))      # (B, max_steps)
+            entropies = jnp.transpose(entropies, (1, 0))
 
             # ── Self lattice ────────────────────────────────────────────
             z_final_mean = z_qs[:, -1, :].mean(axis=0)
