@@ -18,7 +18,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from train.cog_loop import soft_retrieve, dag_fuse, cog_loop_scan
+from train.cog_loop import soft_retrieve, dag_fuse
 from train.encoder import init_encoder_params, encoder_forward as jax_encoder_forward
 from lcm import encoder_forward as numpy_encoder_forward
 
@@ -49,14 +49,24 @@ def test_dag_fuse_weights_normalize():
     assert float(entropy) > 0  # two active lattices → positive entropy
 
 
-def test_cog_loop_scan_converges():
-    """Fixed codebooks + fixed z → the scan must converge (diff → 0)."""
-    z0 = jnp.array([0.2, 0.2], dtype=jnp.float32)
+def test_dag_fuse_reaches_a_fixed_point():
+    """Fixed codebooks + fixed z → repeated dag_fuse must converge (diff → 0).
+
+    This used to be asserted through cog_loop_scan. The cognitive loop now runs
+    the canonical six-lattice step (train/cognitive_step.py) and takes lattice
+    params rather than codebooks, so the property is asserted against dag_fuse
+    directly — which is what it was always about: soft_retrieve snaps to a
+    codebook entry and a snap is stable.
+    """
+    z = jnp.array([0.2, 0.2], dtype=jnp.float32)
     cb = jnp.array([[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]], dtype=jnp.float32)
-    z_qs, diffs, _ = cog_loop_scan(z0, [cb, cb], max_steps=30, tau=0.1)
-    assert float(diffs[-1]) < 1e-3, \
-        f"loop did not converge: last diff={float(diffs[-1]):.4f}"
-    assert np.allclose(np.asarray(z_qs[-1]), np.asarray(z_qs[-2]), atol=1e-3)
+    diffs = []
+    for _ in range(30):
+        z, diff, _ = dag_fuse(z, [cb, cb], [0.5, 0.5], tau=0.1)
+        diffs.append(float(diff))
+    assert diffs[-1] < 1e-3, \
+        f"dag_fuse did not converge: last diff={diffs[-1]:.4f}"
+    assert abs(diffs[-1] - diffs[-2]) < 1e-4
 
 
 # ── 2. Data contract ────────────────────────────────────────────────────────
@@ -147,7 +157,7 @@ def test_encoder_full_forward_jax_vs_numpy():
 if __name__ == '__main__':
     test_soft_retrieve_forward_is_hard()
     test_dag_fuse_weights_normalize()
-    test_cog_loop_scan_converges()
+    test_dag_fuse_reaches_a_fixed_point()
     test_wikidataiter_shift_contract()
     test_wikidataiter_window_bounds()
     test_encoder_full_forward_jax_vs_numpy()
