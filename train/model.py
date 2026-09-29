@@ -22,7 +22,8 @@ from train.lattices import (
     init_value_scalars, init_danger_params,
 )
 from train.gvalue import GValueCodebook, make_global_value_vectors
-from train.fusion import init_fusion_params, init_gen_head_params, fuse_lattices, gen_head_forward
+from train.cognitive_step import six_lattice_step
+from train.fusion import init_fusion_params, init_gen_head_params, gen_head_forward
 from train.self_lattice import (
     init_self_params, init_self_state, self_lattice_forward,
     reset_session_state, SelfState,
@@ -126,53 +127,26 @@ def forward(params, gvalue, x, cfg: LCMConfig, training=True, rng=None,
         route_params, z, cfg.tau_route,
         hard=not training, rng=rng)
 
-    # Local value scalars per lattice
-    vs = params.get('value_scalars', {})
-    alpha_val = cfg.alpha_val
-
-    # Lattice outputs (with local value bias where available)
-    o_hrq, hrq_idx, hrq_top_sim = hrq_forward(
-        params['hrq'], z, cfg.tau_route_fallback,
-        value_scalars=vs.get('hrq'), alpha_val=alpha_val)
-    # LFQ dynamic threshold: Poincaré dis-similarity to nearest HRQ top prototype
-    d_top = None if training else (1.0 - jnp.mean(hrq_top_sim))
-    o_sparse, sparse_idx = sparse_forward(
-        params['sparse'], z, training=training,
-        lambda_sparse=cfg.lambda_sparse, d_top=d_top,
-        value_scalars=vs.get('sparse'), alpha_val=alpha_val)
-    o_lowrank = lowrank_forward(
-        params['lowrank'], z, cfg.ranks,
-        value_scalars=vs.get('lowrank'), alpha_val=alpha_val)
-    o_manifold, man_idx = manifold_forward(
-        params['manifold'], z,
-        value_scalars=vs.get('manifold'), alpha_val=alpha_val)
-
-    V = params['lowrank']['A_V'] @ params['lowrank']['W_V']
-    o_binding, binding_residuals = binding_forward(
-        params['binding'], z, V,
-        value_scalars=vs.get('binding'), alpha_val=alpha_val)
-    o_contrast = contrast_forward(
-        params['contrast'], z,
-        value_scalars=vs.get('contrast'), alpha_val=alpha_val)
-
-    lattice_outputs = [o_hrq, o_sparse, o_lowrank, o_manifold, o_binding, o_contrast]
-
-    # Self lattice (internal state machine)
-    # Output is INDEPENDENT of z — self exists regardless of external input.
-    # z is only used to compute world-self divergence (diagnostic).
+    # Self lattice (internal state machine). Runs first so its output can be
+    # fused as the 7th element. Its output is INDEPENDENT of z — self exists
+    # regardless of external input; z only enters the world-self divergence
+    # (diagnostic).
     self_state_out = None
     world_dev = jnp.array(0.0)
+    self_output = None
     if self_state is not None and 'self' in params:
-        o_self, self_state_out, world_dev = self_lattice_forward(
+        self_output, self_state_out, world_dev = self_lattice_forward(
             params['self'], self_state, z=z, rng=rng, training=training)
-        lattice_outputs.append(o_self)
 
-    # Fusion with global value signals + self bias
-    self_bias_weight = cfg.alpha_self if self_state is not None else None
-    z_q = fuse_lattices(
-        lattice_outputs, soft_mask, params['fusion'],
-        gvalue=gvalue, beta_val=cfg.beta_val, tau_val=cfg.tau_val_signal,
-        self_bias_weight=self_bias_weight)
+    # Routing + the six lattice forwards + fusion, from the single canonical
+    # implementation in train/cognitive_step.py — the same one the cognitive
+    # loop runs. Everything outside this call belongs to this function: the
+    # encoder above, self above, the generation head below.
+    z_q, lat = six_lattice_step(
+        z, params, cfg, training=training, rng=rng, gvalue=gvalue,
+        self_output=self_output,
+        self_bias_weight=cfg.alpha_self if self_output is not None else None)
+    lattice_outputs = lat['lattice_outputs']
 
     # Safety check on fused output (log only, no interrupt during training)
     if gvalue is not None:
@@ -186,18 +160,18 @@ def forward(params, gvalue, x, cfg: LCMConfig, training=True, rng=None,
     logits = gen_head_forward(params['gen_head'], z_q, x, training=training)
 
     aux = {
-        'z_route': z_route,
-        'route_idx': route_idx,
-        'soft_mask': soft_mask,
+        'z_route': lat['z_route'],
+        'route_idx': lat['route_idx'],
+        'soft_mask': lat['soft_mask'],
         'lattice_outputs': lattice_outputs,
-        'man_idx': man_idx,
-        'hrq_idx': hrq_idx,
-        'hrq_top_sim': hrq_top_sim,
-        'sparse_idx': sparse_idx,
+        'man_idx': lat['man_idx'],
+        'hrq_idx': lat['hrq_idx'],
+        'hrq_top_sim': lat['hrq_top_sim'],
+        'sparse_idx': lat['sparse_idx'],
         # Per-layer query vectors of the binding residual chains — the space
         # each binding codebook actually quantises, and therefore the space its
         # EMA must accumulate.
-        'binding_residuals': binding_residuals,
+        'binding_residuals': lat['binding_residuals'],
         'value_signals': None if gvalue is None else
             gvalue.compute_value_signal_batch(lattice_outputs, cfg.tau_val_signal),
         'safety_margin': min_margin,

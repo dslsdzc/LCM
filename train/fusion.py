@@ -43,9 +43,14 @@ def compute_value_signal(gvalue, lattice_outputs, tau=0.1):
     return gvalue.compute_value_signal_batch(lattice_outputs, tau)
 
 
-def fuse_lattices(lattice_outputs, soft_mask, params, gvalue=None, beta_val=0.5,
-                  tau_val=0.1, self_bias_weight=None):
-    """Fuse all lattice outputs into a single representation.
+def fuse_lattices_with_aux(lattice_outputs, soft_mask, params, gvalue=None,
+                           beta_val=0.5, tau_val=0.1, self_bias_weight=None):
+    """Fuse all lattice outputs, returning the fusion weights alongside z_q.
+
+    This is the canonical implementation. `fuse_lattices` is a thin wrapper for
+    callers that only want z_q; anything needing the weights (or their entropy,
+    as the cognitive loop's convergence criterion does) must come through here
+    rather than recomputing them.
 
     Fusion incorporates global value signals:
       w_i = soft_mask_i · α_i · exp(β_val · value_signal_i)
@@ -64,6 +69,8 @@ def fuse_lattices(lattice_outputs, soft_mask, params, gvalue=None, beta_val=0.5,
 
     Returns:
         z_q: (B, d) fused representation.
+        weights_norm: (B, n_routed) normalised fusion weights.
+        entropy: (B,) Shannon entropy of weights_norm, in nats.
     """
     n_lattices = len(lattice_outputs)
 
@@ -96,6 +103,20 @@ def fuse_lattices(lattice_outputs, soft_mask, params, gvalue=None, beta_val=0.5,
         z_q = z_q + self_bias_weight * self_output
 
     z_q = layer_norm(z_q, params['ln_scale'], params['ln_bias'])
+    entropy = -jnp.sum(weights_norm * jnp.log(weights_norm + 1e-8), axis=-1)
+    return z_q, weights_norm, entropy
+
+
+def fuse_lattices(lattice_outputs, soft_mask, params, gvalue=None, beta_val=0.5,
+                  tau_val=0.1, self_bias_weight=None):
+    """Fuse all lattice outputs into a single representation.
+
+    Thin wrapper over `fuse_lattices_with_aux` for callers that need only z_q.
+    Kept so existing call sites and checkpoints are unaffected.
+    """
+    z_q, _, _ = fuse_lattices_with_aux(
+        lattice_outputs, soft_mask, params, gvalue=gvalue, beta_val=beta_val,
+        tau_val=tau_val, self_bias_weight=self_bias_weight)
     return z_q
 
 
