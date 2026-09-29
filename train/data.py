@@ -18,11 +18,15 @@ Usage:
         ...
 """
 
+import hashlib
 import os
 import sys
 import json
 import numpy as np
 from tqdm import tqdm
+
+from train.dataset_meta import save_dataset_meta
+from train.tokenizer_spec import sha256_file
 
 # Paths (relative to project root)
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -148,6 +152,108 @@ def tokenize_and_mmap(text_path: str = TEXT_PATH,
     print(f"Token array saved: {mmap_path} ({total_tokens:,} tokens, "
           f"{os.path.getsize(mmap_path) / 1e9:.2f} GB)")
     return total_tokens
+
+
+# ── Qwen-path corpus builder ───────────────────────────────────────────────
+#
+# Supersedes tokenize_and_mmap for the cognitive-training corpus. Two
+# differences that matter:
+#
+#   * One pass, not two. The old builder tokenized the whole corpus once to
+#     count, then again to write. On zhwiki that is the entire cost of the build
+#     paid twice.
+#   * Framing is `article + one separator`, with no synthetic BOS, and the
+#     builder refuses to emit a partial trailing article. Both are what let
+#     "every span ends on the separator" and "spans form a strict partition"
+#     hold exactly rather than approximately.
+
+def build_corpus(text_path, spec, data_path, shape_path, spans_path,
+                 max_tokens=0):
+    """One-pass corpus build: tokenize, write, record spans, hash as we go.
+
+    Framing is owned entirely by this pipeline: each article is encoded with
+    add_special_tokens=False and exactly one document_separator_id is appended.
+    Nothing else is inserted, so the separator count equals the document count.
+
+    Writes to temporary paths and renames only when complete; metadata is
+    written last so an interrupted build cannot leave new data with old
+    metadata.
+    """
+    from tokenizers import Tokenizer
+    from tqdm import tqdm
+
+    tok = Tokenizer.from_file(spec.path)
+    sep = spec.document_separator_id
+    dtype = np.dtype(spec.dtype)
+
+    spans = np.empty((1 << 16, 2), dtype=np.int64)
+    n_docs = 0
+    pos = 0
+    digest = hashlib.sha256()
+
+    data_tmp = data_path + ".tmp"
+    with open(data_tmp, "wb") as fout, open(text_path, encoding="utf-8") as fin:
+        for line in tqdm(fin, desc="Tokenizing"):
+            text = line.strip()
+            if not text:
+                continue
+
+            ids = tok.encode(text, add_special_tokens=False).ids
+            if sep in ids:
+                raise ValueError(
+                    f"separator {sep} occurred inside a document payload; the "
+                    f"separator must be a unique boundary marker")
+
+            ids.append(sep)
+            seg = np.asarray(ids, dtype=dtype)
+            if max_tokens > 0 and pos + len(seg) > max_tokens:
+                # Never emit a partial trailing article: that would break both
+                # the strict-partition invariant and "every span ends on the
+                # separator".
+                break
+
+            raw = seg.tobytes()
+            fout.write(raw)
+            digest.update(raw)
+
+            if n_docs == len(spans):
+                spans = np.vstack([spans, np.empty_like(spans)])
+            spans[n_docs] = (pos, pos + len(seg))
+            n_docs += 1
+            pos += len(seg)
+
+        fout.flush()
+        os.fsync(fout.fileno())
+
+    if n_docs == 0:
+        raise ValueError("no articles were tokenized")
+
+    spans = np.ascontiguousarray(spans[:n_docs])
+
+    # np.save appends .npy, so the temp name must already end in .npy.
+    spans_tmp = spans_path[: -len(".npy")] + ".tmp.npy"
+    with open(spans_tmp, "wb") as f:
+        np.save(f, spans)
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.replace(data_tmp, data_path)
+    os.replace(spans_tmp, spans_path)
+
+    meta = {
+        "n_tokens": int(pos),
+        "dtype": spec.dtype,
+        "tokenizer_id": spec.tokenizer_id,
+        "tokenizer_sha256": spec.sha256,
+        "separator_id": int(sep),
+        "token_id_max": int(spec.max_token_id),
+        "model_vocab_size": int(spec.model_vocab_size),
+        "n_docs": int(n_docs),
+        "document_spans_sha256": sha256_file(spans_path),
+        "token_data_sha256": digest.hexdigest(),
+    }
+    save_dataset_meta(shape_path, meta)   # metadata LAST
+    return meta
 
 
 # ── Step 4: Data iterator ──────────────────────────────────────────────────
