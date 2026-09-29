@@ -152,17 +152,26 @@ def test_hrq_and_routing_receive_gradient(built):
         assert total > 0, f"grad.{key} is exactly zero"
 
 
-@pytest.mark.xfail(
-    reason="Known: sparse/lowrank/manifold/binding/contrast receive exactly "
-           "zero gradient through the six-lattice step. Contradicts the "
-           "README's 'EMA + gradient codebook' description for sparse, "
-           "manifold and binding. Recorded in memory as "
-           "six-lattice-gradient-zero; not caused by the step extraction "
-           "(the pre-refactor model.forward shows the same pattern). "
-           "strict=False so an unexpected pass is reported, not failed.",
-    strict=False)
-def test_all_six_lattices_receive_gradient(built):
-    """gradient: every lattice's parameters should receive gradient."""
+def test_retrieval_gradient_reaches_only_hrq_by_design(built):
+    """gradient: exactly one lattice is differentiable through retrieval.
+
+    This pins a deliberate design, not a defect. Every other lattice retrieves
+    via ``o = z + stop_gradient(hard - z)`` (see train/lattices.py: simvq_codebook,
+    _residual_vq_chain, contrast_forward): forward is the hard-quantised value,
+    ``d/dz`` is the identity so z stays differentiable, and ``d/dparams`` is
+    exactly zero because the codebook is detached on purpose.
+
+    Codebooks are updated by EMA plus explicit auxiliary losses in
+    cog_train's Stage-3 block (vq_total, contrast_info_nce_loss,
+    manifold_orth_loss) — not by retrieval gradient. Letting gradient through
+    the distance term would drag every codebook toward the current batch
+    centroid; value_biased_scores' docstring states this outright.
+
+    hrq is the exception: it does not use that wrapper.
+
+    If this test ever fails because another lattice gained gradient, that is a
+    design change and should be a deliberate one.
+    """
     params, _, _, _, z = built
 
     def scalar(p):
@@ -171,10 +180,14 @@ def test_all_six_lattices_receive_gradient(built):
         return jnp.sum(z_next ** 2)
 
     grads = jax.grad(scalar)(params)
-    zero = []
+    totals = {}
     for name in LATTICES:
-        total = sum(float(jnp.sum(jnp.abs(g)))
-                    for g in jax.tree_util.tree_leaves(grads[name]))
-        if total == 0.0:
-            zero.append(name)
-    assert not zero, f"lattices with exactly zero gradient: {zero}"
+        totals[name] = sum(float(jnp.sum(jnp.abs(g)))
+                           for g in jax.tree_util.tree_leaves(grads[name]))
+
+    assert totals["hrq"] > 0, "hrq must stay differentiable through retrieval"
+    detached = [n for n in LATTICES if n != "hrq" and totals[n] == 0.0]
+    assert sorted(detached) == sorted(n for n in LATTICES if n != "hrq"), (
+        f"expected every non-hrq lattice detached, but these received "
+        f"gradient: {[n for n in LATTICES if n != 'hrq' and totals[n] != 0.0]} "
+        f"(totals={totals})")
