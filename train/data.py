@@ -25,7 +25,10 @@ import json
 import numpy as np
 from tqdm import tqdm
 
-from train.dataset_meta import save_dataset_meta
+from train.dataset_meta import (
+    check_data_size, load_dataset_meta, save_dataset_meta, token_dtype,
+    validate_spans,
+)
 from train.tokenizer_spec import sha256_file
 
 # Paths (relative to project root)
@@ -336,49 +339,80 @@ class TextLineIter:
         return inputs, targets
 
 class WikiDataIter:
-    """Fast random-access data iterator over memory-mapped tokens.
+    """Random-access iterator over memory-mapped tokens, bounded to documents.
 
-    Yields (inputs, targets) tuples of shape (B, N).
-    targets = inputs shifted left by 1 (autoregressive LM).
+    Yields (inputs, targets) of shape (B, N); targets are inputs shifted by one.
+    Windows never cross a document boundary.
 
-    Uses a random read head per sample for maximum efficiency —
-    no sequential scan, no shuffling needed.
+    This is not a style preference. z_q = f(context) is a global summary and
+    active_z_margin forces the generation segment to depend on it, so pairing
+    article A's context with article B's generation is unsatisfiable and pushes
+    noise into the cognitive state. Ordinary causal-LM packing tolerates
+    straddling windows because each token's loss depends only on its own prefix;
+    this architecture does not.
     """
 
-    def __init__(self, mmap_path: str = MMAP_PATH,
+    def __init__(self, data_path: str = MMAP_PATH,
                  shape_path: str = MMAP_SHAPE_PATH,
-                 B: int = 16, N: int = 512):
-        with open(shape_path) as f:
-            meta = json.load(f)
-        self.n_tokens = meta['n_tokens']
+                 spans_path: str = None, B: int = 16, N: int = 512):
+        meta = load_dataset_meta(shape_path)
+        check_data_size(meta, data_path)
+
+        self.meta = meta
+        self.n_tokens = int(meta["n_tokens"])
         self.B = B
         self.N = N
-        # Memory-map the token array (read-only)
-        self.tokens = np.memmap(mmap_path, dtype=np.uint16, mode='r',
+
+        self.tokens = np.memmap(data_path, dtype=token_dtype(meta), mode="r",
                                 shape=(self.n_tokens,))
+
+        spans = validate_spans(spans_path, meta)
+        lengths = (spans[:, 1] - spans[:, 0]).astype(np.int64)
+        keep = lengths >= (N + 1)          # N inputs + 1 shifted target
+        if not keep.any():
+            raise ValueError(
+                f"no document is long enough for N={N}; the longest is "
+                f"{int(lengths.max())} tokens and N+1={N + 1} is required")
+        self.spans = np.ascontiguousarray(spans[keep])
+
+        # Weight by usable windows, not by document count, so every valid
+        # window is equally likely.
+        self.weights = lengths[keep] - N
+        probs = self.weights.astype(np.float64)
+        self.cdf = np.cumsum(probs / probs.sum())
+        self.cdf[-1] = 1.0                # guard against fp drift
 
     def __iter__(self):
         return self
 
+    def _sample_starts(self):
+        """One start offset per sample, each inside a single document."""
+        docs = np.searchsorted(self.cdf, np.random.rand(self.B))
+        starts = np.empty(self.B, dtype=np.int64)
+        for i, d in enumerate(docs):
+            lo = int(self.spans[d, 0])
+            hi = int(self.spans[d, 1])
+            # valid starts are [lo, hi-N-1]; randint's upper bound is exclusive
+            starts[i] = np.random.randint(lo, hi - self.N)
+        return starts
+
     def __next__(self):
-        """Return next batch: (inputs, targets) each (B, N)."""
-        # Random offsets: ensure each segment fits within the array
-        max_start = self.n_tokens - self.N - 1
-        starts = np.random.randint(0, max_start, size=self.B)
-
-        batch = np.stack([self.tokens[s:s + self.N] for s in starts])
-        inputs = batch.astype(np.int32)
-        targets = np.stack([
-            self.tokens[s + 1:s + self.N + 1] for s in starts
-        ]).astype(np.int32)
-
-        return inputs, targets
+        starts = self._sample_starts()
+        inputs = np.stack([self.tokens[s:s + self.N] for s in starts])
+        targets = np.stack([self.tokens[s + 1:s + self.N + 1] for s in starts])
+        return inputs.astype(np.int32), targets.astype(np.int32)
 
     def get_num_batches(self, tokens_per_step: int = None):
-        """Return approximate number of batches in one epoch."""
+        """Approximate batches per epoch over usable windows.
+
+        weights.sum() counts usable WINDOWS, so it must be scaled by N before
+        being divided by a per-step TOKEN budget. Dividing windows by tokens
+        directly undercounts by roughly a factor of N.
+        """
         if tokens_per_step is None:
             tokens_per_step = self.B * self.N
-        return self.n_tokens // tokens_per_step
+        usable_tokens = int(self.weights.sum()) * self.N
+        return usable_tokens // tokens_per_step
 
 
 # ── Convenience: build everything ──────────────────────────────────────────
