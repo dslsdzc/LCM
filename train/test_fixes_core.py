@@ -21,7 +21,7 @@ import sys
 import tempfile
 import zlib
 
-os.environ.setdefault("JAX_PLATFORM", "cpu")
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -62,11 +62,17 @@ def _shared_train_step():
 
 
 def _fake_qwen():
-    """4-layer fake Qwen2.5-0.5B (d=896), dims mirror test_causal_mask."""
+    """4-layer fake Qwen2.5-0.5B (d=896), dims mirror test_causal_mask.
+
+    Carries the q/k/v biases real Qwen2 has. Without them this fixture does not
+    describe Qwen2, `qwen_attn` refuses it, and a test that passed anyway would
+    be testing a model the checkpoint loader can never produce.
+    """
     d = 896
     vocab = 64
+    n_kv = 2 * 64
     rng = jax.random.PRNGKey(0)
-    keys = jax.random.split(rng, 30)
+    keys = jax.random.split(rng, 48)
     p = {
         'model.embed_tokens.weight': jax.random.normal(keys[0], (vocab, d)) * 0.02,
         'model.norm.weight': jnp.ones(d),
@@ -76,8 +82,11 @@ def _fake_qwen():
         p[f'model.layers.{li}.input_layernorm.weight'] = jnp.ones(d)
         p[f'model.layers.{li}.post_attention_layernorm.weight'] = jnp.ones(d)
         p[f'model.layers.{li}.self_attn.q_proj.weight'] = jax.random.normal(keys[ki], (d, d)) * 0.02; ki += 1
-        p[f'model.layers.{li}.self_attn.k_proj.weight'] = jax.random.normal(keys[ki], (2 * 64, d)) * 0.02; ki += 1
-        p[f'model.layers.{li}.self_attn.v_proj.weight'] = jax.random.normal(keys[ki], (2 * 64, d)) * 0.02; ki += 1
+        p[f'model.layers.{li}.self_attn.q_proj.bias'] = jax.random.normal(keys[ki], (d,)) * 0.02; ki += 1
+        p[f'model.layers.{li}.self_attn.k_proj.weight'] = jax.random.normal(keys[ki], (n_kv, d)) * 0.02; ki += 1
+        p[f'model.layers.{li}.self_attn.k_proj.bias'] = jax.random.normal(keys[ki], (n_kv,)) * 0.02; ki += 1
+        p[f'model.layers.{li}.self_attn.v_proj.weight'] = jax.random.normal(keys[ki], (n_kv, d)) * 0.02; ki += 1
+        p[f'model.layers.{li}.self_attn.v_proj.bias'] = jax.random.normal(keys[ki], (n_kv,)) * 0.02; ki += 1
         p[f'model.layers.{li}.self_attn.o_proj.weight'] = jax.random.normal(keys[ki], (d, d)) * 0.02; ki += 1
         p[f'model.layers.{li}.mlp.gate_proj.weight'] = jax.random.normal(keys[ki], (2048, d)) * 0.02; ki += 1
         p[f'model.layers.{li}.mlp.up_proj.weight'] = jax.random.normal(keys[ki], (2048, d)) * 0.02; ki += 1
@@ -242,11 +251,26 @@ def test_supervisor_step_signature_and_rollback():
     # Step 3: loss 9.0 → streak 2 ≥ patience → rollback to BEST params
     p_rb, o_rb, loss_rb, aux_rb = sup.step(
         fake_train_fn, p0, o0, batch, 0.001, jax.random.PRNGKey(2), step=2)
-    assert p_rb is sup.best_params, \
+
+    # The rollback restores the BEST params. Identity no longer holds: the
+    # frozen bridge is deliberately excluded from the snapshot (it is ~2 GB and
+    # never changes) and has to be re-attached before the step can run, so the
+    # returned dict is a rebuild rather than the snapshot object itself.
+    got = {k: v for k, v in p_rb.items() if k != 'qwen'}
+    assert jax.tree_util.tree_all(jax.tree_util.tree_map(
+        lambda a, b: jnp.allclose(a, b), got, sup.best_params)), \
         "rollback must return the BEST params, not the degraded current ones"
-    assert float(loss_rb) == 1e10 and aux_rb.get('rollback') is True
-    assert sup.current_lr == cfg.learning_rate * 0.5
-    print("  #4 OK: step() forwards lr/rng/self_state; spike rollback uses best params")
+
+    # ...and it must actually RETRY at the reduced LR. The old version returned
+    # a fabricated 1e10 and never re-ran the step; the retry consumes the next
+    # loss from the iterator (27.0) instead.
+    assert aux_rb.get('rollback') is True
+    assert float(loss_rb) == 27.0, f"rollback must retry the step, got {loss_rb}"
+    assert sup.lr_scale == 0.5, f"lr_scale not decayed: {sup.lr_scale}"
+    assert calls[-1][0] == 0.0005, \
+        f"retry must run at the reduced LR, got {calls[-1][0]}"
+    print("  #4 OK: step() forwards lr/rng/self_state; spike rollback restores "
+          "best params and retries at the reduced LR")
 
 
 # ── #7: bare d×V decoder.bin (cog checkpoint) ────────────────────────────────

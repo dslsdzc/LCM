@@ -467,12 +467,16 @@ def make_train_step(cfg, optimizer, joint=False):
             conv = (diffs[:, -1] < cfg.convergence_tol) & (entropies[:, -1] < cfg.entropy_threshold)
             n_steps = jnp.argmax((diffs < cfg.convergence_tol).astype(jnp.float32), axis=-1) + 1
 
-            # Convergence bonus — reward FAST convergence (n=1 → +0.0035,
-            # n=max_steps → 0). The old sign rewarded slow loops: n=1 got 0
-            # while n=32 got -0.0035 (i.e. smaller loss for slower loops).
+            # Convergence bonus — reward FAST convergence (n=1 → -0.0035,
+            # n=max_steps → 0). loss is MINIMISED, so the term must go negative
+            # for fast loops. Written the other way up,
+            # +log(max_steps / n_steps), it reads like a bonus but is a penalty:
+            # n=1 scored +0.0035 and n=32 scored 0, so converging slowly was
+            # still the better outcome. Inverting the ratio is what makes the
+            # sign actually match the intent.
             loss = p_loss + a_loss + loss_self + jnp.mean(
                 jnp.where(conv, 0.001 * jnp.log(
-                    cfg.max_inference_steps / (n_steps.astype(jnp.float32) + 1e-8)), 0.0))
+                    (n_steps.astype(jnp.float32) + 1e-8) / cfg.max_inference_steps), 0.0))
 
             # ── Stage 3 joint losses ─────────────────────────────────────
             stage3_extra = {}
@@ -522,6 +526,11 @@ def make_train_step(cfg, optimizer, joint=False):
         updates, new_opt = optimizer.update(
             {k: v for k, v in grads.items() if k != 'qwen'},
             opt_state, trainable)
+        # The optimizer is built with learning_rate=1.0, so its own scale is
+        # already -1 (optax adds updates). Multiplying by the live `lr` here is
+        # what actually applies the schedule — and what lets the Supervisor
+        # reduce the rate mid-run. See the optimizer construction in train_cog.
+        updates = jax.tree_util.tree_map(lambda u: lr * u, updates)
         new_params = {**optax.apply_updates(trainable, updates),
                       'qwen': params['qwen']}
         return new_params, new_opt, loss, aux_out
@@ -559,9 +568,14 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
 
     schedule = optax.cosine_decay_schedule(
         init_value=lr, decay_steps=steps, alpha=0.1)
+    # learning_rate=1.0, deliberately not `schedule`. A schedule bound here is
+    # stored inside opt_state and cannot be varied per step, which made
+    # train_step's `lr` argument dead code: the Supervisor's "LR reduced" line
+    # printed a new number while training carried on down the original curve.
+    # train_step now applies the live schedule value to the updates itself.
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate=schedule, b1=cfg.adam_beta1,
+        optax.adamw(learning_rate=1.0, b1=cfg.adam_beta1,
                      b2=cfg.adam_beta2, eps=cfg.adam_eps,
                      weight_decay=cfg.weight_decay),
     )

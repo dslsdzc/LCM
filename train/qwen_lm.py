@@ -73,6 +73,23 @@ def apply_rope(x, cos, sin):
 
 # ─── Attention (GQA) ─────────────────────────────────────────────────────────
 
+def _qwen_proj(x, params, name):
+    """Linear projection carrying the bias Qwen2 has on q/k/v.
+
+    Fails loudly when the bias is absent. Defaulting to zero would silently
+    recompute a different model, which is the exact failure this bias term was
+    added to fix — a hand-built params dict that omits it is not a Qwen
+    checkpoint, whatever its weight shapes say.
+    """
+    bias = params.get(name + '.bias')
+    if bias is None:
+        raise ValueError(
+            f"Qwen attention is missing '{name}.bias'. Qwen2 carries a bias on "
+            f"q/k/v (and none on o_proj), so a params dict without it does not "
+            f"describe Qwen2.")
+    return x @ params[name].T + bias
+
+
 def qwen_attn(x, params, cos, sin, mask=None):
     """Grouped-query attention with RoPE.
 
@@ -90,10 +107,14 @@ def qwen_attn(x, params, cos, sin, mask=None):
     n_kv_heads = 2
     head_dim = d // n_heads  # 896/14 = 64
 
-    # Project Q, K, V
-    q = (x @ params['q_proj'].T).reshape(B, N, n_heads, head_dim)
-    k = (x @ params['k_proj'].T).reshape(B, N, n_kv_heads, head_dim)
-    v = (x @ params['v_proj'].T).reshape(B, N, n_kv_heads, head_dim)
+    # Project Q, K, V. Qwen2 carries a bias on q/k/v and none on o_proj
+    # (verified against the checkpoint: 290 tensors, 72 of them bias, and no
+    # o_proj.bias). Omitting these terms does not give a slightly-off Qwen, it
+    # gives a different model: every head's query/key/value is shifted by a
+    # learned constant before RoPE and the softmax.
+    q = _qwen_proj(x, params, 'q_proj').reshape(B, N, n_heads, head_dim)
+    k = _qwen_proj(x, params, 'k_proj').reshape(B, N, n_kv_heads, head_dim)
+    v = _qwen_proj(x, params, 'v_proj').reshape(B, N, n_kv_heads, head_dim)
 
     # Apply RoPE
     q = apply_rope(q, cos, sin)

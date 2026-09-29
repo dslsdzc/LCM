@@ -45,7 +45,11 @@ class Supervisor:
         self.best_opt_state = None
         self.best_step = 0
         self.bad_streak = 0
-        self.current_lr = cfg.learning_rate
+        # A multiplier, not an absolute rate. The training loop owns the
+        # schedule; the supervisor only scales it. The old `current_lr` was
+        # printed as if it were the live rate but never reached the optimizer.
+        self.lr_scale = 1.0
+        self.last_lr = float(cfg.learning_rate)
 
         # Cognitive loop stats
         self.cog_convergence = []
@@ -75,16 +79,19 @@ class Supervisor:
             return train_fn(params, opt_state, batch, lr, rng,
                             self_state=self_state)
 
+        effective_lr = lr * self.lr_scale
+        self.last_lr = float(effective_lr)
         try:
             new_params, new_opt, loss_val, aux_out = train_fn(
-                params, opt_state, batch, lr, rng, self_state=self_state)
+                params, opt_state, batch, effective_lr, rng,
+                self_state=self_state)
 
             loss_f = float(loss_val)
 
             # ── NaN / Inf detection ──
             if np.isnan(loss_f) or np.isinf(loss_f):
                 return self._handle_bad_step(
-                    params, opt_state, batch, lr, rng,
+                    train_fn, params, opt_state, batch, effective_lr, rng,
                     f"loss={loss_f}", step=step, self_state=self_state)
 
             # ── Loss spike detection ──
@@ -96,16 +103,23 @@ class Supervisor:
                     # Roll back to the BEST (healthy) params — passing the
                     # current degraded params would lock in the damage.
                     return self._rollback(
-                        self.best_params, self.best_opt_state,
-                        batch, lr, rng, step=step, self_state=self_state)
+                        train_fn, self._params_with_bridge(params),
+                        self.best_opt_state, batch, effective_lr, rng,
+                        reason=f"loss spike x{self.bad_streak}",
+                        step=step, self_state=self_state)
             else:
                 self.bad_streak = 0
 
             # ── Update best ──
             if loss_f < self.best_loss:
                 self.best_loss = loss_f
+                # Exclude the frozen bridge. params['qwen'] is ~2 GB of weights
+                # that never change and are reloaded from the npz on resume, so
+                # snapshotting them held a second full copy resident for the
+                # entire run and bought nothing.
                 self.best_params = jax.tree_util.tree_map(
-                    lambda x: jnp.array(x), new_params)
+                    lambda x: jnp.array(x),
+                    {k: v for k, v in new_params.items() if k != "qwen"})
                 self.best_opt_state = jax.tree_util.tree_map(
                     lambda x: jnp.array(x), new_opt)
                 self.best_step = step if step is not None else 0
@@ -124,25 +138,66 @@ class Supervisor:
             self._emergency_save(params, opt_state, step or 0)
             return params, opt_state, jnp.array(float("nan")), {}
 
-    def _handle_bad_step(self, params, opt_state, batch, lr, rng, reason,
-                         step=None, self_state=None):
-        """Handle NaN/inf by LR reduction + rollback."""
+    def _handle_bad_step(self, train_fn, params, opt_state, batch, lr, rng,
+                         reason, step=None, self_state=None):
+        """Handle NaN/inf by LR reduction + rollback + one retry."""
         print(f"\n[SUPERVISOR] Bad step {step}: {reason}")
         self.bad_streak += 1
 
         if self.bad_streak >= self.patience and self.best_params is not None:
-            print(f"[SUPERVISOR] Rolling back to step {self.best_step} (loss={self.best_loss:.4f})")
-            return self._rollback(self.best_params, self.best_opt_state,
-                                  batch, lr, rng, step=step,
-                                  self_state=self_state)
+            print(f"[SUPERVISOR] Rolling back to step {self.best_step} "
+                  f"(loss={self.best_loss:.4f})")
+            return self._rollback(
+                train_fn, self._params_with_bridge(params),
+                self.best_opt_state, batch, lr, rng, reason=reason,
+                step=step, self_state=self_state)
         return params, opt_state, jnp.array(float("nan")), {}
 
-    def _rollback(self, params, opt_state, batch, lr, rng,
-                  step=None, self_state=None):
-        """Rollback and reduce LR."""
-        self.current_lr *= self.lr_decay
-        print(f"[SUPERVISOR] LR reduced to {self.current_lr:.6f}")
-        return params, opt_state, jnp.array(1e10), {"rollback": True}
+    def _params_with_bridge(self, current):
+        """The best-params snapshot, plus the live frozen bridge.
+
+        params['qwen'] is excluded from the snapshot (it never changes and is
+        ~2 GB), so a rollback has to re-attach the current copy before the step
+        can run again.
+        """
+        if self.best_params is None:
+            return current
+        out = dict(self.best_params)
+        if "qwen" in current:
+            out["qwen"] = current["qwen"]
+        return out
+
+    def _rollback(self, train_fn, params, opt_state, batch, lr, rng,
+                  reason="rollback", step=None, self_state=None):
+        """Reduce LR, restore the best params, and retry the step once.
+
+        The previous version returned a fake 1e10 loss and never re-ran the
+        step, despite its docstring promising a retry. Training then continued
+        from the next batch — at the restored params, but with nothing checking
+        that the bad step was actually avoidable.
+        """
+        self.lr_scale *= self.lr_decay
+        effective = lr * self.lr_scale
+        self.last_lr = float(effective)
+        print(f"[SUPERVISOR] {reason}: LR -> {effective:.6e} "
+              f"(x{self.lr_scale:.4f})")
+
+        if params is None:
+            return params, opt_state, jnp.array(float("nan")), {"rollback": True}
+
+        try:
+            new_params, new_opt, loss_val, aux_out = train_fn(
+                params, opt_state, batch, effective, rng, self_state=self_state)
+        except Exception as e:
+            print(f"[SUPERVISOR] retry after rollback failed: {e}")
+            return params, opt_state, jnp.array(float("nan")), {"rollback": True}
+
+        loss_f = float(loss_val)
+        if np.isnan(loss_f) or np.isinf(loss_f):
+            print(f"[SUPERVISOR] retry after rollback still bad: loss={loss_f}")
+            return params, opt_state, jnp.array(float("nan")), {"rollback": True}
+
+        return new_params, new_opt, loss_val, {**aux_out, "rollback": True}
 
     def _emergency_save(self, params, opt_state, step):
         """Save checkpoint on crash for later resume."""
@@ -164,7 +219,8 @@ class Supervisor:
         conv = self.cog_convergence
         rate = sum(conv[-100:]) / max(len(conv[-100:]), 1) * 100 if conv else 0
         print(f"[SUPERVISOR] step {step:>6d} | best loss={self.best_loss:.4f} | "
-              f"LR={self.current_lr:.6f} | cog conv={rate:.0f}%")
+              f"LR={self.last_lr:.6e} (x{self.lr_scale:.3f}) | "
+              f"cog conv={rate:.0f}%")
 
     def save_best(self, params, opt_state, step, self_state=None):
         """Save the best checkpoint so far.

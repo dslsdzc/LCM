@@ -53,20 +53,27 @@ def test_lang_lcm_attention_cannot_peek_future():
 def _fake_qwen_params():
     d = 896  # Qwen2.5-0.5B d_model (d // 14 heads = 64 head_dim)
     vocab = 64
+    n_kv = 2 * 64
     rng = jax.random.PRNGKey(0)
-    keys = jax.random.split(rng, 7)
+    keys = jax.random.split(rng, 10)
     return {
         'model.embed_tokens.weight': jax.random.normal(keys[0], (vocab, d)) * 0.02,
         'model.norm.weight': jnp.ones(d),
         'model.layers.0.input_layernorm.weight': jnp.ones(d),
         'model.layers.0.post_attention_layernorm.weight': jnp.ones(d),
+        # Qwen2 carries a bias on q/k/v and none on o_proj. A params dict
+        # without them does not describe Qwen2, and qwen_attn rejects it rather
+        # than quietly computing a different model.
         'model.layers.0.self_attn.q_proj.weight': jax.random.normal(keys[1], (d, d)) * 0.02,
-        'model.layers.0.self_attn.k_proj.weight': jax.random.normal(keys[2], (2 * 64, d)) * 0.02,
-        'model.layers.0.self_attn.v_proj.weight': jax.random.normal(keys[3], (2 * 64, d)) * 0.02,
-        'model.layers.0.self_attn.o_proj.weight': jax.random.normal(keys[4], (d, d)) * 0.02,
-        'model.layers.0.mlp.gate_proj.weight': jax.random.normal(keys[5], (2048, d)) * 0.02,
-        'model.layers.0.mlp.up_proj.weight': jax.random.normal(keys[6], (2048, d)) * 0.02,
-        'model.layers.0.mlp.down_proj.weight': jax.random.normal(keys[5], (d, 2048)) * 0.02,
+        'model.layers.0.self_attn.q_proj.bias': jax.random.normal(keys[2], (d,)) * 0.02,
+        'model.layers.0.self_attn.k_proj.weight': jax.random.normal(keys[3], (n_kv, d)) * 0.02,
+        'model.layers.0.self_attn.k_proj.bias': jax.random.normal(keys[4], (n_kv,)) * 0.02,
+        'model.layers.0.self_attn.v_proj.weight': jax.random.normal(keys[5], (n_kv, d)) * 0.02,
+        'model.layers.0.self_attn.v_proj.bias': jax.random.normal(keys[6], (n_kv,)) * 0.02,
+        'model.layers.0.self_attn.o_proj.weight': jax.random.normal(keys[7], (d, d)) * 0.02,
+        'model.layers.0.mlp.gate_proj.weight': jax.random.normal(keys[8], (2048, d)) * 0.02,
+        'model.layers.0.mlp.up_proj.weight': jax.random.normal(keys[9], (2048, d)) * 0.02,
+        'model.layers.0.mlp.down_proj.weight': jax.random.normal(keys[8], (d, 2048)) * 0.02,
     }
 
 
