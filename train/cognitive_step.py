@@ -30,7 +30,7 @@ from train.lattices import (
 
 
 def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
-                     self_output=None, self_bias_weight=None):
+                     routing_bias=None, self_output=None, self_bias_weight=None):
     """One cognitive step: route, run the six lattices, fuse.
 
     Args:
@@ -66,8 +66,16 @@ def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
             "the self element by it having no routing weight, so passing one "
             "without the other silently routes the self output instead")
 
+    # routing_bias must be applied HERE, not by the caller before calling in.
+    # model.forward used to inject it into route_params and run its own
+    # routing_gate first; once the step took over the routing, that earlier
+    # result became dead computation and BehaviorExplorer's active bias had no
+    # effect on cognition at all.
+    route_params = params['route']
+    if routing_bias is not None:
+        route_params = dict(route_params, bias=routing_bias)
     soft_mask, z_route, route_idx = routing_gate(
-        params['route'], z, cfg.tau_route, hard=not training, rng=rng)
+        route_params, z, cfg.tau_route, hard=not training, rng=rng)
 
     vs = params.get('value_scalars', {})
     alpha_val = cfg.alpha_val

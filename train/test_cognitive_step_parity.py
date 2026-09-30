@@ -136,6 +136,31 @@ def test_lattice_output_matches_direct_call(built, name):
         f"{name}: step output differs from a direct forward call"
 
 
+def test_routing_bias_changes_the_step_output(built):
+    """routing_bias must reach the fusion, not be computed and discarded.
+
+    model.forward used to inject the bias into route_params and run its own
+    routing_gate before the step; once the step took over the routing, that
+    earlier result became dead computation and BehaviorExplorer's active bias
+    had no effect. The golden-fingerprint parity check that guarded the step
+    extraction passed with routing_bias=None, so it could not see this.
+    """
+    params, _, _, _, z = built
+    base, _ = six_lattice_step(z, params, CFG, training=True,
+                               rng=jax.random.PRNGKey(1))
+    # Non-uniform on purpose: the bias enters as
+    # softmax((logits + gumbel + bias) / tau), and a constant added to every
+    # logit cancels — so a uniform bias is a mathematical no-op, not a bug.
+    # Only a bias that differs across lattices can move the routing.
+    bias = jnp.zeros((CFG.n_lattices,)).at[0].set(5.0)
+    biased, _ = six_lattice_step(z, params, CFG, training=True,
+                                 rng=jax.random.PRNGKey(1), routing_bias=bias)
+    biased = jnp.where(jnp.isnan(biased), 0.0, biased)
+    base = jnp.where(jnp.isnan(base), 0.0, base)
+    assert not np.allclose(np.asarray(base), np.asarray(biased), atol=1e-6), \
+        "routing_bias did not change z_next — it is being computed and discarded"
+
+
 def test_hrq_and_routing_receive_gradient(built):
     """gradient: the two lattices that currently do receive gradient, do."""
     params, _, _, _, z = built
@@ -161,11 +186,20 @@ def test_retrieval_gradient_reaches_only_hrq_by_design(built):
     ``d/dz`` is the identity so z stays differentiable, and ``d/dparams`` is
     exactly zero because the codebook is detached on purpose.
 
-    Codebooks are updated by EMA plus explicit auxiliary losses in
+    The INTENDED compensating path is EMA plus explicit auxiliary losses in
     cog_train's Stage-3 block (vq_total, contrast_info_nce_loss,
-    manifold_orth_loss) — not by retrieval gradient. Letting gradient through
-    the distance term would drag every codebook toward the current batch
-    centroid; value_biased_scores' docstring states this outright.
+    manifold_orth_loss). Letting gradient through the distance term instead
+    would drag every codebook toward the current batch centroid;
+    value_biased_scores' docstring states this outright.
+
+    WARNING — the intended path is not currently delivered. Verified 2026-09-30:
+    cog_train.py calls no EMA (and sparse_ema_update / manifold_ema_update have
+    zero callers repo-wide), and both entry points default to joint=False
+    (lcm.py:2583 joint=(args.stage == 3), lcm.py:2668 joint=False). So in the
+    default cognitive-training configuration all five detached lattices receive
+    NO update at all — not gradient, not EMA, not an auxiliary loss. This test
+    pins the retrieval semantics, which are correct; it does NOT establish that
+    the codebooks train.
 
     hrq is the exception: it does not use that wrapper.
 

@@ -120,13 +120,6 @@ def forward(params, gvalue, x, cfg: LCMConfig, training=True, rng=None,
     z = safe_unit(z)
 
     # Routing gate with optional bias injection
-    route_params = params['route']
-    if routing_bias is not None:
-        route_params = dict(route_params, bias=routing_bias)
-    soft_mask, z_route, route_idx = routing_gate(
-        route_params, z, cfg.tau_route,
-        hard=not training, rng=rng)
-
     # Self lattice (internal state machine). Runs first so its output can be
     # fused as the 7th element. Its output is INDEPENDENT of z — self exists
     # regardless of external input; z only enters the world-self divergence
@@ -144,7 +137,7 @@ def forward(params, gvalue, x, cfg: LCMConfig, training=True, rng=None,
     # encoder above, self above, the generation head below.
     z_q, lat = six_lattice_step(
         z, params, cfg, training=training, rng=rng, gvalue=gvalue,
-        self_output=self_output,
+        routing_bias=routing_bias, self_output=self_output,
         self_bias_weight=cfg.alpha_self if self_output is not None else None)
     lattice_outputs = lat['lattice_outputs']
 
