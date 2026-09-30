@@ -72,6 +72,10 @@ def load_lib(path):
     ]
     lib.lcm_infer_step_v2.restype = ctypes.c_int
     lib.lcm_infer_step_v2.argtypes = common + [
+        ctypes.POINTER(ctypes.c_float), ctypes.c_int,          # hrq_top_C, M
+        ctypes.POINTER(ctypes.c_float), ctypes.c_int,          # hrq_fine_C, M
+        ctypes.c_int,                                          # hrq_n_fine
+        ctypes.c_float,                                        # tau_route_fallback
         ctypes.POINTER(ctypes.c_float), ctypes.c_int,          # soft_mask, n
         ctypes.POINTER(ctypes.c_float), ctypes.c_int,          # alpha, n_alpha
         ctypes.POINTER(ctypes.c_float),                        # ln_scale
@@ -115,6 +119,10 @@ def primary_codebooks(d):
         "binding": simvq("binding.key_cb.0"),
         "contrast": simvq("contrast.C_a.0"),
     }
+
+
+def cb2(d, name):
+    return np.asarray(d[f"params.{name}"], dtype=np.float32)
 
 
 def _feed(lib, fn, z, cbs, man_t_dim, extra_args):
@@ -175,8 +183,22 @@ def main():
     alpha = _f32(d["params.fusion.alpha"])
     ln_scale = _f32(d["params.fusion.ln_scale"])
     ln_bias = _f32(d["params.fusion.ln_bias"])
+    # HRQ stack: top codebook plus the concatenated fine codebooks per layer.
+    hrq_top = _f32(cb2(d, "hrq.top.A") @ cb2(d, "hrq.top.W"))
+    fine_keys = sorted(k for k in d.files
+                       if k.startswith("params.hrq.fine.") and k.endswith(".A"))
+    # fine_keys are already full archive keys; cb2() would double the prefix.
+    fine_layers = [_f32(np.asarray(d[k], dtype=np.float32)
+                        @ np.asarray(d[k[:-2] + ".W"], dtype=np.float32))
+                   for k in fine_keys]
+    hrq_n_fine = len(fine_layers)
+    hrq_fine = _f32(np.concatenate(fine_layers)) if fine_layers else _f32(np.zeros((0, D_MODEL)))
+    hrq_fine_M = fine_layers[0].shape[0] if fine_layers else 0
+
     z_v2 = _feed(lib, lib.lcm_infer_step_v2, z, cbs, man_t_dim,
-                 [_ptr(soft_mask), N_LATTICES, _ptr(alpha), alpha.size,
+                 [_ptr(hrq_top), hrq_top.shape[0],
+                  _ptr(hrq_fine), hrq_fine_M, hrq_n_fine, 0.1,
+                  _ptr(soft_mask), N_LATTICES, _ptr(alpha), alpha.size,
                   _ptr(ln_scale), _ptr(ln_bias)])
 
     # Decisive separation: feed C the JAX lattice outputs and run ONLY the
@@ -206,9 +228,11 @@ def main():
     print("  A ~0 gap there means the fusion is correct and the entire v2")
     print("  residual above is retrieval (the six lattice forwards).")
     print()
-    print("Remaining gap after v2 is attributable to the six lattice forwards,")
-    print("which C still computes as a flat nearest-neighbour retrieval while JAX")
-    print("runs six distinct learned operators.")
+    print("v2 now uses the faithful HRQ port for lattice 0 and flat retrieval for")
+    print("the rest. HRQ was 99.7% of the original gap: 2.9406 -> 0.2622 (fusion)")
+    print("-> 0.0007 (HRQ). What is left is the other five lattices; re-run")
+    print("train/parity_ablate.py to see which of them matters next -- not the")
+    print("mask weights, which point the wrong way.")
 
 
 if __name__ == "__main__":

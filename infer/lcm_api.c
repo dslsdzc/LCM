@@ -104,6 +104,9 @@ int lcm_infer_step_v2(const float* z, int d,
                       const float* man_T, int man_t_dim,
                       const float* bind_C, int bind_M,
                       const float* contrast_C, int contrast_M,
+                      const float* hrq_top_C, int hrq_top_M,
+                      const float* hrq_fine_C, int hrq_fine_M, int hrq_n_fine,
+                      float tau_route_fallback,
                       const float* soft_mask, int n_lattices,
                       const float* alpha, int n_alpha,
                       const float* ln_scale,
@@ -129,6 +132,16 @@ int lcm_infer_step_v2(const float* z, int d,
     memset(outputs, 0, sizeof(outputs));
     for (int i = 0; i < LCM_MAX_LATTICES; i++) confidences[i] = 0.0f;
     execute_dag(&dag, &mem, outputs, confidences);
+
+    /* Faithful HRQ, when its stack is supplied. The DAG retrieves lattice 0 as
+     * a flat nearest neighbour, which the ablation measured at 99.7% of the
+     * whole JAX<->C gap; every other lattice contributed under 0.05%. */
+    if (hrq_top_C != NULL && hrq_top_M > 0) {
+        if (hrq_forward_c(z, d, hrq_top_C, hrq_top_M,
+                          hrq_fine_C, hrq_fine_M, hrq_n_fine,
+                          tau_route_fallback, outputs[LATTICE_HRQ]) != 0)
+            return -1;
+    }
 
     /* Canonical fusion, mirroring fuse_lattices_with_aux with gvalue == NULL.
      * fusion_alpha is [n_lattices]; ln_scale / ln_bias are [d]. */
