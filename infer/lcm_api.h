@@ -73,6 +73,30 @@ int lcm_infer_step_v2(const float* z, int d,
                       const float* ln_bias,
                       float* z_out);
 
+/* ─── Canonical fusion only, with the lattice outputs supplied ────────────
+ *
+ * Diagnostic scaffolding for the JAX<->C parity work, not a deployment entry.
+ *
+ * Runs exactly the fusion of lcm_infer_step_v2 over six already-computed
+ * lattice outputs, skipping retrieval entirely. Feeding it the JAX outputs
+ * answers one question cleanly: is the remaining JAX<->C gap the fusion or the
+ * lattice forwards?
+ *
+ *   ~0 gap  -> fusion is correct, and every remaining percent is retrieval
+ *   non-zero -> the fusion itself still differs
+ *
+ * `outputs` is a flat [n_lattices * d] row-major array in the usual order
+ * (HRQ, SPARSE, LOWRANK, MANIFOLD, BINDING, CONTRAST).
+ *
+ * Returns 0 on success, -1 on error.
+ */
+int lcm_fuse_only(const float* outputs, int n_lattices, int d,
+                  const float* soft_mask,
+                  const float* alpha, int n_alpha,
+                  const float* ln_scale,
+                  const float* ln_bias,
+                  float* z_out);
+
 /* ─── Full cognitive inference loop (multi-step until convergence) ────────
  *
  * Like lcm_infer_step but runs the full dynamic_inference loop:

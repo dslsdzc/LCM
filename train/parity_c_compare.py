@@ -78,6 +78,15 @@ def load_lib(path):
         ctypes.POINTER(ctypes.c_float),                        # ln_bias
         ctypes.POINTER(ctypes.c_float),                        # z_out
     ]
+    lib.lcm_fuse_only.restype = ctypes.c_int
+    lib.lcm_fuse_only.argtypes = [
+        ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int,  # outputs, n, d
+        ctypes.POINTER(ctypes.c_float),                              # soft_mask
+        ctypes.POINTER(ctypes.c_float), ctypes.c_int,                # alpha, n_alpha
+        ctypes.POINTER(ctypes.c_float),                              # ln_scale
+        ctypes.POINTER(ctypes.c_float),                              # ln_bias
+        ctypes.POINTER(ctypes.c_float),                              # z_out
+    ]
     return lib
 
 
@@ -170,6 +179,17 @@ def main():
                  [_ptr(soft_mask), N_LATTICES, _ptr(alpha), alpha.size,
                   _ptr(ln_scale), _ptr(ln_bias)])
 
+    # Decisive separation: feed C the JAX lattice outputs and run ONLY the
+    # fusion. Whatever gap survives here is fusion error; the rest is retrieval.
+    lat = np.concatenate([_f32(d[f"out.lattice.{k}"][0]) for k in LATTICES])
+    z_fuse = np.zeros(D_MODEL, dtype=np.float32)
+    rc = lib.lcm_fuse_only(_ptr(_f32(lat)), N_LATTICES, D_MODEL,
+                           _ptr(soft_mask), _ptr(alpha), int(alpha.size),
+                           _ptr(ln_scale), _ptr(ln_bias), _ptr(z_fuse))
+    if rc != 0:
+        raise SystemExit(f"lcm_fuse_only returned {rc}")
+    z_fuse = z_fuse.astype(np.float64)
+
     print("=== result ===")
     print(f"  soft_mask  = {soft_mask}")
     print(f"  alpha      = {alpha}")
@@ -180,6 +200,11 @@ def main():
     print()
     print(f"  fusion alignment moved the gap {d1:.6f} -> {d2:.6f}"
           f"  ({'improved' if d2 < d1 else 'NOT improved'})")
+    _report("fuse-only", z_jax, z_fuse)
+    print()
+    print("  fuse-only feeds C the JAX lattice outputs and runs ONLY the fusion.")
+    print("  A ~0 gap there means the fusion is correct and the entire v2")
+    print("  residual above is retrieval (the six lattice forwards).")
     print()
     print("Remaining gap after v2 is attributable to the six lattice forwards,")
     print("which C still computes as a flat nearest-neighbour retrieval while JAX")

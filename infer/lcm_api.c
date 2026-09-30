@@ -168,6 +168,54 @@ int lcm_infer_step_v2(const float* z, int d,
     return 0;
 }
 
+/* ─── Canonical fusion only, lattice outputs supplied by the caller ─────── */
+
+int lcm_fuse_only(const float* outputs, int n_lattices, int d,
+                  const float* soft_mask,
+                  const float* alpha, int n_alpha,
+                  const float* ln_scale,
+                  const float* ln_bias,
+                  float* z_out) {
+    if (!outputs || !z_out || d <= 0) return -1;
+    if (!soft_mask || !alpha || !ln_scale || !ln_bias) return -1;
+    if (n_lattices <= 0 || n_lattices > LCM_MAX_LATTICES) return -1;
+    if (n_alpha < n_lattices) return -1;
+
+    float w[LCM_MAX_LATTICES];
+    float w_sum = 0.0f;
+    for (int i = 0; i < n_lattices; i++) {
+        w[i] = soft_mask[i] * alpha[i];
+        w_sum += w[i];
+    }
+    if (w_sum == 0.0f) return -1;
+
+    for (int j = 0; j < d; j++) {
+        float acc = 0.0f;
+        for (int i = 0; i < n_lattices; i++) {
+            acc += (w[i] / w_sum) * outputs[i * d + j];
+        }
+        z_out[j] = acc;
+    }
+
+    float mean = 0.0f;
+    for (int j = 0; j < d; j++) mean += z_out[j];
+    mean /= (float)d;
+
+    float var = 0.0f;
+    for (int j = 0; j < d; j++) {
+        float t = z_out[j] - mean;
+        var += t * t;
+    }
+    var /= (float)d;
+
+    float inv_std = 1.0f / sqrtf(var + 1e-6f);
+    for (int j = 0; j < d; j++) {
+        z_out[j] = (z_out[j] - mean) * inv_std * ln_scale[j] + ln_bias[j];
+    }
+
+    return 0;
+}
+
 /* ─── Full inference loop (multi-step with convergence, gvalue, danger) ─── */
 
 /* Last-trace storage for visualization.
