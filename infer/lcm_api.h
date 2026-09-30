@@ -37,6 +37,42 @@ int lcm_infer_step(const float* z, int d,
                    int n_lattices,
                    float* z_out);
 
+/* ─── Single step with the canonical (JAX) fusion ─────────────────────────
+ *
+ * Same lattice retrieval as lcm_infer_step, but the fusion is the one
+ * train/fusion.py::fuse_lattices_with_aux performs, instead of
+ * distance_weighted_fusion's inverse-distance weighting:
+ *
+ *     weights_i     = soft_mask_i * alpha_i
+ *     weights_norm  = weights / sum(weights)
+ *     z_q           = sum_i weights_norm_i * o_i
+ *     z_q           = layer_norm(z_q, ln_scale, ln_bias, eps=1e-6)
+ *
+ * `soft_mask` is an INPUT here rather than computed internally. The routing
+ * gate draws Gumbel noise, and reproducing the same draw in C is a separate
+ * problem; taking the mask as given keeps a fusion mismatch attributable to the
+ * fusion. A later revision can compute it from route_C / route_W / tau.
+ *
+ * Lattice order matches fill_memory and the JAX side:
+ *   [0]=HRQ [1]=SPARSE [2]=LOWRANK [3]=MANIFOLD [4]=BINDING [5]=CONTRAST
+ *
+ * `alpha` must have at least n_lattices entries; ln_scale / ln_bias at least d.
+ * Returns 0 on success, -1 on error.
+ */
+int lcm_infer_step_v2(const float* z, int d,
+                      const float* hrq_C, int hrq_M,
+                      const float* sparse_C, int sparse_M,
+                      const float* lr_C, int lr_M,
+                      const float* man_C, int man_M,
+                      const float* man_T, int man_t_dim,
+                      const float* bind_C, int bind_M,
+                      const float* contrast_C, int contrast_M,
+                      const float* soft_mask, int n_lattices,
+                      const float* alpha, int n_alpha,
+                      const float* ln_scale,
+                      const float* ln_bias,
+                      float* z_out);
+
 /* ─── Full cognitive inference loop (multi-step until convergence) ────────
  *
  * Like lcm_infer_step but runs the full dynamic_inference loop:

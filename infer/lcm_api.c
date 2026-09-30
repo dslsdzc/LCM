@@ -94,6 +94,80 @@ int lcm_infer_step(const float* z, int d,
     return 0;
 }
 
+/* ─── Single step with the canonical (JAX) fusion ───────────────────────── */
+
+int lcm_infer_step_v2(const float* z, int d,
+                      const float* hrq_C, int hrq_M,
+                      const float* sparse_C, int sparse_M,
+                      const float* lr_C, int lr_M,
+                      const float* man_C, int man_M,
+                      const float* man_T, int man_t_dim,
+                      const float* bind_C, int bind_M,
+                      const float* contrast_C, int contrast_M,
+                      const float* soft_mask, int n_lattices,
+                      const float* alpha, int n_alpha,
+                      const float* ln_scale,
+                      const float* ln_bias,
+                      float* z_out) {
+    if (!z || !z_out || d <= 0) return -1;
+    if (!soft_mask || !alpha || !ln_scale || !ln_bias) return -1;
+    if (n_lattices <= 0 || n_lattices > LCM_MAX_LATTICES) return -1;
+    if (n_alpha < n_lattices) return -1;
+
+    memory_t mem;
+    if (fill_memory(&mem, d,
+                    hrq_C, hrq_M, sparse_C, sparse_M,
+                    lr_C, lr_M, man_C, man_M,
+                    man_T, man_t_dim,
+                    bind_C, bind_M, contrast_C, contrast_M,
+                    n_lattices) != 0) return -1;
+
+    dag_t dag = build_dag(z, &mem, false);
+
+    vec_t outputs[LCM_MAX_LATTICES];
+    float confidences[LCM_MAX_LATTICES];
+    memset(outputs, 0, sizeof(outputs));
+    for (int i = 0; i < LCM_MAX_LATTICES; i++) confidences[i] = 0.0f;
+    execute_dag(&dag, &mem, outputs, confidences);
+
+    /* Canonical fusion, mirroring fuse_lattices_with_aux with gvalue == NULL.
+     * fusion_alpha is [n_lattices]; ln_scale / ln_bias are [d]. */
+    float w[LCM_MAX_LATTICES];
+    float w_sum = 0.0f;
+    for (int i = 0; i < n_lattices; i++) {
+        w[i] = soft_mask[i] * alpha[i];
+        w_sum += w[i];
+    }
+    if (w_sum == 0.0f) return -1;
+
+    for (int j = 0; j < d; j++) {
+        float acc = 0.0f;
+        for (int i = 0; i < n_lattices; i++) {
+            acc += (w[i] / w_sum) * outputs[i][j];
+        }
+        z_out[j] = acc;
+    }
+
+    /* LayerNorm, eps matching fusion.py::layer_norm. */
+    float mean = 0.0f;
+    for (int j = 0; j < d; j++) mean += z_out[j];
+    mean /= (float)d;
+
+    float var = 0.0f;
+    for (int j = 0; j < d; j++) {
+        float t = z_out[j] - mean;
+        var += t * t;
+    }
+    var /= (float)d;
+
+    float inv_std = 1.0f / sqrtf(var + 1e-6f);
+    for (int j = 0; j < d; j++) {
+        z_out[j] = (z_out[j] - mean) * inv_std * ln_scale[j] + ln_bias[j];
+    }
+
+    return 0;
+}
+
 /* ─── Full inference loop (multi-step with convergence, gvalue, danger) ─── */
 
 /* Last-trace storage for visualization.
