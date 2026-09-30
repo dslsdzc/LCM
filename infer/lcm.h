@@ -283,6 +283,14 @@ void  exp_map_c(const float* x, float* out, int D, float c);
 void  log_map_c(const float* y, float* out, int D, float c);
 void  mobius_add_c(const float* u, const float* v, float* out, int D, float c);
 
+/* HRQ: hierarchical residual quantization on the Poincare ball.
+ * Mirrors train/lattices.py::hrq_forward for the value_scalars == 0 case.
+ * top_C is (M_top, D); fine_C is (n_fine * M_fine, D). Both raw, not ball-mapped. */
+int hrq_forward_c(const float* z, int D,
+                  const float* top_C, int M_top,
+                  const float* fine_C, int M_fine, int n_fine,
+                  float tau_fallback, float* out);
+
 /* Lattice retrieval operations */
 void retrieve_single(const float* z, const lattice_memory_t* mem,
                      float* out, float* dist, int* idx);

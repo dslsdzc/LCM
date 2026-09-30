@@ -35,6 +35,110 @@
   ensures  \valid(out + (0 .. LCM_D-1));
   assigns  out[0 .. LCM_D-1], *dist, *idx;
  */
+/* ─── HRQ: hierarchical residual quantization on the Poincaré ball ─────────
+ *
+ * Mirrors train/lattices.py::hrq_forward in the configuration the parity
+ * harness runs: value_scalars are all zero (their init is jnp.zeros), so
+ * `value_biased_retrieve`'s score reduces to `-dist2` and the top-level
+ * selection is a *Euclidean* argmin over the tangent-space codebook, retrieving
+ * the ball prototype. When alpha_val > 0 the score is genuinely value-biased
+ * and that branch would need value_scalars plumbed in here too.
+ *
+ * Note the two different metrics, which is deliberate and easy to get wrong:
+ *   - top-level SELECTION is Euclidean (over top_C)
+ *   - the fallback DECISION and the fine-layer selection are Poincaré
+ *     (poincare_similarity, distance-monotone: nearest = argmin)
+ *
+ * `top_C` is (M_top, D) raw; `fine_C` is (n_fine * M_fine, D) raw. Both are
+ * mapped into the ball internally, layer by layer, rather than materialised up
+ * front — a (512, 256) ball copy is 512 KB and does not belong on the stack.
+ *
+ * Returns 0 on success, -1 on bad arguments.
+ */
+int hrq_forward_c(const float* z, int D,
+                  const float* top_C, int M_top,
+                  const float* fine_C, int M_fine, int n_fine,
+                  float tau_fallback, float* out) {
+    if (!z || !top_C || !out || D <= 0 || M_top <= 0) return -1;
+    if (n_fine > 0 && (!fine_C || M_fine <= 0)) return -1;
+
+    const float c = 1.0f;
+    vec_t z_P, c_p, r, t1, t2, t3, acc, neg;
+
+    exp_map_c(z, z_P, D, c);
+
+    /* Pass 1: the two smallest similarities (ascending; closest first), the
+     * Poincaré argmin, and separately the Euclidean argmin over top_C. */
+    float min1 = 1e20f, min2 = 1e20f;
+    int euclid_idx = 0;
+    float euclid_best = 1e20f;
+
+    for (int m = 0; m < M_top; m++) {
+        const float* row = top_C + (size_t)m * D;
+        exp_map_c(row, c_p, D, c);
+        float s = poincare_similarity_c(z_P, c_p, D, c);
+        if (s < min1) { min2 = min1; min1 = s; }
+        else if (s < min2) { min2 = s; }
+
+        float d2 = 0.0f;
+        for (int i = 0; i < D; i++) {
+            float diff = z[i] - row[i];
+            d2 += diff * diff;
+        }
+        if (d2 < euclid_best) { euclid_best = d2; euclid_idx = m; }
+    }
+
+    /* Top prototype in the ball: the Euclidean winner, mapped. */
+    exp_map_c(top_C + (size_t)euclid_idx * D, c_p, D, c);
+    memcpy(t3, c_p, sizeof(float) * (size_t)D);   /* c_top */
+
+    /* Fallback when the top-1 / top-2 similarity gap is small. */
+    int use_fallback = (min2 - min1) < tau_fallback;
+
+    if (use_fallback) {
+        /* c_top_w = sum_m softmax(-sims)_m * C_top_P[m], computed in one pass
+         * (numerator vector and denominator accumulated together) so the
+         * ball-mapped rows need not be stored. */
+        float den = 0.0f;
+        memset(acc, 0, sizeof(vec_t));
+        for (int m = 0; m < M_top; m++) {
+            exp_map_c(top_C + (size_t)m * D, c_p, D, c);
+            float s = poincare_similarity_c(z_P, c_p, D, c);
+            float e = expf(-s + min1);          /* max(-sims) == -min1 */
+            den += e;
+            for (int i = 0; i < D; i++) acc[i] += e * c_p[i];
+        }
+        if (den <= 0.0f) return -1;
+        for (int i = 0; i < D; i++) t3[i] = acc[i] / den;   /* c_top_w */
+    }
+
+    /* t1 = z_P (-) c_top. mobius_add takes v directly, so pass -c_top. */
+    for (int i = 0; i < D; i++) neg[i] = -t3[i];
+    mobius_add_c(z_P, neg, t1, D, c);
+
+    /* fine_residual: r = t1; per layer r = r (+) (-C_fb_P[argmin sim]) */
+    memcpy(r, t1, sizeof(float) * (size_t)D);
+    for (int l = 0; l < n_fine; l++) {
+        const float* layer = fine_C + (size_t)l * M_fine * D;
+        float best = 1e20f;
+        int best_m = 0;
+        for (int m = 0; m < M_fine; m++) {
+            exp_map_c(layer + (size_t)m * D, c_p, D, c);
+            float s = poincare_similarity_c(r, c_p, D, c);
+            if (s < best) { best = s; best_m = m; }
+        }
+        exp_map_c(layer + (size_t)best_m * D, c_p, D, c);
+        for (int i = 0; i < D; i++) neg[i] = -c_p[i];
+        mobius_add_c(r, neg, t2, D, c);
+        memcpy(r, t2, sizeof(float) * (size_t)D);
+    }
+
+    /* out = log_map( c_top (+) fine_residual ) */
+    mobius_add_c(t3, r, t2, D, c);
+    log_map_c(t2, out, D, c);
+    return 0;
+}
+
 void retrieve_single(const float* z, const lattice_memory_t* mem,
                      float* out, float* dist, int* idx) {
     assert(mem != NULL && mem->C != NULL && out != NULL);
