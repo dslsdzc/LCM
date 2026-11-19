@@ -76,7 +76,9 @@ def test_exported_config_reports_the_tied_extent(exported):
 
 def test_manifest_covers_exported_tensors(exported):
     """Every exported .bin has a per-tensor canonical hash (R10)."""
-    from train.checkpoint import FORMAT_VERSION, load_manifest
+    from train.bin_format import (
+        FORMAT_VERSION, HEADER_SIZE_V2, canonical_sha256, load_manifest,
+    )
     _, _, out, _, _ = exported
     manifest = load_manifest(out)
     assert manifest["format_version"] == FORMAT_VERSION
@@ -89,7 +91,15 @@ def test_manifest_covers_exported_tensors(exported):
         assert entry["name"] == name
         assert entry["dtype"] == "float32"
         assert len(entry["sha256"]) == 64
+        assert entry["length"] == int(np.prod(entry["shape"])) * 4
     assert "params.encoder.embed" in tensors
+    # Hash a real headerless payload and a real header-bearing payload.
+    enc = np.fromfile(os.path.join(out, "encoder.bin"), dtype=np.float32)
+    assert tensors["encoder"]["sha256"] == canonical_sha256({"encoder": enc})
+    sparse = np.fromfile(os.path.join(out, "sparse_codebook.bin"),
+                         dtype=np.float32, offset=HEADER_SIZE_V2)
+    assert tensors["sparse_codebook"]["sha256"] == canonical_sha256(
+        {"sparse_codebook": sparse})
     # offset/length locate each tensor in the canonical stream.
     offset = 0
     for entry in sorted(tensors.values(), key=lambda e: e["offset"]):

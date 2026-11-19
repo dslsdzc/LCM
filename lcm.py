@@ -1166,7 +1166,7 @@ def load_codebook_for_c(ckpt_dir, filename):
 
     Old 24-byte headers are rejected outright (R10); there is no migration.
     """
-    from train.checkpoint import read_bin_v2
+    from train.bin_format import read_bin_v2
 
     path = Path(ckpt_dir) / filename
     has_hash = (filename.startswith('gvalue') or filename.startswith('danger'))
@@ -1533,7 +1533,7 @@ class LCMInferEngine:
 
         with open(self.checkpoint_dir / "config.json") as f:
             self.cfg = json.load(f)
-        from train.checkpoint import FORMAT_VERSION
+        from train.bin_format import FORMAT_VERSION
         if self.cfg.get('format_version') != FORMAT_VERSION:
             raise SystemExit(
                 f"[INFER] {self.checkpoint_dir / 'config.json'} has checkpoint "

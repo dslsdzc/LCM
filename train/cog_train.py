@@ -891,7 +891,7 @@ _CB_HEADER_FMT = HEADER_FMT_V2
 def _pack_cb_header(M, d, n_layers, cb_type=1, curvature=1.0):
     import struct
     return struct.pack(_CB_HEADER_FMT, int(M), int(d), int(n_layers),
-                       int(cb_type), float(curvature), FORMAT_VERSION, 0)
+                       int(cb_type), float(curvature), FORMAT_VERSION, 0, 0)
 
 
 def _write_cb_bin(dir_path, filename, mat, cb_type):
@@ -903,7 +903,7 @@ def _write_cb_bin(dir_path, filename, mat, cb_type):
     data_bytes = mat.tobytes()
     crc = zlib.crc32(data_bytes) & 0xFFFFFFFF
     hdr = struct.pack(_CB_HEADER_FMT, int(M), int(d), 1, int(cb_type), 1.0,
-                      FORMAT_VERSION, crc)
+                      FORMAT_VERSION, 0, crc)
     path = os.path.join(dir_path, filename)
     with open(path, 'wb') as f:
         f.write(hdr)
@@ -922,7 +922,7 @@ def _write_flat_cb(dir_path, filename, arrays, cb_type=1):
     data_bytes = flat.tobytes()
     crc = zlib.crc32(data_bytes) & 0xFFFFFFFF
     hdr = struct.pack(_CB_HEADER_FMT, int(M), int(d), len(arrays), int(cb_type),
-                      1.0, FORMAT_VERSION, crc)
+                      1.0, FORMAT_VERSION, 0, crc)
     path = os.path.join(dir_path, filename)
     with open(path, 'wb') as f:
         f.write(hdr)
@@ -1157,6 +1157,7 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
     # gvalue codebooks — schema-v2 32-byte header. The old 36-byte custom
     # header made lcm.py parse M as garbage (gv_n wrong → C engine got
     # misaligned pointers).
+    gvalue_written = None
     try:
         C_pos, C_neg = make_global_value_vectors(d)
         C_p = _to_np(C_pos)
@@ -1177,14 +1178,18 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
             _f.write(_hdr)
             _f.write(_data)
             _f.write(hashlib.sha256(_data).digest())
-        manifest_tensors['gvalue_codebook'] = _np.concatenate(
-            [C_p.ravel(), C_n.ravel()]).astype(_np.float32)
+        gvalue_written = (C_p, C_n)
     except Exception as e:
         print(f"[CKPT] gvalue write skipped: {e}")
+    if gvalue_written is not None:
+        C_p, C_n = gvalue_written
+        manifest_tensors['gvalue_codebook'] = _np.concatenate(
+            [C_p.ravel(), C_n.ravel()]).astype(_np.float32)
     # danger codebook — PLACEHOLDER, same story as gvalue above: identical
     # halves with a fixed seed → danger_score ≡ 0 → the danger lattice never
     # fires. The danger lattice is not part of cognitive training yet.
     # Matches checkpoint._save_danger.
+    danger_written = None
     try:
         print("[CKPT] WARNING: exporting PLACEHOLDER danger codebook "
               "(threat == normal) — the danger lattice is INACTIVE")
@@ -1196,15 +1201,18 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
         _sha_d = hashlib.sha256(_data_d).digest()
         _crc_d = zlib.crc32(_data_d) & 0xFFFFFFFF
         _hdr_d = struct.pack(_CB_HEADER_FMT, int(M_d), int(d), 1, 2, 1.0,
-                             FORMAT_VERSION, _crc_d)
+                             FORMAT_VERSION, 0, _crc_d)
         with open(os.path.join(output_dir, "danger_codebook.bin"), "wb") as _f:
             _f.write(_hdr_d)
             _f.write(_data_d)
             _f.write(_sha_d)
-        manifest_tensors['danger_codebook'] = _np.concatenate(
-            [danger_t.ravel(), danger_n.ravel()]).astype(_np.float32)
+        danger_written = (danger_t, danger_n)
     except Exception as e:
         print(f"[CKPT] danger write skipped: {e}")
+    if danger_written is not None:
+        danger_t, danger_n = danger_written
+        manifest_tensors['danger_codebook'] = _np.concatenate(
+            [danger_t.ravel(), danger_n.ravel()]).astype(_np.float32)
 
     # Per-tensor hashes for the exported files, plus a summary of the pickled
     # training params so a resume can detect a truncated/mixed checkpoint.

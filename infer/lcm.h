@@ -56,8 +56,9 @@ extern "C" {
 
 /* Checkpoint/export schema v2 (R10). Every header-bearing .bin file starts
  * with a 32-byte header: int32 M, d, n_layers, type; float c; uint32
- * format_version; uint32 checksum. Python owns manifest.json; the C side only
- * needs the version tag to reject v1 files before pointers are passed in. */
+ * format_version; uint32 reserved; uint32 checksum. Python reads the header and
+ * manifest.json; no C loader consumes these constants yet, but the v3 loader
+ * must use these frozen values. */
 #define LCM_HEADER_SIZE_V2   32
 #define LCM_FORMAT_VERSION   2
 

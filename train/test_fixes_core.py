@@ -320,7 +320,7 @@ def test_crc_mismatch_raises():
     good = os.path.join(tmp, "bar_codebook.bin")
     with open(good, 'wb') as f:
         f.write(struct.pack(HEADER_FMT_V2, M, d, 1, 1, 1.0, FORMAT_VERSION,
-                            _compute_checksum(data)))
+                            0, _compute_checksum(data)))
         f.write(data)
     arr, M2, d2 = lcm_mod.load_codebook_for_c(tmp, "bar_codebook.bin")
     assert (M2, d2) == (M, d) and arr.shape == (M * d,)
