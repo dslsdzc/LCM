@@ -41,11 +41,15 @@ FROZEN_PATHS = frozenset({
 # Read-only constants that are stored in the params tree for shape/API
 # stability but are not parameters:
 #   * sparse.zero_vec is the LFQ origin. It must stay exactly zero.
+#   * self.core is the permanent identity anchor; self_lattice.py documents it
+#     as frozen forever. Task 13 replaces the self model with C_self[0] and must
+#     keep this path frozen.
 #   * the Qwen bridge is a frozen pretrained model, not a cognitive parameter.
 # The brief fixes FROZEN_PATHS to danger.C only; these are structural constants,
 # kept in a separate set so the R3 contract stays literally true.
 CONSTANT_PATHS = frozenset({
     ('sparse', 'zero_vec'),
+    ('self', 'core'),
     ('qwen',),
 })
 

@@ -47,7 +47,8 @@ def exported(tmp_path, tiny_spec):
     out = str(tmp_path / "ckpt")
     save_cog_checkpoint(params, out, 0,
                         run_identity=RunIdentity(tiny_spec, dict(meta)),
-                        train_cfg=cfg, self_state=self_state)
+                        train_cfg=cfg, self_state=self_state,
+                        allow_missing_buffers=True)
     return cfg, params, out, tiny_spec, meta
 
 

@@ -295,7 +295,12 @@ def sparse_forward(params, z, training=True, lambda_sparse=1e-4, d_top=None,
 
 
 def sparse_ema_update(params, z_sum, count, N, m, gamma=0.99, lambda_s=1e-4):
-    """EMA update with soft shrinkage."""
+    """EMA update with soft shrinkage.
+
+    DEPRECATED: no callers. The live EMA path is ``train/ema_state.py``
+    (feature-bank cold start needs the decayed-sum recursion); kept because
+    tests/imports may still reference this historical helper.
+    """
     N_new = gamma * N + (1 - gamma) * count
     m_new = gamma * m + (1 - gamma) * z_sum
     C_new = m_new / jnp.clip(N_new, 1.0)[:, None]
@@ -421,6 +426,10 @@ def manifold_orth_loss(T, indices, k, lambda_orth=0.01, rng=None):
 def manifold_ema_update(C, z_sum, count, N, m, gamma=0.99):
     """EMA update for the manifold codebook.
 
+    DEPRECATED: no callers. The live EMA path is ``train/ema_state.py``
+    (decayed-sum recursion + untouched-row preservation); kept because
+    tests/imports may still reference this historical helper.
+
     ``params['manifold']['C']`` is **tangent-space** coordinates: every consumer
     pushes it onto the ball itself (``manifold_forward`` does
     ``C_P = exp_map(params['C'])``, ``compute_vq_loss`` compares against
@@ -459,35 +468,41 @@ def _residual_vq_chain(codebooks, r, value_scalars, alpha_val):
     """Multi-layer residual VQ over a list of SimVQ codebooks.
 
     Returns:
-        (quantised list, residual inputs list, accumulated ste_relax or None).
-        The residual inputs are the per-layer query vectors; they are what the
-        per-codebook EMA must accumulate, since each layer quantises its own
-        residual and not the raw lattice input.
+        (quantised list, residual inputs list, per-layer idx list, accumulated
+        ste_relax or None). The residual inputs are the per-layer query vectors;
+        the indices are the rows the forward actually selected. Both are needed
+        by the EMA pass: recomputing an argmin would diverge from the
+        value-biased selection under a nonzero ``value_scalars``.
     """
-    quantised, inputs = [], []
+    quantised, inputs, indices = [], [], []
     relax = None
     for cb in codebooks:
         inputs.append(r)
         if value_scalars is not None and alpha_val > 0:
             C = cb['A'] @ cb['W']  # (M, d)
             scores = value_biased_scores(r, C, value_scalars, alpha_val)
-            z_q = r + lax.stop_gradient(C[scores.argmax(axis=-1)] - r)
+            idx = scores.argmax(axis=-1)
+            z_q = r + lax.stop_gradient(C[idx] - r)
             step = ste_relax(scores, C)
             relax = step if relax is None else relax + step
         else:
-            z_q, _, _ = simvq_codebook(cb, r)
+            z_q, idx, _ = simvq_codebook(cb, r)
         quantised.append(z_q)
+        indices.append(idx)
         r = r - z_q
-    return quantised, inputs, relax
+    return quantised, inputs, indices, relax
 
 
 def binding_forward(params, z, V, value_scalars=None, alpha_val=0.0):
     """HRR binding/unbinding with cross-layer superposition.
 
     Returns:
-        (o_bind, residuals): residuals maps 'key'/'val'/'bind' to the list of
-        per-layer query vectors, so the EMA pass can update each binding
-        codebook in the space it actually quantises.
+        (o_bind, residuals, indices): residuals maps 'key'/'val'/'bind' to the
+        list of per-layer query vectors, so the EMA pass can update each
+        binding codebook in the space it actually quantises. indices maps the
+        same families to the rows selected by *this* forward (value-biased when
+        ``value_scalars`` is active); EMA must use them rather than recomputing
+        a plain Euclidean argmin.
     """
     # Key/value projections: W_k = V @ A_k, z_k = z @ W_k.T
     # (d, r_max) @ (r_max, d) = (d, d); (B, d) @ (d, d) = (B, d)
@@ -497,9 +512,9 @@ def binding_forward(params, z, V, value_scalars=None, alpha_val=0.0):
     z_v = z @ W_v.T  # (B, d)
 
     # Multi-layer residual VQ for key / value
-    k_q_list, key_inputs, relax_k = _residual_vq_chain(
+    k_q_list, key_inputs, key_idx, relax_k = _residual_vq_chain(
         params['key_cb'], z_k, value_scalars, alpha_val)
-    v_q_list, val_inputs, relax_v = _residual_vq_chain(
+    v_q_list, val_inputs, val_idx, relax_v = _residual_vq_chain(
         params['val_cb'], z_v, value_scalars, alpha_val)
 
     # Cross-layer HRR binding (9 pairs for 3 layers)
@@ -510,7 +525,7 @@ def binding_forward(params, z, V, value_scalars=None, alpha_val=0.0):
                 normalize_fft(k_i) * normalize_fft(v_j), n=z.shape[-1])
 
     # Quantize the bound representation
-    b_q_list, bind_inputs, relax_b = _residual_vq_chain(
+    b_q_list, bind_inputs, bind_idx, relax_b = _residual_vq_chain(
         params['bind_cb'], b_raw, value_scalars, alpha_val)
 
     o_bind = jnp.sum(jnp.stack(b_q_list), axis=0)
@@ -520,7 +535,8 @@ def binding_forward(params, z, V, value_scalars=None, alpha_val=0.0):
             o_bind = o_bind + step  # value-scalar gradient (forward ≡ 0)
 
     residuals = {'key': key_inputs, 'val': val_inputs, 'bind': bind_inputs}
-    return o_bind, residuals
+    indices = {'key': key_idx, 'val': val_idx, 'bind': bind_idx}
+    return o_bind, residuals, indices
 
 
 # ── 4.6 Contrast Lattice (Λ_contrast) ───────────────────────────────────────
@@ -537,9 +553,9 @@ def init_contrast_params(rng, d, M_contrast, n_layers):
 
 def contrast_forward(params, z, value_scalars=None, alpha_val=0.0):
     """Dual codebook contrast lattice."""
-    a_q_list, _, relax_a = _residual_vq_chain(
+    a_q_list, _, _, relax_a = _residual_vq_chain(
         params['C_a'], z, value_scalars, alpha_val)
-    b_q_list, _, relax_b = _residual_vq_chain(
+    b_q_list, _, _, relax_b = _residual_vq_chain(
         params['C_b'], z, value_scalars, alpha_val)
 
     o_contrast = (jnp.sum(jnp.stack(a_q_list), axis=0)

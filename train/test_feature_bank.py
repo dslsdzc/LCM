@@ -27,7 +27,7 @@ def test_contrast_uses_farthest_point():
     C = jnp.array([[5.0, 0.0]])
     C2, _ = bank.replace_dead_contrast(C, jnp.array([0], dtype=jnp.int32),
                                        step=1001, t_dead=1000)
-    # 最远点是 [-1, 0]
+    # The farthest point is [-1, 0].
     assert float(C2[0, 0]) < 0.0
 
 

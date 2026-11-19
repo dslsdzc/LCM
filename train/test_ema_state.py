@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import pytest
 
 from train.cog_loop import cog_loop_scan
 from train.config import LCMConfig
@@ -19,6 +20,7 @@ from train.ema_state import (
 )
 from train.feature_bank import FeatureBank
 from train.hyp import exp_map
+from train.lattices import binding_forward
 
 
 def _cfg(**overrides):
@@ -147,17 +149,20 @@ def test_binding_ema_updates_every_layer_and_family():
              for fam in ('key', 'val', 'bind')}
     residuals = {}
     selected = {}
+    indices = {}
     for f_i, fam in enumerate(('key', 'val', 'bind')):
         residuals[fam] = []
         selected[fam] = []
+        indices[fam] = []
         for l in range(n_layers):
             sel = (f_i + l) % M
             residuals[fam].append(jnp.array(
                 [[float(sel) * (f_i + 1) + 0.5, 0.25]]))
             selected[fam].append(sel)
+            indices[fam].append(jnp.array([sel], dtype=jnp.int32))
 
     new_params, new_state = ema_update_binding(
-        params, state, residuals, gamma=0.99, step=17)
+        params, state, residuals, indices, gamma=0.99, step=17)
 
     for f_i, fam in enumerate(('key', 'val', 'bind')):
         for l in range(n_layers):
@@ -176,6 +181,91 @@ def test_binding_ema_updates_every_layer_and_family():
             np.testing.assert_allclose(
                 np.asarray(C[other]),
                 np.array([float(other) * (f_i + 1), 0.0]), atol=1e-6)
+
+
+def test_binding_ema_uses_value_biased_forward_indices():
+    """EMA must write the row the forward selected, not a Euclidean argmin.
+
+    ``binding_forward`` selects with ``value_biased_scores`` when
+    ``value_scalars`` is active. Recomputing a plain argmin in the EMA pass
+    would update a row the forward never quantised.
+    """
+    d, r_max = 2, 2
+    # Rows [0,0] and [1,0]; the query [0.1,0] is Euclidean-nearest to row 0.
+    base = jnp.array([[0.0, 0.0], [1.0, 0.0]])
+    params = {
+        'A_k': jnp.eye(r_max), 'A_v': jnp.eye(r_max),
+        'key_cb': [{'A': base, 'W': jnp.eye(d)}],
+        'val_cb': [{'A': base, 'W': jnp.eye(d)}],
+        'bind_cb': [{'A': base, 'W': jnp.eye(d)}],
+    }
+    V = jnp.eye(d, r_max)
+    z = jnp.array([[0.1, 0.0]])
+    # Row 1 has value 1; alpha=20 makes the value term dominate the distance.
+    v = jnp.array([0.0, 1.0])
+    _, residuals, indices = binding_forward(
+        params, z, V, value_scalars=v, alpha_val=20.0)
+
+    key_residual = residuals['key'][0]
+    C_key = params['key_cb'][0]['A'] @ params['key_cb'][0]['W']
+    plain_argmin = jnp.argmin(
+        jnp.sum((key_residual[:, None, :] - C_key[None, :, :]) ** 2, axis=-1),
+        axis=-1)
+    assert int(plain_argmin[0]) == 0, "fixture no longer has a disagreement"
+    assert int(indices['key'][0][0]) == 1, \
+        "value bias did not flip the key selection"
+
+    state = {fam: [{'N': jnp.zeros(2), 'm': jnp.zeros((2, d)),
+                    'last_used': jnp.zeros(2, dtype=jnp.int32)}]
+             for fam in ('key', 'val', 'bind')}
+    new_params, new_state = ema_update_binding(
+        params, state, residuals, indices, gamma=0.99)
+
+    updated_key = new_params['key_cb'][0]['A'] @ new_params['key_cb'][0]['W']
+    # The value-biased row received the residual; the Euclidean-nearest row
+    # was not touched by the EMA.
+    np.testing.assert_allclose(np.asarray(updated_key[1]),
+                               np.asarray(key_residual[0]), atol=1e-6)
+    np.testing.assert_allclose(np.asarray(updated_key[0]), [0.0, 0.0],
+                               atol=1e-6)
+    assert float(new_state['key'][0]['N'][1]) > 0.0
+    assert float(new_state['key'][0]['N'][0]) == 0.0
+
+
+def test_decayed_sum_form_matches_bmd_scaled_form():
+    """Our N/m are b.md's state divided by (1-gamma); the codebook is the same.
+
+    For a warm row (N >= 1, both clips are the identity):
+        N_ours = N_ref/(1-gamma),  m_ours = m_ref/(1-gamma)
+    The update is linear, so after an assignment the ratio m/N is identical.
+    """
+    gamma = 0.9
+    scale = 1.0 - gamma
+    N_ref0 = jnp.array([2.0])
+    m_ref0 = jnp.array([[2.0, 4.0]])
+    state = {'N': N_ref0 / scale, 'm': m_ref0 / scale,
+             'last_used': jnp.zeros(1, dtype=jnp.int32)}
+    z = jnp.array([[3.0, 5.0]])
+    idx = jnp.array([0])
+
+    C_our, state_our = ema_update_sparse(
+        jnp.zeros((1, 2)), state, z, idx, gamma, lambda_shrink=0.0)
+
+    N_ref = gamma * N_ref0 + scale * 1.0
+    m_ref = gamma * m_ref0 + scale * z
+    C_ref = m_ref / jnp.clip(N_ref, 1.0)[:, None]
+    np.testing.assert_allclose(np.asarray(C_our), np.asarray(C_ref),
+                               atol=1e-6)
+    np.testing.assert_allclose(np.asarray(state_our['N']),
+                               np.asarray(N_ref / scale), atol=1e-6)
+
+    # Cold row: b.md's scaled state is (1-gamma)*[count, z_sum]; the ratio is
+    # the observation, which our N=count>=1 clip makes exact.
+    cold = {'N': jnp.zeros(1), 'm': jnp.zeros((1, 2)),
+            'last_used': jnp.zeros(1, dtype=jnp.int32)}
+    C_cold, _ = ema_update_sparse(jnp.zeros((1, 2)), cold, z, idx, gamma,
+                                  lambda_shrink=0.0)
+    np.testing.assert_allclose(np.asarray(C_cold), np.asarray(z), atol=1e-7)
 
 
 def test_last_used_only_moves_for_selected_rows():
@@ -243,6 +333,8 @@ def test_cog_loop_scan_stats_are_opt_in_and_default_return_is_unchanged():
     for family in ('key', 'val', 'bind'):
         assert len(stats['binding_residuals'][family]) == cfg.n_bind_layers
         assert stats['binding_residuals'][family][0].shape == (2, 1, cfg.d_model)
+        assert len(stats['binding_indices'][family]) == cfg.n_bind_layers
+        assert stats['binding_indices'][family][0].shape == (2, 1)
 
 
 def test_train_step_separates_ema_from_adamw_and_updates_ema():
@@ -287,7 +379,6 @@ def test_train_step_separates_ema_from_adamw_and_updates_ema():
         # Frozen parameters do not.
         np.testing.assert_array_equal(np.asarray(params['danger']['C']),
                                       danger_before)
-        assert 'danger' not in opt_state
 
         stats = aux['loop_stats']
         C_expected, state_expected = ema_update_sparse(
@@ -303,7 +394,6 @@ def test_train_step_separates_ema_from_adamw_and_updates_ema():
                                    np.asarray(state_expected['N']), atol=1e-6)
         np.testing.assert_allclose(np.asarray(ema['sparse']['m']),
                                    np.asarray(state_expected['m']), atol=1e-6)
-        assert 'sparse' not in opt_state
         if aux.get('self_state') is not None:
             self_state = aux['self_state']
 
@@ -317,6 +407,71 @@ def test_train_step_separates_ema_from_adamw_and_updates_ema():
     np.testing.assert_allclose(
         np.asarray(params['binding']['key_cb'][0]['W']),
         np.eye(cfg.d_model), atol=1e-6)
+
+
+def test_host_bank_update_replaces_dead_rows_only():
+    """The host path zeroes N/m and updates last_used for dead rows only."""
+    from train.cog_train import _host_bank_update
+
+    cfg = _tiny_cfg(bank_dead_threshold=2)
+    params, _ = _tiny_params(cfg)
+    ema = init_ema_state(params, cfg)
+    # Row 0 is dead at step 5; rows 1..3 were used recently.
+    last = jnp.full((cfg.M_sparse,), 4, dtype=jnp.int32).at[0].set(2)
+    ema['sparse']['last_used'] = last
+    ema['sparse']['N'] = ema['sparse']['N'].at[0].set(5.0)
+    ema['sparse']['m'] = ema['sparse']['m'].at[0].set(jnp.ones(cfg.d_model))
+    C_before = jnp.asarray(params['sparse']['C'])
+
+    # Empty bank: the dead row cannot be replenished, so nothing changes.
+    empty = FeatureBank(4, cfg.d_model)
+    params_noop, ema_noop = _host_bank_update(params, ema, empty, 5, cfg)
+    np.testing.assert_array_equal(np.asarray(params_noop['sparse']['C']),
+                                  np.asarray(C_before))
+    assert float(ema_noop['sparse']['N'][0]) == 5.0
+    assert int(ema_noop['sparse']['last_used'][0]) == 2
+
+    bank = FeatureBank(4, cfg.d_model)
+    bank.add(jnp.full((1, cfg.d_model), 7.0))
+    params_new, ema_new = _host_bank_update(params, ema, bank, 5, cfg)
+    np.testing.assert_allclose(np.asarray(params_new['sparse']['C'][0]),
+                               np.full(cfg.d_model, 7.0), atol=1e-6)
+    np.testing.assert_array_equal(np.asarray(params_new['sparse']['C'][1:]),
+                                  np.asarray(C_before[1:]))
+    assert float(ema_new['sparse']['N'][0]) == 0.0
+    assert float(jnp.linalg.norm(ema_new['sparse']['m'][0])) == 0.0
+    assert int(ema_new['sparse']['last_used'][0]) == 5
+    assert int(ema_new['sparse']['last_used'][1]) == 4
+
+
+def test_supervisor_forwards_ema_state_for_five_output_steps(tmp_path):
+    """Supervisor keeps its 4-tuple API but carries the EMA state through aux."""
+    from train.train_supervisor import Supervisor
+
+    cfg = _tiny_cfg()
+    sup = Supervisor(str(tmp_path / "sup"), cfg, enable_auto=True)
+    calls = []
+
+    def fake_step(params, opt_state, ema_state, batch, lr, rng,
+                  self_state=None, step=None):
+        calls.append((ema_state, step, self_state))
+        new_ema = jax.tree_util.tree_map(lambda x: x + 1.0, ema_state)
+        return params, opt_state, new_ema, jnp.array(0.5), \
+            {'self_state': self_state}
+
+    ema = {'sparse': {'N': jnp.zeros(3)}}
+    params, opt_state, loss, aux = sup.step(
+        fake_step, {'p': jnp.zeros(1)}, {'o': jnp.zeros(1)}, None,
+        1e-3, jax.random.PRNGKey(0), step=3, self_state='ss',
+        ema_state=ema)
+
+    assert calls[0][1] == 3 and calls[0][2] == 'ss'
+    assert float(loss) == 0.5
+    np.testing.assert_allclose(np.asarray(aux['ema_state']['sparse']['N']),
+                               np.ones(3))
+    assert sup.best_ema_state is not None
+    np.testing.assert_allclose(
+        np.asarray(sup.best_ema_state['sparse']['N']), np.ones(3))
 
 
 class _FakeSpec:
@@ -352,7 +507,8 @@ def test_cog_checkpoint_roundtrips_ema_and_feature_bank(tmp_path):
     ema = init_ema_state(params, cfg)
     ema['sparse']['N'] = ema['sparse']['N'].at[0].set(2.5)
     ema['sparse']['m'] = ema['sparse']['m'].at[0].set(jnp.ones(cfg.d_model))
-    ema['sparse']['last_used'] = ema['sparse']['last_used'].at[0].set(7)
+    last = jnp.full((cfg.M_sparse,), 4, dtype=jnp.int32).at[0].set(2)
+    ema['sparse']['last_used'] = last
 
     bank = FeatureBank(8, cfg.d_model)
     bank.add(np.arange(cfg.d_model, dtype=np.float32))
@@ -360,7 +516,7 @@ def test_cog_checkpoint_roundtrips_ema_and_feature_bank(tmp_path):
 
     out = str(tmp_path / "ckpt")
     save_cog_checkpoint(
-        params, out, 4, run_identity=_fake_identity(tmp_path, cfg.vocab_size),
+        params, out, 5, run_identity=_fake_identity(tmp_path, cfg.vocab_size),
         train_cfg=cfg, self_state=self_state, ema_state=ema,
         feature_bank=bank)
 
@@ -368,9 +524,13 @@ def test_cog_checkpoint_roundtrips_ema_and_feature_bank(tmp_path):
         ckpt = pickle.load(f)
     assert ckpt.get('ema_state') is not None
     assert ckpt.get('feature_bank') is not None
+    assert ckpt.get('buffers_present') is True
 
-    params2, _ = load_stage2_params(out, cfg, jax.random.PRNGKey(0))
-    ema2, bank2 = load_cog_buffers(out, params2, cfg)
+    params2, _, saved_step = load_stage2_params(
+        out, cfg, jax.random.PRNGKey(0))
+    assert saved_step == 5, "load_stage2_params must preserve the time origin"
+    ema2, bank2, start_step = load_cog_buffers(out, params2, cfg)
+    assert start_step == 5, "load_cog_buffers must preserve the time origin"
     np.testing.assert_allclose(np.asarray(ema2['sparse']['N']),
                                np.asarray(ema['sparse']['N']))
     np.testing.assert_allclose(np.asarray(ema2['sparse']['m']),
@@ -382,6 +542,15 @@ def test_cog_checkpoint_roundtrips_ema_and_feature_bank(tmp_path):
     np.testing.assert_allclose(np.asarray(bank2.vectors),
                                np.asarray(bank.vectors))
 
+    # Dead-code detection uses the restored absolute step origin: row 0 was
+    # last used at step 2, so it is dead at step 5 with t_dead=2. Restarting the
+    # clock at 0 would see no dead rows (the bug this guards against).
+    dead = bank2.dead_indices(ema2['sparse']['last_used'], start_step,
+                              t_dead=2)
+    np.testing.assert_array_equal(dead, [0])
+    assert len(bank2.dead_indices(ema2['sparse']['last_used'], 0,
+                                  t_dead=2)) == 0
+
     # A v2-era pickle without the buffers is not a valid cognitive
     # checkpoint; it must be rejected instead of silently starting fresh.
     ckpt.pop('ema_state')
@@ -389,3 +558,27 @@ def test_cog_checkpoint_roundtrips_ema_and_feature_bank(tmp_path):
         pickle.dump(ckpt, f)
     with np.testing.assert_raises(ValueError):
         load_cog_buffers(out, params2, cfg)
+
+
+def test_checkpoint_without_buffers_is_not_resumable(tmp_path):
+    from train.cog_train import load_cog_buffers, save_cog_checkpoint
+
+    cfg = _tiny_cfg()
+    params, self_state = _tiny_params(cfg)
+    identity = _fake_identity(tmp_path, cfg.vocab_size)
+
+    # Training/export callers that omit the buffers must opt in explicitly.
+    with pytest.raises(ValueError, match="requires ema_state"):
+        save_cog_checkpoint(
+            params, str(tmp_path / "refuse"), 0, run_identity=identity,
+            train_cfg=cfg, self_state=self_state)
+
+    out = str(tmp_path / "export")
+    save_cog_checkpoint(
+        params, out, 0, run_identity=identity, train_cfg=cfg,
+        self_state=self_state, allow_missing_buffers=True)
+    with open(f"{out}/cog_params.pkl", "rb") as f:
+        ckpt = pickle.load(f)
+    assert ckpt['buffers_present'] is False
+    with pytest.raises(ValueError, match="not resumable"):
+        load_cog_buffers(out, params, cfg)

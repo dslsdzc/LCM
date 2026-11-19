@@ -8,6 +8,7 @@ import argparse
 import json
 import os
 import pickle
+import warnings
 
 import jax
 import jax.numpy as jnp
@@ -15,8 +16,6 @@ import numpy as np
 import optax
 from tokenizers import Tokenizer
 
-from train.cog_loop import cog_loop_scan
-from train.cog_train import pack_codebooks_for_c
 from train.config import LCMConfig
 from train.encoder import encoder_forward
 from train.fusion import gen_head_forward
@@ -45,14 +44,15 @@ def normalize(x):
 
 def states(params, questions, cfg):
     encoded = encoder_forward(params['encoder'], questions, cfg.n_heads)
-    codebooks = pack_codebooks_for_c(params)
-    code_norm = jnp.sqrt(sum(jnp.mean(jnp.sum(c * c, axis=-1)) for c in codebooks) / len(codebooks))
-    encoded = encoded * (code_norm / (jnp.sqrt(jnp.mean(jnp.sum(encoded * encoded, axis=-1))) + 1e-8))
-    run = lambda value: cog_loop_scan(
-        value, codebooks, max_steps=cfg.max_inference_steps,
-        thresholds=None, tau=.5)[0][-1]
-    lattice = jax.vmap(run)(encoded)
-    return encoded, lattice
+    warnings.warn(
+        "eval_lattice_storage's lattice path predates the canonical "
+        "six-lattice loop; cog_loop_scan now takes (z, params, cfg), not a "
+        "flat codebook list.",
+        DeprecationWarning, stacklevel=2)
+    raise NotImplementedError(
+        "This evaluator was written against the retired generic-codebook "
+        "cog_loop_scan(z, codebooks, thresholds=..., tau=...). Port it to "
+        "cog_loop_scan(encoded, params, cfg, ...) before use.")
 
 
 def evaluate(params, cfg, questions, inputs, targets, masks):

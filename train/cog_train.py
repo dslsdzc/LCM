@@ -249,7 +249,8 @@ def load_stage2_params(resume, cfg, rng):
       2. .bin files (old) — loaded via checkpoint.load_checkpoint.
 
     Returns:
-        (params, self_state)
+        (params, self_state, step) — the saved absolute step is the time origin
+        of ``ema_state['last_used']`` and must be threaded back into training.
     """
     # Try new pickle format first (preserves self_state)
     pkl_path = os.path.join(resume, "cog_params.pkl")
@@ -263,7 +264,7 @@ def load_stage2_params(resume, cfg, rng):
         if self_state is None:
             self_state = init_self_state(cfg.n_self_codes, cfg.d_model)
         print(f"[COG] Loaded from cog_params.pkl (step {step})")
-        return params, self_state
+        return params, self_state, int(step)
 
     # Fallback: legacy .bin format — caller must supply --qwen-ckpt separately
     from train.checkpoint import load_checkpoint as bin_load
@@ -278,26 +279,32 @@ def load_stage2_params(resume, cfg, rng):
     print(f"[COG] Loaded Stage 2 checkpoint from {resume} (step {step})")
     print(f"      encoder + {len([k for k in params if k not in ('gen_head',)])} codebooks + "
           f"{'gen_head' if 'gen_head' in params else 'no'} gen_head")
-    return params, self_state
+    return params, self_state, int(step)
 
 
 def load_cog_buffers(resume, params, cfg):
-    """Load EMA state and feature bank, or initialise them for a fresh run.
+    """Load EMA state, feature bank and the saved step for a resume.
 
     These are buffers, not parameters: a resume that cannot restore them would
     silently restart the EMA statistics from zero, so the v2 checkpoint is
-    required to carry both (``load_cog_state(require_buffers=True)``).
+    required to carry both (``load_cog_state(require_buffers=True)``). The
+    saved step is returned because restored ``last_used`` values are absolute
+    step indices from the old run; the loop must continue from that origin, not
+    from 0.
     """
     if resume:
         pkl_path = os.path.join(resume, "cog_params.pkl")
-        if os.path.exists(pkl_path):
-            ckpt = load_cog_state(resume, require_buffers=True)
-            ema_state = jax.tree_util.tree_map(
-                lambda x: jnp.asarray(x), ckpt['ema_state'])
-            return ema_state, ckpt['feature_bank']
+        if not os.path.exists(pkl_path):
+            raise ValueError(
+                f"{resume} has no cog_params.pkl; only v2 cognitive "
+                f"checkpoints with EMA/feature-bank buffers are resumable")
+        ckpt = load_cog_state(resume, require_buffers=True)
+        ema_state = jax.tree_util.tree_map(
+            lambda x: jnp.asarray(x), ckpt['ema_state'])
+        return ema_state, ckpt['feature_bank'], int(ckpt.get('step', 0))
 
     return (init_ema_state(params, cfg),
-            FeatureBank(cfg.bank_capacity, cfg.d_model))
+            FeatureBank(cfg.bank_capacity, cfg.d_model), 0)
 
 
 # ─── Init full params ───────────────────────────────────────────────────────
@@ -344,7 +351,7 @@ def init_cog_params(cfg, rng, qwen_ckpt=None, resume=None):
     d = cfg.d_model
 
     if resume:
-        params, self_state = load_stage2_params(resume, cfg, rng)
+        params, self_state, _ = load_stage2_params(resume, cfg, rng)
         # A checkpoint carrying W_out predates the tied readout. It is not
         # migrated: W_out was a second token table trained against a different
         # token space, so resuming it would silently mix the two.
@@ -509,7 +516,7 @@ def _apply_ema_updates(ema, ema_state, stats, cfg, step):
     if 'binding' in ema:
         binding, state = ema_update_binding(
             ema['binding'], ema_state['binding'], stats['binding_residuals'],
-            cfg.gamma_bind, step=step)
+            stats['binding_indices'], cfg.gamma_bind, step=step)
         new_ema['binding'] = binding
         new_state['binding'] = state
 
@@ -764,6 +771,8 @@ def _host_bank_update(params, ema_state, feature_bank, step, cfg):
     """
     if 'sparse' not in ema_state or 'sparse' not in params:
         return params, ema_state
+    if len(feature_bank) == 0:
+        return params, ema_state
     state = ema_state['sparse']
     dead = feature_bank.dead_indices(
         state['last_used'], step, cfg.bank_dead_threshold)
@@ -829,7 +838,10 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     rng, init_rng = jax.random.split(rng)
     params, self_state = init_cog_params(cfg, init_rng, qwen_ckpt=qwen_ckpt,
                                           resume=resume)
-    ema_state, feature_bank = load_cog_buffers(resume, params, cfg)
+    ema_state, feature_bank, start_step = load_cog_buffers(resume, params, cfg)
+    # Restored last_used values are absolute step indices from the old run, so
+    # the loop continues from the saved step rather than restarting its clock.
+    step = start_step
 
     # 5. Assert the actual tensors, do not assume init did the right thing.
     verify_tied_table(params, meta, cfg)
@@ -914,7 +926,8 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
         sup = Supervisor(output_dir, cfg, enable_auto=True,
                          val_data_path=data_path, val_shape_path=shape_path)
 
-    for step in range(steps):
+    for offset in range(steps):
+        step = start_step + offset
         batch = next(data_iter)
         current_lr = schedule(step)
         rng, step_rng = jax.random.split(rng)
@@ -953,11 +966,15 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
 
         # Feature bank: collect the state the lattices quantised this step;
         # every bank_check_interval steps replace dead sparse rows on the host.
-        loop_stats = aux_out.get('loop_stats')
-        if loop_stats is not None and 'z_in' in loop_stats:
-            feature_bank.add(np.asarray(loop_stats['z_in']))
+        # TODO(Task 6): schedule FeatureBank.replace_dead_contrast here once
+        # contrast_forward exposes per-layer indices (R21).
         interval = cfg.bank_check_interval
         if interval > 0 and step > 0 and step % interval == 0:
+            loop_stats = aux_out.get('loop_stats')
+            if loop_stats is not None and 'z_in' in loop_stats:
+                # Host conversion happens only at the interval, not every step
+                # (a per-step np.asarray forces a device sync).
+                feature_bank.add(np.asarray(loop_stats['z_in']))
             params, ema_state = _host_bank_update(
                 params, ema_state, feature_bank, step, cfg)
 
@@ -990,14 +1007,17 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
 
     pbar.close()
     pbar.refresh()
-    final_dir = os.path.join(output_dir, f"step_{steps:06d}")
-    save_cog_checkpoint(params, final_dir, steps, self_state=self_state,
+    final_step = start_step + steps
+    final_dir = os.path.join(output_dir, f"step_{final_step:06d}")
+    save_cog_checkpoint(params, final_dir, final_step, self_state=self_state,
                         ema_state=ema_state, feature_bank=feature_bank,
                         run_identity=run_identity, train_cfg=cfg)
     if sup and sup.best_params is not None:
         sup.save_best(sup.best_params, sup.best_opt_state, sup.best_step,
                       self_state=self_state, run_identity=run_identity,
-                      ema_state=sup.best_ema_state,
+                      ema_state=(sup.best_ema_state
+                                 if sup.best_ema_state is not None
+                                 else ema_state),
                       feature_bank=feature_bank)
     print(f"[COG] Training complete → {output_dir}/")
 
@@ -1078,7 +1098,8 @@ def _flatten_params_for_manifest(params):
 
 
 def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
-                        self_state=None, ema_state=None, feature_bank=None):
+                        self_state=None, ema_state=None, feature_bank=None,
+                        allow_missing_buffers=False):
     """Save full checkpoint + export codebooks + tied readout for C engine.
 
     run_identity is required: the checkpoint must record the tokenizer and
@@ -1087,8 +1108,12 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
     which reshapes attention by n_heads.
 
     ``ema_state`` and ``feature_bank`` are buffers: they live next to
-    ``self_state`` in cog_params.pkl. When omitted (test/export callers that do
-    not train) they are written as a fresh zeroed state, never dropped.
+    ``self_state`` in cog_params.pkl. Training must pass them. Export/test
+    callers that do not train must opt in explicitly with
+    ``allow_missing_buffers=True``; that records ``buffers_present=False`` and
+    the checkpoint can never be resumed (``load_cog_state`` rejects it). This
+    is deliberate: fabricating zeroed buffers would look resumable while
+    silently restarting the EMA statistics.
     """
     import json, os, pickle, struct, hashlib, zlib
     import numpy as _np
@@ -1106,10 +1131,12 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
             f"model_vocab_size={_meta['model_vocab_size']}")
     os.makedirs(output_dir, exist_ok=True)
 
-    if ema_state is None:
-        ema_state = init_ema_state(params, train_cfg)
-    if feature_bank is None:
-        feature_bank = FeatureBank(train_cfg.bank_capacity, train_cfg.d_model)
+    buffers_present = ema_state is not None and feature_bank is not None
+    if not buffers_present and not allow_missing_buffers:
+        raise ValueError(
+            "save_cog_checkpoint requires ema_state and feature_bank for a "
+            "resumable checkpoint; pass allow_missing_buffers=True only for "
+            "export/test checkpoints that must not be resumed")
 
     # Exclude the frozen Qwen weights from the pickle (≈2GB): they are
     # reloaded from the .npz on demand (see _load_qwen_checkpoint). The
@@ -1117,7 +1144,8 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
     save_params = {k: v for k, v in params.items() if k != 'qwen'}
     save_cog_state(output_dir, params=save_params, step=step,
                    self_state=self_state, ema_state=ema_state,
-                   feature_bank=feature_bank)
+                   feature_bank=feature_bank,
+                   buffers_present=buffers_present)
 
     # ── C推理引擎输出格式 ──────────────────────────────────────────────
 

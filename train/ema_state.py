@@ -24,6 +24,17 @@ would come back at ``(1-gamma)*z`` instead. Rows with ``N == 0`` keep their
 existing vector (a row that was never assigned is not evidence that its vector
 is zero). This is what makes the 100-step variance check possible.
 
+The two recursions are the same estimator up to a global factor. If
+``(N_ref, m_ref)`` is b.md's state, ours is
+``(N, m) = (N_ref, m_ref) / (1-gamma)``: both updates are linear and the two
+forms differ by exactly that factor, which cancels in ``m / N``. For a warm row
+(``N >= 1``) the clip is the same in both. For a cold row the first assignment
+gives ``N=count, m=z_sum`` here versus ``(1-gamma)*count, (1-gamma)*z_sum`` in
+b.md; the ratio is ``z_sum/count`` in both, which is the observation itself for
+a single selected row. We keep the un-scaled form so the feature bank's zeroed
+cold start is exact and so an untouched row is not divided by a sub-1 clip.
+``test_decayed_sum_form_matches_bmd_scaled_form`` pins the warm-row equivalence.
+
 Manifold coordinates are tangent space by construction: ``manifold_forward``
 calls ``exp_map`` on them, so the EMA must not apply ``exp_map`` here. The
 "reprojection after EMA" in the specification is exactly this equivalence: the
@@ -125,13 +136,8 @@ def ema_update_manifold(C, state, z, idx, gamma, step=None):
     return C_new, _rebuild_state(N, m, last_used)
 
 
-def _binding_indices(residual, C):
-    """Nearest code per batch row in the space the codebook quantises."""
-    dist2 = jnp.sum((residual[:, None, :] - C[None, :, :]) ** 2, axis=-1)
-    return jnp.argmin(dist2, axis=-1).astype(jnp.int32)
-
-
-def ema_update_binding(params_binding, state, residuals, gamma, step=None):
+def ema_update_binding(params_binding, state, residuals, indices, gamma,
+                       step=None):
     """EMA for the three binding codebook families, every layer.
 
     Args:
@@ -141,6 +147,11 @@ def ema_update_binding(params_binding, state, residuals, gamma, step=None):
         residuals: ``{'key': [r_0, ...], 'val': [...], 'bind': [...]}``, the
             per-layer query vectors returned by ``binding_forward``. Each is
             ``(B, d)``.
+        indices: the per-layer rows ``binding_forward`` actually selected,
+            same family/layer layout. They are **not** recomputed here: under a
+            nonzero ``value_scalars`` the forward picks by value-biased score,
+            and a plain Euclidean argmin would write the EMA into a row the
+            forward never quantised.
         gamma: EMA decay.
         step: optional training step recorded in ``last_used``.
 
@@ -157,18 +168,21 @@ def ema_update_binding(params_binding, state, residuals, gamma, step=None):
         key = f'{family}_cb'
         entries = params_binding[key]
         family_residuals = residuals[family]
+        family_indices = indices[family]
         family_state = state[family]
-        if not (len(entries) == len(family_residuals) == len(family_state)):
+        if not (len(entries) == len(family_residuals)
+                == len(family_indices) == len(family_state)):
             raise ValueError(
                 f"binding {family}: {len(entries)} codebooks, "
                 f"{len(family_residuals)} residuals, "
+                f"{len(family_indices)} indices, "
                 f"{len(family_state)} states")
 
         new_entries, new_family_state = [], []
-        for entry, residual, entry_state in zip(
-                entries, family_residuals, family_state):
+        for entry, residual, selected, entry_state in zip(
+                entries, family_residuals, family_indices, family_state):
             C = entry['A'] @ entry['W']
-            idx = _binding_indices(residual, C)
+            idx = jnp.asarray(selected, dtype=jnp.int32)
             C_new, N, m = _ema(C, entry_state, residual, idx, gamma)
             d = C_new.shape[-1]
             new_entries.append({'A': C_new, 'W': jnp.eye(d, dtype=C_new.dtype)})

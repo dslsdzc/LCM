@@ -176,8 +176,8 @@ def cog_loop_scan(z, params, cfg, max_steps=None, rng=None,
         diffs: (max_steps, B) — stepwise delta ‖z_{t+1} - z_t‖.
         entropies: (max_steps, B) — stepwise fusion entropy, in nats.
         stats: only when return_stats=True — dict with per-step ``z_in``,
-            ``hrq_idx``, ``sparse_idx``, ``man_idx`` and
-            ``binding_residuals`` (each stacked along axis 0).
+            ``hrq_idx``, ``sparse_idx``, ``man_idx``, ``binding_residuals``
+            and ``binding_indices`` (each stacked along axis 0).
     """
     from jax import lax
 
@@ -201,6 +201,7 @@ def cog_loop_scan(z, params, cfg, max_steps=None, rng=None,
             'sparse_idx': aux['sparse_idx'],
             'man_idx': aux['man_idx'],
             'binding_residuals': aux['binding_residuals'],
+            'binding_indices': aux['binding_indices'],
         }
         return z_next, (z_next, diff, aux['entropy'], stats)
 

@@ -101,7 +101,7 @@ def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
     # binding_forward quantises against the shared low-rank base V, derived
     # from lowrank's own factors rather than stored separately.
     V = params['lowrank']['A_V'] @ params['lowrank']['W_V']
-    o_binding, binding_residuals = binding_forward(
+    o_binding, binding_residuals, binding_indices = binding_forward(
         params['binding'], z, V,
         value_scalars=vs.get('binding'), alpha_val=alpha_val)
     o_contrast = contrast_forward(
@@ -133,5 +133,8 @@ def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
         # each binding codebook actually quantises, and therefore the space its
         # EMA must accumulate.
         'binding_residuals': binding_residuals,
+        # Rows selected by this forward. Under value bias these differ from a
+        # plain Euclidean argmin, so EMA must not recompute them.
+        'binding_indices': binding_indices,
     }
     return z_next, aux

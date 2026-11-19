@@ -4,7 +4,7 @@ Qwen is used only to build soft language targets.  Gradients update the LCM
 encoder/lattices and its active generation head.  The saved checkpoint contains
 no Qwen tensors, so evaluation is a genuine student-only inference path.
 """
-import argparse, dataclasses, json, os, pickle
+import argparse, dataclasses, json, os, pickle, warnings
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -16,8 +16,6 @@ from train.encoder import init_encoder_params, encoder_forward
 from train.lattices import (init_hrq_params, init_sparse_params,
     init_lowrank_params, init_manifold_params, init_binding_params,
     init_contrast_params)
-from train.cog_loop import cog_loop_scan
-from train.cog_train import pack_codebooks_for_c
 from train.fusion import init_gen_head_params, gen_head_forward
 from train.qwen_lm import load_qwen_params, qwen_forward
 
@@ -74,19 +72,18 @@ def init_student(cfg, key, vocab):
 
 def z_state(p,q,cfg,mode='residual'):
     z=encoder_forward(p['encoder'],q,cfg.n_heads)
-    cbs=pack_codebooks_for_c(p)
-    cn=jnp.sqrt(sum(jnp.mean(jnp.sum(c*c,axis=-1)) for c in cbs)/len(cbs))
-    z=z*(cn/(jnp.sqrt(jnp.mean(jnp.sum(z*z,axis=-1)))+1e-8))
-    fn=lambda x: cog_loop_scan(x,cbs,max_steps=cfg.max_inference_steps,
-                               thresholds=None,tau=0.5)[0][-1]
     if mode == 'encoder_only':
         return z/(jnp.sqrt(jnp.mean(z*z,axis=-1,keepdims=True))+1e-6)
-    z_loop=jax.vmap(fn)(z)
-    if mode == 'lattice_only':
-        return z_loop/(jnp.sqrt(jnp.mean(z_loop*z_loop,axis=-1,keepdims=True))+1e-6)
-    # Preserve prompt identity while retaining the deliberated lattice state.
-    out=z+z_loop
-    return out/(jnp.sqrt(jnp.mean(out*out,axis=-1,keepdims=True))+1e-6)
+    warnings.warn(
+        "z_state's lattice modes predate the canonical six-lattice loop; "
+        "cog_loop_scan now takes (z, params, cfg) and full lattice params, "
+        "not a flat codebook list.",
+        DeprecationWarning, stacklevel=2)
+    raise NotImplementedError(
+        "This caller was written against the retired generic-codebook "
+        "cog_loop_scan(z, codebooks, thresholds=..., tau=...). Port it to "
+        "cog_loop_scan(z, params, cfg, ...) / model.forward before use; the "
+        "codebook-list path no longer exists.")
 
 
 def teacher_targets(rows,tok,gids,qwen_path,cache,max_a=24):

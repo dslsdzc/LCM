@@ -392,7 +392,7 @@ def test_export_roundtrip_through_lcm():
     out = tempfile.mkdtemp(prefix="lcm_export_")
     save_cog_checkpoint(params, out, 1, self_state=self_state,
                         run_identity=_fake_run_identity(out, cfg.vocab_size),
-                        train_cfg=cfg)
+                        train_cfg=cfg, allow_missing_buffers=True)
 
     for fname in ["hrq_codebook.bin", "sparse_codebook.bin",
                   "manifold_codebook.bin", "gvalue_codebook.bin",

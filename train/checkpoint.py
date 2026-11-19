@@ -260,18 +260,24 @@ def _to_host(x):
 
 
 def save_cog_state(output_dir, *, params, step, self_state=None,
-                   ema_state=None, feature_bank=None):
+                   ema_state=None, feature_bank=None, buffers_present=None):
     """Write ``cog_params.pkl``: params plus the non-parameter buffers.
 
     Schema v2: EMA state (N/m/last_used) and the feature bank live next to
     ``self_state`` in the same pickle, because they are runtime state of the
     same training run. They are never parameters and never enter the optimizer.
-    A checkpoint written before this schema is rejected by ``load_cog_state``
-    when a training resume asks for the buffers.
+
+    ``buffers_present`` is recorded explicitly. A checkpoint written by an
+    export/test caller with ``allow_missing_buffers=True`` stores ``False`` and
+    can never be mistaken for a resumable training checkpoint: fabricating
+    zeroed buffers would silently restart the EMA statistics on resume.
     """
     os.makedirs(output_dir, exist_ok=True)
+    if buffers_present is None:
+        buffers_present = ema_state is not None and feature_bank is not None
     payload = {
         'format_version': FORMAT_VERSION,
+        'buffers_present': bool(buffers_present),
         'step': step,
         'params': jax.tree_util.tree_map(_to_host, params),
         'self_state': jax.tree_util.tree_map(_to_host, self_state)
@@ -290,8 +296,11 @@ def load_cog_state(output_dir, require_buffers=False):
     """Read ``cog_params.pkl`` and optionally enforce the v2 buffer schema.
 
     ``require_buffers=True`` is the training-resume path: a checkpoint without
-    ``ema_state``/``feature_bank`` cannot be continued without silently
-    restarting the EMA statistics, so it is rejected.
+    ``format_version=2`` or without ``buffers_present=True`` cannot be
+    continued without silently restarting the EMA statistics, so it is
+    rejected. The legacy (version-less) read is retained only for callers that
+    are not resuming training, because older test fixtures and the W_out
+    rejection path still read their hand-written pickles through it.
     """
     path = os.path.join(output_dir, COG_STATE_FILE)
     with open(path, 'rb') as f:
@@ -299,17 +308,26 @@ def load_cog_state(output_dir, require_buffers=False):
     if not isinstance(ckpt, dict) or 'params' not in ckpt:
         raise ValueError(f"{path} is not a cognitive checkpoint")
     version = ckpt.get('format_version')
-    if version is not None and version != FORMAT_VERSION:
+    if version is None:
+        if require_buffers:
+            raise ValueError(f"{path}: {OLD_FORMAT_ERROR} "
+                             f"(no format_version; training resume requires v2)")
+    elif version != FORMAT_VERSION:
         raise ValueError(f"{path}: {OLD_FORMAT_ERROR} "
                          f"(format_version={version!r}, expected "
                          f"{FORMAT_VERSION})")
     if require_buffers:
+        if ckpt.get('buffers_present') is not True:
+            raise ValueError(
+                f"{path} was written without EMA/feature-bank buffers "
+                f"(buffers_present={ckpt.get('buffers_present')!r}); it is not "
+                f"resumable — re-export from a training run")
         missing = [key for key in ('ema_state', 'feature_bank')
                    if ckpt.get(key) is None]
         if missing:
             raise ValueError(
-                f"{path} is missing {missing}; this checkpoint predates the "
-                f"EMA/feature-bank schema and cannot be resumed")
+                f"{path} claims buffers_present but is missing {missing}; "
+                f"re-export required")
     return ckpt
 
 

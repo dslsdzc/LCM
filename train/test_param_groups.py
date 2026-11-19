@@ -126,6 +126,7 @@ def test_frozen_constants_stay_out_of_the_optimizer_tree():
     p = {
         'encoder': {'w': jnp.ones((2, 2))},
         'sparse': {'C': jnp.ones((4, 2)), 'zero_vec': jnp.zeros((1, 2))},
+        'self': {'core': jnp.ones(2), 'modes': jnp.ones((4, 2))},
         'danger': {'C': jnp.ones((4, 2))},
         'qwen': {'model.embed_tokens.weight': jnp.ones((3, 2))},
         'z_proj': None,
@@ -135,6 +136,9 @@ def test_frozen_constants_stay_out_of_the_optimizer_tree():
     assert 'zero_vec' not in em['sparse']
     assert 'zero_vec' in fr['sparse']
     assert 'danger' in fr and 'danger' not in tr
+    # self_lattice documents core as permanently frozen; only modes train.
+    assert 'core' in fr['self'] and 'core' not in tr.get('self', {})
+    assert 'modes' in tr['self'] and 'modes' not in fr['self']
     # The frozen Qwen bridge is ~2 GB and must never enter AdamW.
     assert 'qwen' in fr and 'qwen' not in tr
     assert 'z_proj' not in tr and 'z_proj' in fr
