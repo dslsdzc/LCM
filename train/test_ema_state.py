@@ -397,6 +397,15 @@ def test_train_step_separates_ema_from_adamw_and_updates_ema():
         if aux.get('self_state') is not None:
             self_state = aux['self_state']
 
+    # The state clock is absolute: a resumed offset-0 step carries abs_step=5,
+    # so `last_used` must be stamped 5, not 0.
+    params, opt_state, ema, _, aux = train_step(
+        params, opt_state, ema, batch, 1e-2, jax.random.PRNGKey(99),
+        self_state=self_state, step=5)
+    selected = np.asarray(aux['loop_stats']['sparse_idx'])
+    np.testing.assert_array_equal(
+        np.asarray(ema['sparse']['last_used'])[selected], 5)
+
     # EMA statistics keep accumulating across steps (the pass really ran).
     assert float(jnp.sum(ema['sparse']['N'])) > 0.0
     assert not np.array_equal(np.asarray(ema['sparse']['N']),
@@ -558,6 +567,48 @@ def test_cog_checkpoint_roundtrips_ema_and_feature_bank(tmp_path):
         pickle.dump(ckpt, f)
     with np.testing.assert_raises(ValueError):
         load_cog_buffers(out, params2, cfg)
+
+
+def test_resume_loop_clock_policy_a_and_guards():
+    """Offset drives schedule/log/save/bank; abs_step drives state only."""
+    from train.cog_train import _lr_decay_steps, _resume_loop_plan
+
+    plan = _resume_loop_plan(start_step=5, steps=3, save_every=2,
+                             log_every=1, bank_check_interval=2)
+    assert [p['offset'] for p in plan] == [0, 1, 2]
+    assert [p['abs_step'] for p in plan] == [5, 6, 7]
+    # The first new step (offset 0) is the resume point: never re-save it.
+    assert plan[0]['save'] is False
+    assert plan[1]['save'] is False and plan[2]['save'] is True
+    assert plan[0]['log'] is False
+    assert plan[1]['log'] is True and plan[2]['log'] is True
+    assert plan[0]['bank'] is False
+    assert plan[1]['bank'] is False and plan[2]['bank'] is True
+
+    # Regression shape: start_step is itself a multiple of every guard. Absolute
+    # guards would save `step_000005`/log/check the bank on the first new step.
+    risky = _resume_loop_plan(start_step=5, steps=2, save_every=5,
+                              log_every=5, bank_check_interval=5)
+    assert risky[0]['abs_step'] == 5
+    assert not (risky[0]['save'] or risky[0]['log'] or risky[0]['bank'])
+    assert risky[1]['abs_step'] == 6
+
+    # Policy A: continue the original cosine curve over the extended horizon.
+    # At the first resumed step the LR is above the alpha=0.1 floor.
+    init = 1e-3
+    assert _lr_decay_steps(5, 3) == 8
+    schedule = optax.cosine_decay_schedule(
+        init_value=init, decay_steps=_lr_decay_steps(5, 3), alpha=0.1)
+    first_lr = float(schedule(plan[0]['abs_step']))
+    assert first_lr > 0.1 * init + 1e-12
+
+    # Dead-code detection uses the absolute clock: a row last used at step 2 is
+    # dead at the resumed first step 5 with t_dead=2, but not at offset 0.
+    bank = FeatureBank(4, 2)
+    last = jnp.array([2, 4], dtype=jnp.int32)
+    np.testing.assert_array_equal(
+        bank.dead_indices(last, plan[0]['abs_step'], t_dead=2), [0])
+    assert len(bank.dead_indices(last, plan[0]['offset'], t_dead=2)) == 0
 
 
 def test_checkpoint_without_buffers_is_not_resumable(tmp_path):

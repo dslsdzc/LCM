@@ -790,6 +790,49 @@ def _host_bank_update(params, ema_state, feature_bank, step, cfg):
     return new_params, new_ema
 
 
+def _lr_decay_steps(start_step, steps):
+    """Policy A: a resumed run continues the original cosine curve.
+
+    ``train_cog(steps=N)`` means N *new* steps; the decay horizon is the
+    absolute end of the extended run, ``start_step + N``. A resumed run at
+    ``start_step >= N`` therefore does not pin at the ``alpha=0.1`` floor.
+    """
+    return start_step + steps
+
+
+def _resume_loop_plan(start_step, steps, save_every, log_every,
+                      bank_check_interval):
+    """Per-step clocks and guards for a (possibly resumed) training loop.
+
+    Two clocks, deliberately separate:
+
+    * ``offset`` (loop-relative, ``0..steps-1``) drives the LR schedule, the
+      log/save/bank-interval guards and loss averaging.
+    * ``abs_step = start_step + offset`` is the *state* clock: EMA
+      ``last_used``/dead-code detection and checkpoint directory names.
+
+    A saved step is not a multiple of every guard by construction, so mixing the
+    clocks made the first resumed step overwrite ``step_{start_step}`` and
+    diluted the first log average. Kept pure so this can be tested without
+    running the jitted step.
+    """
+    plan = []
+    for offset in range(steps):
+        plan.append({
+            'offset': offset,
+            'abs_step': start_step + offset,
+            # `offset > 0` keeps the first new step from re-saving the
+            # checkpoint it was resumed from (and matches the old step-0 skip).
+            'save': (save_every > 0 and offset > 0
+                     and offset % save_every == 0),
+            'log': (log_every > 0 and offset > 0
+                    and offset % log_every == 0),
+            'bank': (bank_check_interval > 0 and offset > 0
+                     and offset % bank_check_interval == 0),
+        })
+    return plan
+
+
 def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
               seq_len=256, log_every=100, save_every=1000,
               data_path=None, shape_path=None, spans_path=None,
@@ -847,8 +890,12 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     verify_tied_table(params, meta, cfg)
     verify_qwen_extent(params, meta)
 
+    # Policy A: continue the original cosine curve across a resume. The horizon
+    # is the absolute end of the extended run; `schedule(abs_step)` is below the
+    # alpha floor only at that end, never merely because start_step >= steps.
     schedule = optax.cosine_decay_schedule(
-        init_value=lr, decay_steps=steps, alpha=0.1)
+        init_value=lr, decay_steps=_lr_decay_steps(start_step, steps),
+        alpha=0.1)
     # learning_rate=1.0, deliberately not `schedule`. A schedule bound here is
     # stored inside opt_state and cannot be varied per step, which made
     # train_step's `lr` argument dead code: the Supervisor's "LR reduced" line
@@ -904,8 +951,11 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     print()
 
     running_loss = 0.0
+    logged_steps = 0
     start_time = time.time()
     pbar = tqdm(total=steps, desc="cog training", unit="step", file=sys.stderr, mininterval=0.5)
+    plan = _resume_loop_plan(start_step, steps, save_every, log_every,
+                             cfg.bank_check_interval)
 
     import signal as _signal
 
@@ -926,10 +976,14 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
         sup = Supervisor(output_dir, cfg, enable_auto=True,
                          val_data_path=data_path, val_shape_path=shape_path)
 
-    for offset in range(steps):
-        step = start_step + offset
+    for item in plan:
+        # item['offset'] is loop-relative (schedule/log/save/bank guards);
+        # abs_step is the state clock (EMA last_used, dead-code detection,
+        # checkpoint names). Never use one for the other.
+        abs_step = item['abs_step']
+        step = abs_step
         batch = next(data_iter)
-        current_lr = schedule(step)
+        current_lr = schedule(abs_step)
         rng, step_rng = jax.random.split(rng)
 
         # Shallow backups: train_step returns fresh trees, never mutates these.
@@ -939,7 +993,7 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
         if sup:
             params, opt_state, loss_val, aux_out = sup.step(
                 train_step, params, opt_state, batch, current_lr, step_rng,
-                step=step, self_state=self_state, ema_state=ema_state)
+                step=abs_step, self_state=self_state, ema_state=ema_state)
             # Supervisor keeps its historical 4-tuple and carries the EMA state
             # through aux, so its rollback path stays compatible with callers
             # that only know params/opt_state.
@@ -947,7 +1001,7 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
         else:
             params, opt_state, ema_state, loss_val, aux_out = train_step(
                 params, opt_state, ema_state, batch, current_lr, step_rng,
-                self_state=self_state, step=step)
+                self_state=self_state, step=abs_step)
 
         # Update self state from forward pass
         if self_state is not None and aux_out.get('self_state') is not None:
@@ -964,43 +1018,50 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
             pbar.update(1)
             continue
 
-        # Feature bank: collect the state the lattices quantised this step;
-        # every bank_check_interval steps replace dead sparse rows on the host.
+        # Feature bank: collect at the check interval (loop-relative guard);
+        # dead detection uses the absolute state clock.
         # TODO(Task 6): schedule FeatureBank.replace_dead_contrast here once
         # contrast_forward exposes per-layer indices (R21).
-        interval = cfg.bank_check_interval
-        if interval > 0 and step > 0 and step % interval == 0:
+        if item['bank']:
             loop_stats = aux_out.get('loop_stats')
             if loop_stats is not None and 'z_in' in loop_stats:
                 # Host conversion happens only at the interval, not every step
                 # (a per-step np.asarray forces a device sync).
                 feature_bank.add(np.asarray(loop_stats['z_in']))
             params, ema_state = _host_bank_update(
-                params, ema_state, feature_bank, step, cfg)
+                params, ema_state, feature_bank, abs_step, cfg)
 
-        # Save checkpoint (only with a clean step — never on poisoned params)
-        if save_every > 0 and step % save_every == 0 and step > 0:
-            ckpt_dir = os.path.join(output_dir, f"step_{step:06d}")
-            save_cog_checkpoint(params, ckpt_dir, step, self_state=self_state,
+        # Save checkpoint (only with a clean step — never on poisoned params).
+        # The guard is loop-relative so resuming at step 5 with save_every=2
+        # does not immediately overwrite step_000005; the name is absolute.
+        if item['save']:
+            ckpt_dir = os.path.join(output_dir, f"step_{abs_step:06d}")
+            save_cog_checkpoint(params, ckpt_dir, abs_step,
+                                self_state=self_state,
                                 ema_state=ema_state, feature_bank=feature_bank,
                                 run_identity=run_identity, train_cfg=cfg)
 
         running_loss += loss_f
+        logged_steps += 1
 
-        if step % log_every == 0 and step > 0:
-            avg_loss = running_loss / log_every
+        if item['log']:
+            # Average over the steps actually accumulated since the last log,
+            # not blindly over log_every (the first resumed log starts from
+            # offset 0 and would otherwise be divided by too large a number).
+            avg_loss = running_loss / logged_steps
             elapsed = time.time() - start_time
-            tok_s = batch_size * seq_len * log_every / elapsed
+            tok_s = batch_size * seq_len * logged_steps / elapsed
             loss_self = float(aux_out.get('loss_self', 0.0))
             gap = avg_loss - _LOSS_FLOOR
-            parts = [f"  step {step:>6d} | loss={avg_loss:.4f}  gap={gap:.2f}"]
+            parts = [f"  step {abs_step:>6d} | loss={avg_loss:.4f}  gap={gap:.2f}"]
             if loss_self > 0:
                 parts.append(f"self={loss_self:.6f}")
             parts.append(f"lr={current_lr:.2e} | {tok_s:.0f} tok/s")
             tqdm.write(" | ".join(parts))
             if sup:
-                sup.report(step)
+                sup.report(abs_step)
             running_loss = 0.0
+            logged_steps = 0
             start_time = time.time()
 
         pbar.update(1)
