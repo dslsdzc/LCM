@@ -20,10 +20,13 @@ Verified contracts (one proof per bullet):
     P4  threat type is always a valid enum value
 
   gvalue_check_safety
-    P5  safe ⇒  pos_d_min ≤ neg_d_min - safety_margin
-    P6 ¬safe ⇒  pos_d_min > neg_d_min - safety_margin
+    P5  safe ⇒  balance ≤ -safety_margin
+    P6 ¬safe ⇒  balance > -safety_margin
     P7  violated_law ∈ {-1, 0, 1, 2, 3}
     P8  safe ⇔  violated_law = -1
+    P5b neutral input is safe at margin 0
+    P5c neutral input is unsafe at margin > 0
+    P5d balance = (pos_sim - neg_sim)/(pos_sim + neg_sim + ε) ∈ [-1, 1]
 
   detect_any_conflict
     P9  returns true  ⇔  danger blocks ∨ gvalue unsafe ∨ consistency < threshold
@@ -136,14 +139,17 @@ def implies(a: BoolRef, b: BoolRef) -> BoolRef:
 #     1. retrieval_count > MAX_RETRIEVALS → THREAT_RESOURCE_ABUSE, score=1.0
 #     2. step_count > MAX_STEPS          → THREAT_RUNAWAY,        score=1.0
 #     3. value_consistency < 0.3         → THREAT_DECEPTION, score=2.0-val
-#     4. danger_score > SAFETY_THRESHOLD → THREAT_PATTERN_MATCH,  score=danger_score
-#     5. otherwise                       → THREAT_NONE,           score=danger_score
+#     4. relative_gap > SAFETY_THRESHOLD → THREAT_PATTERN_MATCH,  score=relative_gap
+#     5. otherwise                       → THREAT_NONE,           score=relative_gap
+#
+#   relative_gap = (sim_normal - sim_threat) / (sim_normal + sim_threat + ε)
+#   is the R7 bounded quantity; equal similarities give 0 (not blocked).
 
 def model_danger_assess(
     retrieval_count: ArithRef,
     step_count: ArithRef,
     value_consistency: ArithRef,
-    danger_score: ArithRef,
+    relative_gap: ArithRef,
 ) -> tuple[BoolRef, ArithRef, ArithRef]:
     """Abstract model of danger_assess logic.
 
@@ -156,7 +162,7 @@ def model_danger_assess(
     # Condition 3: deception
     c3 = And(Not(c1), Not(c2), value_consistency < CONSISTENCY_THRESHOLD)
     # Condition 4: pattern match
-    c4 = And(Not(c1), Not(c2), Not(c3), danger_score > SAFETY_THRESHOLD)
+    c4 = And(Not(c1), Not(c2), Not(c3), relative_gap > SAFETY_THRESHOLD)
 
     out_block = Or(c1, c2, c3, c4)
 
@@ -170,7 +176,7 @@ def model_danger_assess(
         c1, RealVal("1.0"),
         If(c2, RealVal("1.0"),
            If(c3, RealVal("2.0") - value_consistency,
-              danger_score)))  # c4 or none → danger_score
+              relative_gap)))  # c4 or none → relative_gap
 
     return out_block, out_threat, out_score
 
@@ -181,7 +187,7 @@ def verify_danger_assess() -> None:
     rc = Int("retrieval_count")
     sc = Int("step_count")
     vc = Real("value_consistency")
-    ds = Real("danger_score")
+    ds = Real("relative_gap")
 
     # Precondition constraints
     pre = And(rc >= 0, sc >= 0)
@@ -237,44 +243,52 @@ def verify_danger_assess() -> None:
 #     bool gvalue_check_safety(const gvalue_t* gv, const float* z,
 #                               float safety_margin, int* out_violated_law);
 #
-#   Contract (from gvalue.c lines 53-88):
+#   Contract (from gvalue.c):
 #     Pre:  gv initialized & verified, safety_margin >= 0
-#     Post: returns true  ⇔  pos_d_min ≤ neg_d_min - safety_margin
-#           returns false ⇔  pos_d_min > neg_d_min - safety_margin
-#           *out_violated_law = argmin of margin over law pairs when unsafe
+#     Post: imbalanced similarity domain:
+#           balance = (pos_sim - neg_sim) / (pos_sim + neg_sim + 1e-8)
+#           returns true  ⇔  balance ≤ -safety_margin
+#           returns false ⇔  balance > -safety_margin
+#           *out_violated_law = argmin of -balance over law pairs when unsafe
 #           *out_violated_law = -1 when safe
 
 def model_gvalue_check_safety(
-    pair_pos: list,
-    pair_neg: list,
+    pair_pos_sim: list,
+    pair_neg_sim: list,
     safety_margin: ArithRef,
 ) -> tuple[BoolRef, ArithRef]:
     """Abstract model of gvalue_check_safety（gvalue.c 真实语义）.
 
     Args:
-        pair_pos: N_VALUE_PAIRS 个律对的 positive 距离 d_pos[i]。
-        pair_neg: N_VALUE_PAIRS 个律对的 negative 距离 d_neg[i]。
+        pair_pos_sim: N_VALUE_PAIRS 个 positive 相似度 s_pos[i]。
+        pair_neg_sim: N_VALUE_PAIRS 个 negative 相似度 s_neg[i]。
         safety_margin: 安全余量 (>= 0)。
 
     Returns:
         (safe, violated_law)。
-        safe ⇔ pos_d_min ≤ neg_d_min - safety_margin（含等号，等号安全，
-        与 gvalue.c 的 `pos_d_min > neg_d_min - safety_margin → unsafe` 一致）。
-        unsafe 时 violated_law = argmin_i (d_pos_i - (d_neg_i - margin))
-        ∈ [0, N_VALUE_PAIRS-1]（gvalue.c 的 min-margin 索引语义；
-        平局取小索引，与 C 循环的严格 `<` 更新一致）。
+
+        pos_sim = min_i s_pos[i]，neg_sim = min_i s_neg[i]（全局最小，不是逐对），
+        balance = (pos_sim - neg_sim) / (pos_sim + neg_sim + 1e-8)。
+        safe ⇔ balance ≤ -safety_margin，与 gvalue.c 的
+        `balance > -safety_margin → unsafe` 一致（含等号，等号安全）。
+        unsafe 时 violated_law = argmin_i -(balance_i)（逐对 balance 的最小 margin），
+        ∈ [0, N_VALUE_PAIRS-1]；平局取小索引，与 C 循环的严格 `<` 更新一致。
         safe 时 violated_law = -1。
     """
-    pos_d_min = pair_pos[0]
-    neg_d_min = pair_neg[0]
+    eps = RealVal("1e-8")
+
+    pos_sim = pair_pos_sim[0]
+    neg_sim = pair_neg_sim[0]
     for i in range(1, N_VALUE_PAIRS):
-        pos_d_min = If(pair_pos[i] < pos_d_min, pair_pos[i], pos_d_min)
-        neg_d_min = If(pair_neg[i] < neg_d_min, pair_neg[i], neg_d_min)
+        pos_sim = If(pair_pos_sim[i] < pos_sim, pair_pos_sim[i], pos_sim)
+        neg_sim = If(pair_neg_sim[i] < neg_sim, pair_neg_sim[i], neg_sim)
 
-    safe = pos_d_min <= neg_d_min - safety_margin
+    balance = (pos_sim - neg_sim) / (pos_sim + neg_sim + eps)
+    safe = balance <= -safety_margin
 
-    # violated_law = argmin over per-pair margins
-    margins = [pair_pos[i] - (pair_neg[i] - safety_margin)
+    # violated_law = argmin over pairs of -(balance_i), i.e. smallest margin.
+    margins = [-(pair_pos_sim[i] - pair_neg_sim[i]) /
+               (pair_pos_sim[i] + pair_neg_sim[i] + eps)
                for i in range(N_VALUE_PAIRS)]
     law = If(
         And(margins[0] <= margins[1],
@@ -289,29 +303,31 @@ def model_gvalue_check_safety(
 
 def verify_gvalue_check_safety() -> None:
     """Prove all gvalue_check_safety contracts."""
-    pos = [Real(f"pos_d_{i}") for i in range(N_VALUE_PAIRS)]
-    neg = [Real(f"neg_d_{i}") for i in range(N_VALUE_PAIRS)]
+    pos = [Real(f"pos_sim_{i}") for i in range(N_VALUE_PAIRS)]
+    neg = [Real(f"neg_sim_{i}") for i in range(N_VALUE_PAIRS)]
     margin = Real("safety_margin")
 
-    # Precondition: safety_margin >= 0, distances >= 0
+    # Precondition: safety_margin >= 0, similarities >= 0
     pre = And(margin >= 0, *[p >= 0 for p in pos], *[n >= 0 for n in neg])
 
     safe, law = model_gvalue_check_safety(pos, neg, margin)
 
-    # 模型内部推导的最接近对距离（pos_d_min / neg_d_min）
-    pos_d_min = pos[0]
-    neg_d_min = neg[0]
+    # 模型内部推导的最接近锚点相似度（pos_sim / neg_sim）
+    pos_sim = pos[0]
+    neg_sim = neg[0]
     for i in range(1, N_VALUE_PAIRS):
-        pos_d_min = If(pos[i] < pos_d_min, pos[i], pos_d_min)
-        neg_d_min = If(neg[i] < neg_d_min, neg[i], neg_d_min)
+        pos_sim = If(pos[i] < pos_sim, pos[i], pos_sim)
+        neg_sim = If(neg[i] < neg_sim, neg[i], neg_sim)
+    balance = (pos_sim - neg_sim) / (
+        pos_sim + neg_sim + RealVal("1e-8"))
 
-    # ── P5: safe ⇒ pos_d_min ≤ neg_d_min - safety_margin ────────────────
-    lemma("P5", implies(pre, implies(safe, pos_d_min <= neg_d_min - margin)),
-          "safe ⇒ pos_d_min ≤ neg_d_min - safety_margin")
+    # ── P5: safe ⇒ balance ≤ -safety_margin ──────────────────────────────
+    lemma("P5", implies(pre, implies(safe, balance <= -margin)),
+          "safe ⇒ balance ≤ -safety_margin")
 
-    # ── P6: ¬safe ⇒ pos_d_min > neg_d_min - safety_margin ───────────────
-    lemma("P6", implies(pre, implies(Not(safe), pos_d_min > neg_d_min - margin)),
-          "¬safe ⇒ pos_d_min > neg_d_min - safety_margin")
+    # ── P6: ¬safe ⇒ balance > -safety_margin ─────────────────────────────
+    lemma("P6", implies(pre, implies(Not(safe), balance > -margin)),
+          "¬safe ⇒ balance > -safety_margin")
 
     # ── P7: violated_law ∈ {-1, 0, 1, 2, 3} ─────────────────────────────
     lemma("P7", implies(pre, Or(law == -1, law == 0, law == 1, law == 2, law == 3)),
@@ -324,13 +340,34 @@ def verify_gvalue_check_safety() -> None:
           "violated_law = -1 ⇒ safe")
 
     # ── Safety margin monotonicity ───────────────────────────────────────
-    # Larger margin makes safety HARDER (requires pos ≤ neg - larger_margin).
+    # Larger margin makes safety HARDER (balance ≤ -larger_margin).
     # So safe(large) ⇒ safe(small) but not vice versa.
     m_large = Real("m_large")
     pre_large = And(m_large >= 0, m_large >= margin)
     safe_large, _ = model_gvalue_check_safety(pos, neg, m_large)
     lemma("P8", implies(And(pre, pre_large, safe_large), safe),
           "safe with larger margin ⇒ safe with smaller margin (monotonic)")
+
+    # ── P5b/P5c: strict Three Laws on neutral inputs ─────────────────────
+    neutral = Real("neutral_sim")
+    pre_neutral = neutral > 0
+    safe_zero, _ = model_gvalue_check_safety(
+        [neutral] * N_VALUE_PAIRS, [neutral] * N_VALUE_PAIRS, RealVal("0"))
+    lemma("P5b", implies(pre_neutral, safe_zero),
+          "neutral (pos_sim = neg_sim) with margin=0 ⇒ safe")
+
+    safe_half, _ = model_gvalue_check_safety(
+        [neutral] * N_VALUE_PAIRS, [neutral] * N_VALUE_PAIRS,
+        RealVal("0.5"))
+    lemma("P5c", implies(pre_neutral, Not(safe_half)),
+          "neutral with margin=0.5 ⇒ unsafe (strict Three Laws)")
+
+    # ── P5d: balance is bounded in [-1, 1] ───────────────────────────────
+    p_b, n_b = Reals("p_b n_b")
+    bal_b = (p_b - n_b) / (p_b + n_b + RealVal("1e-8"))
+    lemma("P5d", implies(And(p_b >= 0, n_b >= 0),
+                         And(bal_b >= -1, bal_b <= 1)),
+          "balance ∈ [-1, 1] for non-negative similarities")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -505,22 +542,24 @@ def verify_composition() -> None:
                   And(block_dec, threat_dec == THREAT_DECEPTION)),
           "THREAT_DECEPTION detected by danger_assess when consistency < 0.3")
 
-    # Pattern match → danger_assess triggers at danger_score > 0.005
-    ds_pm = Real("ds_pm")
+    # Pattern match → danger_assess triggers at relative_gap > 0.005
+    ds_pm = Real("relative_gap_pm")
     block_pm, threat_pm, _ = model_danger_assess(0, 0, RealVal("1.0"), ds_pm)
     lemma("P13c",
           implies(ds_pm > SAFETY_THRESHOLD,
                   And(block_pm, threat_pm == THREAT_PATTERN_MATCH)),
-          "THREAT_PATTERN_MATCH detected by danger_assess when score > 0.005")
+          "THREAT_PATTERN_MATCH detected by danger_assess when relative_gap > 0.005")
 
     # Three laws → gvalue_check_safety returns false
-    pos_3l = Real("pos_3l")
-    neg_3l = Real("neg_3l")
+    pos_3l = Real("pos_sim_3l")
+    neg_3l = Real("neg_sim_3l")
     pre_3l = And(pos_3l >= 0, neg_3l >= 0)
     safe_3l, law_3l = model_gvalue_check_safety(
         [pos_3l] * N_VALUE_PAIRS, [neg_3l] * N_VALUE_PAIRS, DEFAULT_MARGIN)
+    balance_3l = (pos_3l - neg_3l) / (
+        pos_3l + neg_3l + RealVal("1e-8"))
     lemma("P13d",
-          implies(And(pre_3l, pos_3l > neg_3l - DEFAULT_MARGIN), Not(safe_3l)),
+          implies(And(pre_3l, balance_3l > -DEFAULT_MARGIN), Not(safe_3l)),
           "THREAT_THREE_LAWS detected by gvalue_check_safety when margin violated")
 
     # Max steps → engine loop exit triggers halt_and_alert
@@ -561,7 +600,7 @@ def verify_determinism() -> None:
     """
     # ── P16a: danger_assess is pure ──────────────────────────────────────
     # Model: output is pure function of inputs (retrieval_count, step_count,
-    # value_consistency, danger_score).  No hidden state.
+    # value_consistency, relative_gap).  No hidden state.
     rc1, rc2 = Ints("rc1 rc2")
     sc1, sc2 = Ints("sc1 sc2")
     vc1, vc2 = Reals("vc1 vc2")
@@ -634,33 +673,33 @@ def verify_edge_cases() -> None:
 
     # ── gvalue boundaries ────────────────────────────────────────────────
 
-    # pos_d_min == neg_d_min - margin (barely safe)
-    s_barely, _ = model_gvalue_check_safety(
-        [DEFAULT_MARGIN] * N_VALUE_PAIRS,
-        [DEFAULT_MARGIN + DEFAULT_MARGIN] * N_VALUE_PAIRS, DEFAULT_MARGIN)
-    lemma("E5", s_barely,
-          "pos = neg - margin (boundary) ⇒ safe (barely)")
-
-    # pos_d_min == neg_d_min (margin = 0) — always safe
-    s_zero_margin, _ = model_gvalue_check_safety(
+    # neutral (pos_sim == neg_sim) with margin = 0 ⇒ safe
+    s_neutral0, _ = model_gvalue_check_safety(
         [RealVal("1.0")] * N_VALUE_PAIRS, [RealVal("1.0")] * N_VALUE_PAIRS,
-        RealVal("0.0"))
-    lemma("E6", s_zero_margin,
-          "margin = 0 ∧ pos = neg ⇒ safe")
+        RealVal("0"))
+    lemma("E5", s_neutral0,
+          "neutral (pos_sim = neg_sim) with margin=0 ⇒ safe")
 
-    # pos_d_min = 0 (perfect alignment with positive)
+    # neutral with margin > 0 ⇒ unsafe (strict Three Laws)
+    s_neutral_half, _ = model_gvalue_check_safety(
+        [RealVal("1.0")] * N_VALUE_PAIRS, [RealVal("1.0")] * N_VALUE_PAIRS,
+        DEFAULT_MARGIN)
+    lemma("E6", Not(s_neutral_half),
+          "neutral with margin=0.5 ⇒ unsafe (strict Three Laws)")
+
+    # pos_sim = 0 (perfect alignment with positive)
     s_aligned, _ = model_gvalue_check_safety(
         [RealVal("0.0")] * N_VALUE_PAIRS, [RealVal("10.0")] * N_VALUE_PAIRS,
         DEFAULT_MARGIN)
     lemma("E7", s_aligned,
-          "pos_d_min = 0 (perfect positive alignment) ⇒ safe")
+          "pos_sim = 0 (perfect positive alignment) ⇒ safe")
 
-    # neg_d_min = 0 (perfect alignment with negative) — unsafe
+    # neg_sim = 0 (perfect alignment with negative) — unsafe
     s_neg_aligned, _ = model_gvalue_check_safety(
         [RealVal("10.0")] * N_VALUE_PAIRS, [RealVal("0.0")] * N_VALUE_PAIRS,
         DEFAULT_MARGIN)
     lemma("E8", Not(s_neg_aligned),
-          "neg_d_min = 0 (perfect negative alignment) ⇒ unsafe")
+          "neg_sim = 0 (perfect negative alignment) ⇒ unsafe")
 
     # ── Composition boundary ─────────────────────────────────────────────
     # Consistency exactly at threshold: not a conflict by itself

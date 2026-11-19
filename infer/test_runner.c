@@ -5,6 +5,8 @@
  *   2. log_map_c stays finite for c > 1 (clip scaled by sqrt(c))
  *   3. gvalue integrity hash covers C_neg (tampering is detected)
  *   4. danger pattern matching direction (close to threat → blocked)
+ *   5. strict Three Laws (neutral safe at margin 0, unsafe at margin > 0)
+ *   6. danger bounded relative gap (neutral input is not blocked)
  */
 #include <stdio.h>
 #include <string.h>
@@ -52,6 +54,90 @@ static void test_gvalue_hash_covers_neg(void) {
     /* gvalue_init deep-copies; tamper the copy inside gv, not the source */
     gv.C_neg[0][0] += 0.5f;
     CHECK(!gvalue_verify(&gv), "gvalue_verify false after C_neg tampering");
+}
+
+static void test_gvalue_strict_neutral(void) {
+    gvalue_t gv;
+    float C_pos[LCM_N_VALUE_PAIRS][LCM_D];
+    float C_neg[LCM_N_VALUE_PAIRS][LCM_D];
+    memset(C_pos, 0, sizeof(C_pos));
+    memset(C_neg, 0, sizeof(C_neg));
+    for (int i = 0; i < LCM_N_VALUE_PAIRS; i++) {
+        C_pos[i][i] =  0.9f;
+        C_neg[i][i] = -0.9f;
+    }
+    gvalue_init(&gv, &C_pos[0][0], &C_neg[0][0], LCM_D);
+    CHECK(gvalue_verify(&gv), "gvalue_verify true after init");
+
+    float z[LCM_D] = {0};
+    int law = -2;
+    /* z=0 is neutral: pos_sim == neg_sim ⇒ balance = 0.
+     * Strict Three Laws with margin 0.5: 0 > -0.5 ⇒ violation. */
+    bool safe = gvalue_check_safety(&gv, z, 0.5f, &law);
+    CHECK(!safe, "gvalue strict neutral (z=0, margin=0.5) → unsafe");
+    CHECK(law >= 0 && law < LCM_N_VALUE_PAIRS,
+          "gvalue strict neutral reports a law pair");
+}
+
+static void test_gvalue_margin_zero(void) {
+    gvalue_t gv;
+    float C_pos[LCM_N_VALUE_PAIRS][LCM_D];
+    float C_neg[LCM_N_VALUE_PAIRS][LCM_D];
+    memset(C_pos, 0, sizeof(C_pos));
+    memset(C_neg, 0, sizeof(C_neg));
+    for (int i = 0; i < LCM_N_VALUE_PAIRS; i++) {
+        C_pos[i][i] =  0.9f;
+        C_neg[i][i] = -0.9f;
+    }
+    gvalue_init(&gv, &C_pos[0][0], &C_neg[0][0], LCM_D);
+
+    float z[LCM_D] = {0};
+    int law = -2;
+    /* margin=0: violated ⇔ balance > 0; neutral balance=0 is safe. */
+    bool safe = gvalue_check_safety(&gv, z, 0.0f, &law);
+    CHECK(safe, "gvalue margin=0 neutral (z=0) → safe");
+    CHECK(law == -1, "gvalue margin=0 neutral reports law=-1");
+}
+
+static void test_gvalue_positive_anchor_safe(void) {
+    gvalue_t gv;
+    float C_pos[LCM_N_VALUE_PAIRS][LCM_D];
+    float C_neg[LCM_N_VALUE_PAIRS][LCM_D];
+    memset(C_pos, 0, sizeof(C_pos));
+    memset(C_neg, 0, sizeof(C_neg));
+    for (int i = 0; i < LCM_N_VALUE_PAIRS; i++) {
+        C_pos[i][i] =  0.9f;
+        C_neg[i][i] = -0.9f;
+    }
+    gvalue_init(&gv, &C_pos[0][0], &C_neg[0][0], LCM_D);
+
+    int law = -2;
+    bool safe = gvalue_check_safety(&gv, C_pos[0], 0.5f, &law);
+    CHECK(safe, "gvalue positive anchor → safe even with margin=0.5");
+}
+
+static void test_danger_neutral_no_block(void) {
+    danger_lattice_t dl;
+    float threats[2][LCM_D];
+    float normals[2][LCM_D];
+    memset(threats, 0, sizeof(threats));
+    memset(normals, 0, sizeof(normals));
+    threats[0][0] =  0.5f;
+    threats[1][1] =  0.4f;
+    normals[0][0] = -0.5f;
+    normals[1][1] = -0.4f;
+    danger_init(&dl, &threats[0][0], &normals[0][0], 2, LCM_D);
+    CHECK(danger_verify(&dl), "danger_verify true on intact data");
+
+    /* z=0 is equidistant (after ball projection) from +v and -v anchors:
+     * sim_threat == sim_normal ⇒ relative_gap = 0 ⇒ not blocked. */
+    float z[LCM_D] = {0};
+    float score;
+    int threat;
+    bool block;
+    danger_assess(&dl, z, 1, 0, 32, 1.0f, &score, &threat, &block);
+    CHECK(!block, "danger neutral (threat≈normal) → not blocked");
+    CHECK(threat == THREAT_NONE, "danger neutral → THREAT_NONE");
 }
 
 static void test_danger_direction(void) {
@@ -134,6 +220,10 @@ int main(void) {
     test_lcm_dim();
     test_log_map_c_finite_for_c_gt_1();
     test_gvalue_hash_covers_neg();
+    test_gvalue_strict_neutral();
+    test_gvalue_margin_zero();
+    test_gvalue_positive_anchor_safe();
+    test_danger_neutral_no_block();
     test_danger_direction();
     test_hrr_no_overwrite();
     test_fusion_l2_weights();

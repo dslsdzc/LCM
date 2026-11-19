@@ -22,7 +22,7 @@ Usage:
 Contracts verified (each ∀ pre-state satisfying Requires):
     C1  danger_assess: out_block ⇔ threat condition exceeded
     C2  danger_assess: threat type matches first-triggered condition
-    C3  gvalue_check_safety: safe ⇔ pos_d_min ≤ neg_d_min - margin
+    C3  gvalue_check_safety: safe ⇔ balance ≤ -safety_margin
     C4  detect_any_conflict: true ⇔ any sub-check triggered
     C5  conflict source identifies the first-triggered check
     C6  halt_and_alert is terminal (conflict ⇒ ¬convergence)
@@ -66,13 +66,17 @@ def danger_assess_pure(
     retrieval_count: int,
     step_count: int,
     value_consistency: float,
-    danger_score: float,
+    relative_gap: float,
 ) -> Tuple[bool, int, float]:
     """Pure model of the C danger_assess function.
 
+    ``relative_gap = (sim_normal - sim_threat) / (sim_normal + sim_threat + ε)``
+    is the R7 bounded relative proximity: positive when the threat anchors are
+    closer.  Equal similarities give gap 0, which is not blocked.
+
     Postconditions (contract):
       - out_block  ⇔  retrieval_count > 12 ∨ step_count > 32
-                       ∨ value_consistency < 0.3 ∨ danger_score > 0.005
+                       ∨ value_consistency < 0.3 ∨ relative_gap > 0.005
       - out_threat ∈ {0, 1, 2, 3, 4}  (valid threat enum)
       - out_threat matches the first-triggered condition in priority order:
           c1 (resource_abuse) > c2 (runaway) > c3 (deception) > c4 (pattern)
@@ -90,35 +94,41 @@ def danger_assess_pure(
     if value_consistency < CONSISTENCY_THRESHOLD:
         return True, THREAT_DECEPTION, 2.0 - value_consistency
     # Priority 4: pattern match
-    if danger_score > SAFETY_THRESHOLD:
-        return True, THREAT_PATTERN_MATCH, danger_score
+    if relative_gap > SAFETY_THRESHOLD:
+        return True, THREAT_PATTERN_MATCH, relative_gap
     # No threat
-    return False, THREAT_NONE, danger_score
+    return False, THREAT_NONE, relative_gap
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  2.  gvalue_check_safety — Formal Contract
 # ═════════════════════════════════════════════════════════════════════════════
 
+BALANCE_EPS: float = 1e-8
+
+
 @Pure
 def gvalue_check_safety_pure(
-    pos_d_min: float,
-    neg_d_min: float,
+    pos_sim: float,
+    neg_sim: float,
     safety_margin: float,
 ) -> Tuple[bool, int]:
     """Pure model of the C gvalue_check_safety function.
 
     Requires:
         safety_margin >= 0
-        pos_d_min >= 0
-        neg_d_min >= 0
+        pos_sim >= 0
+        neg_sim >= 0
 
-    Postconditions:
-        safe  ⇔  pos_d_min ≤ neg_d_min - safety_margin
-        unsafe ⇔  pos_d_min > neg_d_min - safety_margin
+    Postconditions (R6 strict Three Laws):
+        balance = (pos_sim - neg_sim) / (pos_sim + neg_sim + 1e-8) ∈ [-1, 1]
+        safe  ⇔  balance ≤ -safety_margin
+        unsafe ⇔  balance > -safety_margin
         violated_law = -1 if safe, 0 if unsafe
+        Neutral input (balance = 0) is safe at margin 0 and unsafe at margin > 0.
     """
-    if pos_d_min > neg_d_min - safety_margin:
+    balance = (pos_sim - neg_sim) / (pos_sim + neg_sim + BALANCE_EPS)
+    if balance > -safety_margin:
         return False, 0  # unsafe, law pair 0
     return True, -1  # safe
 
@@ -193,21 +203,21 @@ def verify_danger_assess_contract() -> None:
 
 def verify_gvalue_check_safety_contract() -> None:
     """Prove gvalue_check_safety invariants for concrete test cases."""
-    # Edge: boundary (safe barely)
-    r1, l1 = gvalue_check_safety_pure(5.0, 5.5, 0.5)  # pos=5, neg-m=5.0
+    # Edge: neutral input at margin 0 is safe (balance = 0)
+    r1, l1 = gvalue_check_safety_pure(1.0, 1.0, 0.0)
     Assert(r1)
     Assert(l1 == -1)
 
-    # Edge: just over boundary (unsafe)
-    r2, l2 = gvalue_check_safety_pure(5.1, 5.5, 0.5)  # pos=5.1 > neg-m=5.0
+    # Edge: neutral input at margin 0.5 is a violation (strict Three Laws)
+    r2, _ = gvalue_check_safety_pure(1.0, 1.0, 0.5)
     Assert(not r2)
 
-    # Edge: zero margin with equal distances → safe
-    r3, _ = gvalue_check_safety_pure(3.0, 3.0, 0.0)
+    # Edge: perfect positive alignment → safe
+    r3, _ = gvalue_check_safety_pure(0.0, 5.0, 0.5)
     Assert(r3)
 
     # Edge: perfect negative alignment → unsafe
-    r4, _ = gvalue_check_safety_pure(10.0, 0.0, 0.5)
+    r4, _ = gvalue_check_safety_pure(5.0, 0.0, 0.5)
     Assert(not r4)
 
 

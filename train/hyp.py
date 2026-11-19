@@ -63,6 +63,16 @@ def safe_unit(x: jnp.ndarray, eps: float = 1e-8) -> jnp.ndarray:
     return x / (_norm_safe_grad(x) + eps)
 
 
+def to_poincare(z: jnp.ndarray, c: float = 1.0) -> jnp.ndarray:
+    """Map arbitrary Euclidean z to the Poincaré ball at a safe radius.
+
+    R6 unified domain: every hyperbolic comparison uses
+    ``exp_map(safe_unit(z))``, whose norm is ``tanh(1) ≈ 0.7616``.  This keeps
+    the ``(1 - c‖z‖²)`` denominator strictly away from zero for any input.
+    """
+    return exp_map(safe_unit(z), c)
+
+
 def exp_map(x: jnp.ndarray, c: float = 1.0) -> jnp.ndarray:
     """Euclidean vector → Poincaré ball (exponential map).
 

@@ -4,14 +4,18 @@ Frozen for all time. No gradient, no EMA, no updates.
 Hash-verified on load to detect tampering.
 
 Extended with:
-- check_safety_batch(): vectorized batch safety check
+- check_safety_batch(): vectorized strict Three Laws check in the unified
+  Poincaré domain (balance = (pos_sim - neg_sim)/(pos_sim + neg_sim + eps))
 - safety_margin_loss(): mild regularization to keep representations clear of boundary
 - compute_value_signal_for_output(): per-vector safety evaluation
 """
 import hashlib
 import jax.numpy as jnp
 from jax import lax
-from train.hyp import poincare_distance, poincare_similarity
+from train.hyp import poincare_distance, poincare_similarity, to_poincare
+
+# Relative-balance denominator guard (matches infer/gvalue.c).
+_GVALUE_EPS = 1e-8
 
 
 def make_global_value_vectors(d):
@@ -84,49 +88,83 @@ class GValueCodebook:
         return True
 
     def check_safety(self, z, safety_margin_relative=0.5):
-        """Relative distance safety check (single vector).
+        """Strict Three Laws safety check (single vector or batch).
 
-        Returns (is_safe, violated_law_priority).
-        Uses relative margin to avoid absolute-threshold sensitivity.
+        R6 unified domain and formula::
+
+            z_P     = exp_map(safe_unit(z))
+            pos_sim = min_j poincare_similarity(z_P, C_pos_P[j])
+            neg_sim = min_j poincare_similarity(z_P, C_neg_P[j])
+            balance = (pos_sim - neg_sim) / (pos_sim + neg_sim + eps)
+            violated = balance > -safety_margin_relative
+
+        ``poincare_similarity`` is distance-monotonic (smaller = closer), so a
+        negative balance means the positive anchors are closer.  A neutral
+        input (``balance = 0``) is safe with margin 0 and a violation with
+        margin > 0 — that is the strict reading the user confirmed.
+
+        Returns (is_safe, violated_law_priority).  For a batch, ``is_safe`` is
+        false if ANY sample violates; the reported law is the highest-risk
+        sample's argmin pair.
         """
-        pos_d_min = poincare_distance(z, self.C_pos).min(axis=-1)
-        neg_d_min = poincare_distance(z, self.C_neg).min(axis=-1)
-        violated = pos_d_min > neg_d_min - safety_margin_relative
-        if violated.any():
-            return False, 0  # Highest priority (zeroth-law level)
-        return True, -1
+        pos_sims, neg_sims = self._poincare_pair_similarities(z)
+        # Global minima (not per-pair): the decision compares the closest
+        # positive anchor with the closest negative anchor.
+        pos_sim = pos_sims.min(axis=-1)
+        neg_sim = neg_sims.min(axis=-1)
+        balance = (pos_sim - neg_sim) / (pos_sim + neg_sim + _GVALUE_EPS)
+        margins = -balance  # positive = safer
+
+        violated = balance > -safety_margin_relative
+        if not bool(jnp.any(violated)):
+            return True, -1
+
+        # Per-pair balances only rank law pairs for the violation report.
+        pair_balance = (pos_sims - neg_sims) / (
+            pos_sims + neg_sims + _GVALUE_EPS)
+        violated_law = jnp.argmin(-pair_balance, axis=-1)
+        worst = int(jnp.argmin(margins.reshape(-1)))
+        return False, int(violated_law.reshape(-1)[worst])
+
+    def _poincare_pair_similarities(self, z):
+        """Per-anchor Poincaré similarities ``(..., M)`` in the unified domain."""
+        z_P = to_poincare(z)
+        C_pos_P = to_poincare(self.C_pos)
+        C_neg_P = to_poincare(self.C_neg)
+        pos_sims = poincare_similarity(
+            z_P[..., None, :], C_pos_P[None, ...]).squeeze(-1)
+        neg_sims = poincare_similarity(
+            z_P[..., None, :], C_neg_P[None, ...]).squeeze(-1)
+        return pos_sims, neg_sims
 
     def check_safety_batch(self, z_batch, safety_margin_relative=0.5):
-        """Vectorized batch safety check.
+        """Vectorized strict Three Laws safety check.
 
         Args:
             z_batch: (B, d) batch of vectors.
-            safety_margin_relative: Relative margin threshold.
+            safety_margin_relative: Relative margin threshold (> 0 makes a
+                neutral input unsafe).
 
         Returns:
             is_safe: (B,) boolean array.
-            margins: (B,) margin values (positive = safe, negative = violation).
-            violated_law: (B,) int index of the closest violated law (-1 if safe).
+            margins: (B,) margin values, defined as ``-balance`` (positive =
+                safer, bounded in [-1, 1]).
+            violated_law: (B,) int index of the argmin law pair (-1 if safe).
         """
-        B = z_batch.shape[0]
-        # (B, 4) distances to positive and negative anchors
-        d_pos = jnp.array([poincare_distance(z_batch, self.C_pos[i])
-                           for i in range(4)]).min(axis=0)  # (B,)
-        d_neg = jnp.array([poincare_distance(z_batch, self.C_neg[i])
-                           for i in range(4)]).min(axis=0)  # (B,)
+        pos_sims, neg_sims = self._poincare_pair_similarities(z_batch)
+        pos_sim = pos_sims.min(axis=-1)  # (B,)
+        neg_sim = neg_sims.min(axis=-1)  # (B,)
 
-        margins = d_neg - safety_margin_relative - d_pos  # (B,)
-        # 边界含等号：与 C 引擎 gvalue_check_safety 一致
-        # （pos_d_min > neg_d_min - margin 才不安全，等号安全）
-        is_safe = margins >= 0
+        balance = (pos_sim - neg_sim) / (pos_sim + neg_sim + _GVALUE_EPS)
+        margins = -balance
 
-        # Find which law pair is closest to violation
-        all_margins = jnp.stack([
-            poincare_distance(z_batch, self.C_pos[i]) -
-            (poincare_distance(z_batch, self.C_neg[i]) - safety_margin_relative)
-            for i in range(4)
-        ], axis=-1)  # (B, 4)
-        violated_law = all_margins.argmin(axis=-1)  # (B,)
+        # violated = balance > -margin, i.e. is_safe = margin >= -balance.
+        is_safe = margins >= safety_margin_relative
+
+        # Find which law pair is closest to violation (smallest margin).
+        pair_balance = (pos_sims - neg_sims) / (
+            pos_sims + neg_sims + _GVALUE_EPS)  # (B, 4)
+        violated_law = jnp.argmin(-pair_balance, axis=-1)  # (B,)
         violated_law = jnp.where(is_safe, -1, violated_law)
 
         return is_safe, margins, violated_law

@@ -233,11 +233,11 @@ def test_11_gvalue_margin_zero_safe():
     gv = GValueCodebook(C_pos, C_neg)
     z = jnp.zeros((1, 8))  # 原点对 ±0.9 锚点距离对称 → margins 恰为 0
     is_safe, margins, law = gv.check_safety_batch(z, safety_margin_relative=0.0)
-    assert float(margins[0, 0]) == 0.0
-    assert bool(is_safe[0, 0]), f"margins==0 应为 safe，got is_safe={is_safe}"
-    assert int(law[0, 0]) == -1
-    print(f"  [11] margins==0.0 → safe={bool(is_safe[0, 0])}, "
-          f"violated_law={int(law[0, 0])}")
+    assert float(margins[0]) == 0.0
+    assert bool(is_safe[0]), f"margins==0 应为 safe，got is_safe={is_safe}"
+    assert int(law[0]) == -1
+    print(f"  [11] margins==0.0 → safe={bool(is_safe[0])}, "
+          f"violated_law={int(law[0])}")
 
 
 # ─── #12 abs(z) 双向触发 ────────────────────────────────────────────────────

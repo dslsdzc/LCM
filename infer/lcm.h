@@ -287,6 +287,7 @@ bool detect_any_conflict(const float* z_next, const float* z_cur, int step,
 /* Hyperbolic operations (all use flat float* for vectors) */
 float poincare_similarity_c(const float* u, const float* v, int D, float c);
 float poincare_distance_c(const float* u, const float* v, int D, float c);
+void  safe_unit_c(const float* x, float* out, int D, float eps);
 void  exp_map_c(const float* x, float* out, int D, float c);
 void  log_map_c(const float* y, float* out, int D, float c);
 void  mobius_add_c(const float* u, const float* v, float* out, int D, float c);

@@ -64,6 +64,39 @@ float poincare_distance_c(const float* u, const float* v, int D, float c) {
     return acoshf(arg);
 }
 
+/* ─── Unit normalisation: x / (‖x‖ + eps) ─────────────────────────────────── */
+
+/*@
+  requires D > 0;
+  requires eps > 0.0f;
+  requires \valid_read(x + (0 .. D-1));
+  requires \valid(out + (0 .. D-1));
+  requires \separated(out + (0 .. D-1), x + (0 .. D-1));
+  requires \forall integer i; 0 <= i < D ==> \is_finite(x[i]);
+  ensures \forall integer i; 0 <= i < D ==> \is_finite(out[i]);
+  assigns out[0 .. D-1];
+ */
+void safe_unit_c(const float* x, float* out, int D, float eps) {
+    assert(x != NULL && out != NULL && D > 0);
+    float norm = 0.0f;
+    /*@
+      loop invariant 0 <= i <= D;
+      loop invariant norm >= 0.0f;
+      loop assigns i, norm;
+      loop variant D - i;
+     */
+    for (int i = 0; i < D; i++) norm += x[i] * x[i];
+    norm = sqrtf(norm) + eps;
+    /*@ assert norm > 0.0f; */
+    /*@
+      loop invariant 0 <= i <= D;
+      loop invariant \forall integer k; 0 <= k < i ==> \is_finite(out[k]);
+      loop assigns i, out[0 .. D-1];
+      loop variant D - i;
+     */
+    for (int i = 0; i < D; i++) out[i] = x[i] / norm;
+}
+
 /* ─── Exponential map: Euclidean → Poincaré ball ─────────────────────────── */
 
 /*@

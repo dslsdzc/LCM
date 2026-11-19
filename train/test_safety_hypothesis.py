@@ -8,7 +8,7 @@ using SMT) by also testing the ACTUAL C and JAX code paths with concrete values.
 
 Tested contracts:
   1. danger_assess:  out_block ⇔ threshold exceeded, with correct threat type
-  2. gvalue_check_safety: safe ⇔ pos_d_min ≤ neg_d_min - margin
+  2. gvalue_check_safety: safe ⇔ relative balance ≤ -margin
   3. detect_any_conflict: result ⇔ any sub-check triggered
   4. Value contrast loss: finite output for all valid inputs
   5. Safety margin loss: finite, non-negative for all valid inputs
@@ -50,10 +50,13 @@ nonneg_ints = integers(min_value=0, max_value=100)
 retrieval_counts = integers(min_value=0, max_value=50)
 step_counts = integers(min_value=0, max_value=100)
 consistency_vals = floats(min_value=0.0, max_value=1.0, allow_nan=False)
-danger_scores = floats(min_value=-1.0, max_value=1.0, allow_nan=False)
+relative_gaps = floats(min_value=-1.0, max_value=1.0, allow_nan=False)
 safety_margins = floats(min_value=0.0, max_value=2.0, allow_nan=False)
-pos_d_min_vals = floats(min_value=0.0, max_value=20.0, allow_nan=False)
-neg_d_min_vals = floats(min_value=0.0, max_value=20.0, allow_nan=False)
+# Poincaré similarities are non-negative; 20 is far outside the ball.
+sim_vals = floats(min_value=0.0, max_value=20.0, allow_nan=False)
+
+# Relative-balance denominator guard (matches train/gvalue.py and infer/gvalue.c).
+BALANCE_EPS = 1e-8
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -64,9 +67,14 @@ def danger_assess_py(
     retrieval_count: int,
     step_count: int,
     value_consistency: float,
-    danger_score: float,
+    relative_gap: float,
 ) -> Tuple[bool, int, float]:
-    """Python reference for the C danger_assess function."""
+    """Python reference for the C danger_assess function.
+
+    ``relative_gap`` is the bounded R7 quantity
+    ``(sim_normal - sim_threat) / (sim_normal + sim_threat + eps)``;
+    positive means the input is closer to a threat pattern.
+    """
     # Priority 1: resource abuse
     if retrieval_count > MAX_RETRIEVALS:
         return True, 2, 1.0  # THREAT_RESOURCE_ABUSE=2
@@ -80,11 +88,17 @@ def danger_assess_py(
         return True, 4, 2.0 - value_consistency  # THREAT_DECEPTION=4
 
     # Priority 4: pattern match
-    if danger_score > SAFETY_THRESHOLD:
-        return True, 1, danger_score  # THREAT_PATTERN_MATCH=1
+    if relative_gap > SAFETY_THRESHOLD:
+        return True, 1, relative_gap  # THREAT_PATTERN_MATCH=1
 
     # No threat
-    return False, 0, danger_score  # THREAT_NONE=0
+    return False, 0, relative_gap  # THREAT_NONE=0
+
+
+def relative_gap_py(sim_normal: float, sim_threat: float,
+                    eps: float = BALANCE_EPS) -> float:
+    """R7 bounded relative proximity in the unified Poincaré domain."""
+    return (sim_normal - sim_threat) / (sim_normal + sim_threat + eps)
 
 
 # ── Hypothesis test: danger_assess contract ──────────────────────────────
@@ -93,7 +107,7 @@ def danger_assess_py(
     rc=retrieval_counts,
     sc=step_counts,
     vc=consistency_vals,
-    ds=danger_scores,
+    ds=relative_gaps,
 )
 @settings(max_examples=5000 if __import__("os").environ.get(
     "HYPOTHESIS_PROFILE", "") == "ci" else 500)
@@ -140,7 +154,7 @@ def test_danger_assess_contract(rc, sc, vc, ds):
 @given(
     rc=integers(min_value=MAX_RETRIEVALS - 1, max_value=MAX_RETRIEVALS + 2),
     vc=consistency_vals,
-    ds=danger_scores,
+    ds=relative_gaps,
 )
 @settings(max_examples=100)
 def test_danger_retrieval_boundary(rc, vc, ds):
@@ -160,7 +174,7 @@ def test_danger_retrieval_boundary(rc, vc, ds):
 @given(
     sc=integers(min_value=MAX_STEPS - 1, max_value=MAX_STEPS + 2),
     vc=consistency_vals,
-    ds=danger_scores,
+    ds=relative_gaps,
 )
 @settings(max_examples=100)
 def test_danger_step_boundary(sc, vc, ds):
@@ -183,41 +197,68 @@ def test_danger_consistency_boundary(vc):
         assert not block, f"Expected no block when vc={vc} ≥ {CONSISTENCY_THRESHOLD}"
 
 
+@given(sn=sim_vals, st=sim_vals)
+@settings(max_examples=500)
+def test_relative_gap_bounded(sn, st):
+    """R7: relative_gap is bounded in [-1, 1]; neutral/equal is 0."""
+    gap = relative_gap_py(sn, st)
+    assert -1.0 <= gap <= 1.0, f"relative_gap={gap} outside [-1, 1]"
+    if sn == st:
+        assert gap == 0.0, f"equal similarities must give gap 0, got {gap}"
+        block, _, _ = danger_assess_py(0, 0, 1.0, gap)
+        assert not block, "neutral danger input must not block"
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  2.  gvalue_check_safety model
 # ═══════════════════════════════════════════════════════════════════════════
 
+def gvalue_balance(pos_sim: float, neg_sim: float,
+                   eps: float = BALANCE_EPS) -> float:
+    """R6 relative balance: negative = closer to positive anchors."""
+    return (pos_sim - neg_sim) / (pos_sim + neg_sim + eps)
+
+
 def gvalue_check_safety_py(
-    pos_d_min: float,
-    neg_d_min: float,
+    pos_sim: float,
+    neg_sim: float,
     safety_margin: float,
 ) -> Tuple[bool, int]:
-    """Python reference for C gvalue_check_safety."""
-    if pos_d_min > neg_d_min - safety_margin:
+    """Python reference for C gvalue_check_safety.
+
+    Strict Three Laws (R6): ``violated = balance > -safety_margin``.
+    A neutral input (balance = 0) is safe with margin 0 and a violation with
+    margin > 0.
+    """
+    if gvalue_balance(pos_sim, neg_sim) > -safety_margin:
         return False, 0  # unsafe, first law pair violated
     return True, -1  # safe
 
 
 @given(
-    pos=pos_d_min_vals,
-    neg=neg_d_min_vals,
+    pos=sim_vals,
+    neg=sim_vals,
     margin=safety_margins,
 )
 @settings(max_examples=1000)
 def test_gvalue_safety_contract(pos, neg, margin):
     """P5-P8: gvalue_check_safety contract holds for all inputs."""
+    balance = gvalue_balance(pos, neg)
     safe, law = gvalue_check_safety_py(pos, neg, margin)
 
-    # P5: safe ⇒ pos ≤ neg - margin
+    # Balance is bounded in [-1, 1] for non-negative similarities.
+    assert -1.0 <= balance <= 1.0, f"balance={balance} outside [-1, 1]"
+
+    # P5: safe ⇒ balance ≤ -margin
     if safe:
-        assert pos <= neg - margin + 1e-8, (
-            f"P5: safe but pos={pos} > neg={neg} - margin={margin}"
+        assert balance <= -margin + 1e-9, (
+            f"P5: safe but balance={balance} > -margin={-margin}"
         )
 
-    # P6: ¬safe ⇒ pos > neg - margin
+    # P6: ¬safe ⇒ balance > -margin
     if not safe:
-        assert pos > neg - margin - 1e-8, (
-            f"P6: unsafe but pos={pos} ≤ neg={neg} - margin={margin}"
+        assert balance > -margin - 1e-9, (
+            f"P6: unsafe but balance={balance} ≤ -margin={-margin}"
         )
 
     # P7: law ∈ {-1, 0}
@@ -227,25 +268,25 @@ def test_gvalue_safety_contract(pos, neg, margin):
     assert safe == (law == -1), f"P8: safe={safe} ⇔ law={law} != -1"
 
 
-@given(margin=floats(min_value=0.0, max_value=2.0, allow_nan=False))
+@given(margin=safety_margins)
 @settings(max_examples=50)
 def test_gvalue_safety_edge_cases(margin):
-    """E5-E8: edge case behavior."""
-    # E5: boundary — pos = neg - margin
-    pos = 5.0
-    neg = pos + margin
-    safe, _ = gvalue_check_safety_py(pos, neg, margin)
-    assert safe, f"E5: boundary not safe: pos={pos}, neg={neg}, m={margin}"
+    """E5-E8: strict Three Laws edge cases."""
+    # E5: neutral input is safe iff margin == 0
+    safe, _ = gvalue_check_safety_py(1.0, 1.0, margin)
+    assert safe == (margin == 0.0), (
+        f"E5: neutral with margin={margin} gave safe={safe}"
+    )
 
-    # E6: margin = 0, pos = neg
-    safe, _ = gvalue_check_safety_py(3.0, 3.0, 0.0)
-    assert safe, "E6: pos=neg with margin=0 should be safe"
+    # E6: neutral input with margin=0.5 is a violation
+    safe, _ = gvalue_check_safety_py(3.0, 3.0, 0.5)
+    assert not safe, "E6: neutral with margin>0 should be unsafe"
 
-    # E7: pos=0 (perfect positive alignment) → safe
+    # E7: pos_sim=0 (perfect positive alignment) → safe
     safe, _ = gvalue_check_safety_py(0.0, 5.0, 0.5)
     assert safe, "E7: pos=0 (perfect positive) should be safe"
 
-    # E8: neg=0 (perfect negative alignment) → unsafe
+    # E8: neg_sim=0 (perfect negative alignment) → unsafe
     safe, _ = gvalue_check_safety_py(5.0, 0.0, 0.5)
     assert not safe, "E8: neg=0 (perfect negative) should be unsafe"
 
