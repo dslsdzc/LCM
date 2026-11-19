@@ -2470,6 +2470,8 @@ def main():
         os.makedirs(args.cache_dir, exist_ok=True)
         from train.config import LCMConfig
         from train.cog_train import make_train_step, init_cog_params
+        from train.ema_state import init_ema_state
+        from train.param_groups import partition_params
         import optax
         if (args.auto_batch or args.use_qwen) and args.cog_batch == 4:
             try:
@@ -2489,14 +2491,16 @@ def main():
         p, ss = init_cog_params(cfg, jax.random.split(rng)[1], qwen_ckpt=lck)
         opt = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(3e-4, weight_decay=0.01))
         ts = make_train_step(cfg, opt)
-        # Frozen Qwen is excluded from the optimizer tree (train_step filters
-        # it out of updates) — init must match that structure.
-        opt_st = opt.init({k: v for k, v in p.items() if k != 'qwen'})
+        # R3: optimizer state exists only for the trainable group; EMA state is
+        # a separate buffer updated inside the step.
+        trainable, _, _ = partition_params(p)
+        opt_st = opt.init(trainable)
+        es = init_ema_state(p, cfg)
         d = (jnp.zeros((B, N), dtype=jnp.int32), jnp.ones((B, N), dtype=jnp.int32))
         import time as tm
         t0 = tm.time()
-        r = ts(p, opt_st, d, 3e-4, jax.random.split(rng)[1], ss)
-        print(f"[COMPILE] Done in {tm.time()-t0:.0f}s, loss={float(r[2]):.4f}")
+        r = ts(p, opt_st, es, d, 3e-4, jax.random.split(rng)[1], ss, step=0)
+        print(f"[COMPILE] Done in {tm.time()-t0:.0f}s, loss={float(r[3]):.4f}")
         return
     elif args.cog_train:
         _require_jax()

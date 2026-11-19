@@ -43,11 +43,16 @@ from train.self_lattice import (
     self_lattice_reg_loss,
 )
 from train.cog_loop import cog_loop_scan
+from train.ema_state import (
+    ema_update_binding, ema_update_manifold, ema_update_sparse, init_ema_state,
+)
+from train.feature_bank import FeatureBank
+from train.param_groups import merge_params, partition_params
 from train.lattices import contrast_info_nce_loss, manifold_orth_loss
 from train.qwen_lm import qwen_forward, load_qwen_params, QWEN_CONFIG
 from train.checkpoint import (
     FORMAT_VERSION, HEADER_FMT_V2, HEADER_SIZE_V2, save_manifest,
-    _pack_header, _compute_checksum,
+    _pack_header, _compute_checksum, load_cog_state, save_cog_state,
 )
 
 # Global Qwen params cache (load once, reuse across calls)
@@ -249,8 +254,7 @@ def load_stage2_params(resume, cfg, rng):
     # Try new pickle format first (preserves self_state)
     pkl_path = os.path.join(resume, "cog_params.pkl")
     if os.path.exists(pkl_path):
-        with open(pkl_path, 'rb') as f:
-            ckpt = pickle.load(f)
+        ckpt = load_cog_state(resume)
         params = jax.tree_util.tree_map(
             lambda x: jnp.array(x) if hasattr(x, 'numpy') else x,
             ckpt['params'])
@@ -275,6 +279,25 @@ def load_stage2_params(resume, cfg, rng):
     print(f"      encoder + {len([k for k in params if k not in ('gen_head',)])} codebooks + "
           f"{'gen_head' if 'gen_head' in params else 'no'} gen_head")
     return params, self_state
+
+
+def load_cog_buffers(resume, params, cfg):
+    """Load EMA state and feature bank, or initialise them for a fresh run.
+
+    These are buffers, not parameters: a resume that cannot restore them would
+    silently restart the EMA statistics from zero, so the v2 checkpoint is
+    required to carry both (``load_cog_state(require_buffers=True)``).
+    """
+    if resume:
+        pkl_path = os.path.join(resume, "cog_params.pkl")
+        if os.path.exists(pkl_path):
+            ckpt = load_cog_state(resume, require_buffers=True)
+            ema_state = jax.tree_util.tree_map(
+                lambda x: jnp.asarray(x), ckpt['ema_state'])
+            return ema_state, ckpt['feature_bank']
+
+    return (init_ema_state(params, cfg),
+            FeatureBank(cfg.bank_capacity, cfg.d_model))
 
 
 # ─── Init full params ───────────────────────────────────────────────────────
@@ -457,6 +480,42 @@ def active_loss(logits, targets):
 
 # ─── Training step ──────────────────────────────────────────────────────────
 
+def _apply_ema_updates(ema, ema_state, stats, cfg, step):
+    """EMA pass over the EMA-owned codebooks (R3).
+
+    ``stats`` is the last cognitive-loop step: its input state and selection
+    indices are the observations the codebooks must move toward. The optimizer
+    never sees these leaves (see ``partition_params``), so this function is the
+    only writer of ``ema``.
+    """
+    new_ema = dict(ema)
+    new_state = dict(ema_state)
+
+    if 'sparse' in ema:
+        C, state = ema_update_sparse(
+            ema['sparse']['C'], ema_state['sparse'], stats['z_in'],
+            stats['sparse_idx'], cfg.gamma_sparse, cfg.lambda_sparse,
+            step=step)
+        new_ema['sparse'] = dict(ema['sparse'], C=C)
+        new_state['sparse'] = state
+
+    if 'manifold' in ema:
+        C, state = ema_update_manifold(
+            ema['manifold']['C'], ema_state['manifold'], stats['z_in'],
+            stats['man_idx'], cfg.gamma_man, step=step)
+        new_ema['manifold'] = dict(ema['manifold'], C=C)
+        new_state['manifold'] = state
+
+    if 'binding' in ema:
+        binding, state = ema_update_binding(
+            ema['binding'], ema_state['binding'], stats['binding_residuals'],
+            cfg.gamma_bind, step=step)
+        new_ema['binding'] = binding
+        new_state['binding'] = state
+
+    return new_ema, new_state
+
+
 def make_train_step(cfg, optimizer, joint=False):
     """Create jitted training step with dual-channel output + self-lattice.
 
@@ -486,7 +545,8 @@ def make_train_step(cfg, optimizer, joint=False):
     """
 
     @jax.jit
-    def train_step(params, opt_state, batch, lr, rng, self_state=None):
+    def train_step(params, opt_state, ema_state, batch, lr, rng,
+                   self_state=None, step=None):
         inputs, targets = batch
         B, N = inputs.shape
         # Context / generation split for the active channel (see the
@@ -508,7 +568,13 @@ def make_train_step(cfg, optimizer, joint=False):
         gen_in = inputs[:, ctx_len - 1:]
         k = gen_in.shape[1]
 
-        def loss_fn(p):
+        # R3: only the trainable group is differentiated / optimized. The EMA
+        # and frozen groups are closed over as constants inside loss_fn, so no
+        # gradient (or AdamW moment, or weight-decay step) reaches them.
+        trainable_params, ema_params, frozen_params = partition_params(params)
+
+        def loss_fn(p_trainable):
+            p = merge_params(p_trainable, ema_params, frozen_params)
             z = encoder_forward(p['encoder'], ctx, cfg.n_heads)  # (B, d)
             codebooks = pack_codebooks_for_c(p)
 
@@ -525,12 +591,15 @@ def make_train_step(cfg, optimizer, joint=False):
             # routing_gate, which indexes z[:, None, :]. The scan yields
             # (max_steps, B, ...), transposed back to the (B, max_steps, ...)
             # every consumer below expects.
-            z_qs, diffs, entropies = cog_loop_scan(
+            z_qs, diffs, entropies, loop_stats = cog_loop_scan(
                 z, p, cfg, max_steps=cfg.max_inference_steps,
-                rng=jax.random.fold_in(rng, 7))
+                rng=jax.random.fold_in(rng, 7), return_stats=True)
             z_qs = jnp.transpose(z_qs, (1, 0, 2))     # (B, max_steps, d)
             diffs = jnp.transpose(diffs, (1, 0))      # (B, max_steps)
             entropies = jnp.transpose(entropies, (1, 0))
+            # The EMA pass consumes the last step's input state and selection
+            # indices; the scan stacks them along the step axis.
+            loop_stats = jax.tree_util.tree_map(lambda x: x[-1], loop_stats)
 
             # ── Self lattice ────────────────────────────────────────────
             z_final_mean = z_qs[:, -1, :].mean(axis=0)
@@ -658,31 +727,59 @@ def make_train_step(cfg, optimizer, joint=False):
                     loss = loss + o_loss
 
             aux_out = {'self_state': self_state_out, 'loss_self': loss_self,
-                       'z_margin': z_margin, 'stage3': stage3_extra}
+                       'z_margin': z_margin, 'stage3': stage3_extra,
+                       'loop_stats': loop_stats}
             return loss, aux_out
 
-        (loss, aux_out), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        (loss, aux_out), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+            trainable_params)
         grads = jax.tree_util.tree_map(
             lambda g: jnp.clip(g, -1.0, 1.0), grads)
-        # Frozen Qwen is kept out of the optimizer tree (init side in train_cog):
-        # it must not accumulate state or weight decay — it only serves loss_fn.
-        trainable = {k: v for k, v in params.items() if k != 'qwen'}
-        updates, new_opt = optimizer.update(
-            {k: v for k, v in grads.items() if k != 'qwen'},
-            opt_state, trainable)
+        # The optimizer sees trainable only. EMA and frozen leaves are not in
+        # this tree, so their absence is structural, not a filtered-out zero.
+        updates, new_opt = optimizer.update(grads, opt_state, trainable_params)
         # The optimizer is built with learning_rate=1.0, so its own scale is
         # already -1 (optax adds updates). Multiplying by the live `lr` here is
         # what actually applies the schedule — and what lets the Supervisor
         # reduce the rate mid-run. See the optimizer construction in train_cog.
         updates = jax.tree_util.tree_map(lambda u: lr * u, updates)
-        new_params = {**optax.apply_updates(trainable, updates),
-                      'qwen': params['qwen']}
-        return new_params, new_opt, loss, aux_out
+        new_trainable = optax.apply_updates(trainable_params, updates)
+
+        new_ema, new_ema_state = _apply_ema_updates(
+            ema_params, ema_state, aux_out['loop_stats'], cfg, step)
+        new_params = merge_params(new_trainable, new_ema, frozen_params)
+        return new_params, new_opt, new_ema_state, loss, aux_out
 
     return train_step
 
 
 # ─── Training loop ──────────────────────────────────────────────────────────
+
+def _host_bank_update(params, ema_state, feature_bank, step, cfg):
+    """Replace dead sparse rows from the feature bank (host numpy).
+
+    Runs outside jit: the number of dead rows is dynamic and must not become a
+    traced shape. The replacement vectors come from observed states, and the
+    replaced rows are cold-started (N/m zeroed) by ``FeatureBank``.
+    """
+    if 'sparse' not in ema_state or 'sparse' not in params:
+        return params, ema_state
+    state = ema_state['sparse']
+    dead = feature_bank.dead_indices(
+        state['last_used'], step, cfg.bank_dead_threshold)
+    if dead.size == 0:
+        return params, ema_state
+
+    C_new, state_new = feature_bank.replace_dead_sparse(
+        params['sparse']['C'], state, step, cfg.bank_dead_threshold)
+    new_params = dict(params)
+    new_params['sparse'] = dict(params['sparse'], C=jnp.asarray(C_new))
+    new_ema = dict(ema_state)
+    new_ema['sparse'] = jax.tree_util.tree_map(jnp.asarray, state_new)
+    print(f"[COG] feature bank: replaced {len(dead)} dead sparse rows "
+          f"at step {step}")
+    return new_params, new_ema
+
 
 def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
               seq_len=256, log_every=100, save_every=1000,
@@ -732,6 +829,7 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     rng, init_rng = jax.random.split(rng)
     params, self_state = init_cog_params(cfg, init_rng, qwen_ckpt=qwen_ckpt,
                                           resume=resume)
+    ema_state, feature_bank = load_cog_buffers(resume, params, cfg)
 
     # 5. Assert the actual tensors, do not assume init did the right thing.
     verify_tied_table(params, meta, cfg)
@@ -750,10 +848,12 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
                      b2=cfg.adam_beta2, eps=cfg.adam_eps,
                      weight_decay=cfg.weight_decay),
     )
-    # Qwen stays frozen: keep it out of the optimizer tree entirely (no state,
-    # no weight-decay drift — adamw's decoupled decay would otherwise slowly
-    # erode the frozen bridge). train_step() filters it out of the update tree.
-    opt_state = optimizer.init({k: v for k, v in params.items() if k != 'qwen'})
+    # R3: optimizer state exists only for the trainable group. EMA codebooks
+    # are written by the EMA pass; frozen tensors (danger, the Qwen bridge)
+    # must not even allocate Adam moments. Filtering `qwen` alone was not
+    # enough: AdamW's decoupled weight decay moves zero-gradient leaves too.
+    trainable_params, _, _ = partition_params(params)
+    opt_state = optimizer.init(trainable_params)
 
     # 6. Sampling must consume the same dataset identity.
     data_iter = WikiDataIter(data_path, shape_path, spans_path,
@@ -800,6 +900,7 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     def _handler(sig, frame):
         print(f"\n[COG] Interrupt at step {step}, saving checkpoint...")
         save_cog_checkpoint(params, output_dir, step, self_state=self_state,
+                            ema_state=ema_state, feature_bank=feature_bank,
                             run_identity=run_identity, train_cfg=cfg)
         print(f"[COG] Saved → {output_dir}/cog_params.pkl")
         sys.exit(0)
@@ -820,15 +921,20 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
 
         # Shallow backups: train_step returns fresh trees, never mutates these.
         params_backup, opt_state_backup = params, opt_state
-        self_state_backup = self_state
+        ema_state_backup, self_state_backup = ema_state, self_state
 
         if sup:
             params, opt_state, loss_val, aux_out = sup.step(
                 train_step, params, opt_state, batch, current_lr, step_rng,
-                step=step, self_state=self_state)
+                step=step, self_state=self_state, ema_state=ema_state)
+            # Supervisor keeps its historical 4-tuple and carries the EMA state
+            # through aux, so its rollback path stays compatible with callers
+            # that only know params/opt_state.
+            ema_state = aux_out.pop('ema_state', ema_state)
         else:
-            params, opt_state, loss_val, aux_out = train_step(
-                params, opt_state, batch, current_lr, step_rng, self_state=self_state)
+            params, opt_state, ema_state, loss_val, aux_out = train_step(
+                params, opt_state, ema_state, batch, current_lr, step_rng,
+                self_state=self_state, step=step)
 
         # Update self state from forward pass
         if self_state is not None and aux_out.get('self_state') is not None:
@@ -839,15 +945,27 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
         # NaN/inf self-heal: without a Supervisor, one bad step would poison
         # params forever (every later checkpoint NaN). Roll back and skip.
         if np.isnan(loss_f) or np.isinf(loss_f):
-            params, opt_state, self_state = (
-                params_backup, opt_state_backup, self_state_backup)
+            params, opt_state, ema_state, self_state = (
+                params_backup, opt_state_backup, ema_state_backup,
+                self_state_backup)
             pbar.update(1)
             continue
+
+        # Feature bank: collect the state the lattices quantised this step;
+        # every bank_check_interval steps replace dead sparse rows on the host.
+        loop_stats = aux_out.get('loop_stats')
+        if loop_stats is not None and 'z_in' in loop_stats:
+            feature_bank.add(np.asarray(loop_stats['z_in']))
+        interval = cfg.bank_check_interval
+        if interval > 0 and step > 0 and step % interval == 0:
+            params, ema_state = _host_bank_update(
+                params, ema_state, feature_bank, step, cfg)
 
         # Save checkpoint (only with a clean step — never on poisoned params)
         if save_every > 0 and step % save_every == 0 and step > 0:
             ckpt_dir = os.path.join(output_dir, f"step_{step:06d}")
             save_cog_checkpoint(params, ckpt_dir, step, self_state=self_state,
+                                ema_state=ema_state, feature_bank=feature_bank,
                                 run_identity=run_identity, train_cfg=cfg)
 
         running_loss += loss_f
@@ -874,10 +992,13 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     pbar.refresh()
     final_dir = os.path.join(output_dir, f"step_{steps:06d}")
     save_cog_checkpoint(params, final_dir, steps, self_state=self_state,
+                        ema_state=ema_state, feature_bank=feature_bank,
                         run_identity=run_identity, train_cfg=cfg)
     if sup and sup.best_params is not None:
         sup.save_best(sup.best_params, sup.best_opt_state, sup.best_step,
-                      self_state=self_state, run_identity=run_identity)
+                      self_state=self_state, run_identity=run_identity,
+                      ema_state=sup.best_ema_state,
+                      feature_bank=feature_bank)
     print(f"[COG] Training complete → {output_dir}/")
 
 
@@ -957,13 +1078,17 @@ def _flatten_params_for_manifest(params):
 
 
 def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
-                        self_state=None):
+                        self_state=None, ema_state=None, feature_bank=None):
     """Save full checkpoint + export codebooks + tied readout for C engine.
 
     run_identity is required: the checkpoint must record the tokenizer and
     corpus it was actually trained with, never a probed global default.
     train_cfg is required because the exported config feeds Python inference,
     which reshapes attention by n_heads.
+
+    ``ema_state`` and ``feature_bank`` are buffers: they live next to
+    ``self_state`` in cog_params.pkl. When omitted (test/export callers that do
+    not train) they are written as a fresh zeroed state, never dropped.
     """
     import json, os, pickle, struct, hashlib, zlib
     import numpy as _np
@@ -981,13 +1106,18 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
             f"model_vocab_size={_meta['model_vocab_size']}")
     os.makedirs(output_dir, exist_ok=True)
 
+    if ema_state is None:
+        ema_state = init_ema_state(params, train_cfg)
+    if feature_bank is None:
+        feature_bank = FeatureBank(train_cfg.bank_capacity, train_cfg.d_model)
+
     # Exclude the frozen Qwen weights from the pickle (≈2GB): they are
     # reloaded from the .npz on demand (see _load_qwen_checkpoint). The
     # trainable z_proj IS saved — resume must keep it.
     save_params = {k: v for k, v in params.items() if k != 'qwen'}
-    ckpt = jax.tree_util.tree_map(_to_np, save_params)
-    with open(os.path.join(output_dir, "cog_params.pkl"), "wb") as f:
-        pickle.dump({'params': ckpt, 'step': step, 'self_state': self_state}, f)
+    save_cog_state(output_dir, params=save_params, step=step,
+                   self_state=self_state, ema_state=ema_state,
+                   feature_bank=feature_bank)
 
     # ── C推理引擎输出格式 ──────────────────────────────────────────────
 

@@ -251,6 +251,68 @@ def _save_opt_state(opt_state, path):
 
 # ── Public save/load API ─────────────────────────────────────────────────────
 
+COG_STATE_FILE = "cog_params.pkl"
+
+
+def _to_host(x):
+    """Device array → numpy, leaving scalars and None untouched."""
+    return np.asarray(x) if hasattr(x, 'shape') else x
+
+
+def save_cog_state(output_dir, *, params, step, self_state=None,
+                   ema_state=None, feature_bank=None):
+    """Write ``cog_params.pkl``: params plus the non-parameter buffers.
+
+    Schema v2: EMA state (N/m/last_used) and the feature bank live next to
+    ``self_state`` in the same pickle, because they are runtime state of the
+    same training run. They are never parameters and never enter the optimizer.
+    A checkpoint written before this schema is rejected by ``load_cog_state``
+    when a training resume asks for the buffers.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    payload = {
+        'format_version': FORMAT_VERSION,
+        'step': step,
+        'params': jax.tree_util.tree_map(_to_host, params),
+        'self_state': jax.tree_util.tree_map(_to_host, self_state)
+        if self_state is not None else None,
+        'ema_state': jax.tree_util.tree_map(_to_host, ema_state)
+        if ema_state is not None else None,
+        'feature_bank': feature_bank,
+    }
+    path = os.path.join(output_dir, COG_STATE_FILE)
+    with open(path, 'wb') as f:
+        pickle.dump(payload, f)
+    return path
+
+
+def load_cog_state(output_dir, require_buffers=False):
+    """Read ``cog_params.pkl`` and optionally enforce the v2 buffer schema.
+
+    ``require_buffers=True`` is the training-resume path: a checkpoint without
+    ``ema_state``/``feature_bank`` cannot be continued without silently
+    restarting the EMA statistics, so it is rejected.
+    """
+    path = os.path.join(output_dir, COG_STATE_FILE)
+    with open(path, 'rb') as f:
+        ckpt = pickle.load(f)
+    if not isinstance(ckpt, dict) or 'params' not in ckpt:
+        raise ValueError(f"{path} is not a cognitive checkpoint")
+    version = ckpt.get('format_version')
+    if version is not None and version != FORMAT_VERSION:
+        raise ValueError(f"{path}: {OLD_FORMAT_ERROR} "
+                         f"(format_version={version!r}, expected "
+                         f"{FORMAT_VERSION})")
+    if require_buffers:
+        missing = [key for key in ('ema_state', 'feature_bank')
+                   if ckpt.get(key) is None]
+        if missing:
+            raise ValueError(
+                f"{path} is missing {missing}; this checkpoint predates the "
+                f"EMA/feature-bank schema and cannot be resumed")
+    return ckpt
+
+
 def save_checkpoint(state, cfg, output_dir="checkpoint", step=None):
     """Save full LCM checkpoint as flat binary files.
 

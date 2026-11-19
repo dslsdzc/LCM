@@ -143,7 +143,8 @@ def dag_fuse(z, codebooks, thresholds, tau=0.1, eps=1e-6):
 
 # ─── Macro loop (compact via lax.scan) ──────────────────────────────────────
 
-def cog_loop_scan(z, params, cfg, max_steps=None, rng=None):
+def cog_loop_scan(z, params, cfg, max_steps=None, rng=None,
+                  return_stats=False):
     """Cognitive macro loop: the canonical six-lattice step, repeated.
 
     The step itself lives in train/cognitive_step.py and is shared with
@@ -165,11 +166,18 @@ def cog_loop_scan(z, params, cfg, max_steps=None, rng=None):
         max_steps: loop length; defaults to cfg.max_inference_steps.
         rng: PRNG key, split into one subkey per step so the routing gate's
             Gumbel noise is reproducible rather than re-seeded identically.
+        return_stats: when True, append a per-step stats pytree carrying the
+            selection indices and binding residual inputs the EMA pass needs.
+            Default False keeps the historical 3-tuple return for the existing
+            callers; the returned arrays are bit-identical in both modes.
 
     Returns:
         z_qs: (max_steps, B, d) — conscious state after each macro step.
         diffs: (max_steps, B) — stepwise delta ‖z_{t+1} - z_t‖.
         entropies: (max_steps, B) — stepwise fusion entropy, in nats.
+        stats: only when return_stats=True — dict with per-step ``z_in``,
+            ``hrq_idx``, ``sparse_idx``, ``man_idx`` and
+            ``binding_residuals`` (each stacked along axis 0).
     """
     from jax import lax
 
@@ -185,7 +193,18 @@ def cog_loop_scan(z, params, cfg, max_steps=None, rng=None):
         z_next, aux = six_lattice_step(
             z_cur, params, cfg, training=True, rng=key)
         diff = jnp.sqrt(jnp.sum((z_next - z_cur) ** 2, axis=-1))
-        return z_next, (z_next, diff, aux['entropy'])
+        stats = {
+            # The state the lattices received, not the fused output: EMA
+            # accumulates the vector each codebook actually quantised.
+            'z_in': z_cur,
+            'hrq_idx': aux['hrq_idx'],
+            'sparse_idx': aux['sparse_idx'],
+            'man_idx': aux['man_idx'],
+            'binding_residuals': aux['binding_residuals'],
+        }
+        return z_next, (z_next, diff, aux['entropy'], stats)
 
-    _, (z_qs, diffs, entropies) = lax.scan(macro_step, z, keys)
+    _, (z_qs, diffs, entropies, stats) = lax.scan(macro_step, z, keys)
+    if return_stats:
+        return z_qs, diffs, entropies, stats
     return z_qs, diffs, entropies

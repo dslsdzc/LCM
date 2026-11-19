@@ -2,9 +2,15 @@
 import dataclasses
 from typing import Tuple
 
+from train.bin_format import FORMAT_VERSION
+
 
 @dataclasses.dataclass(frozen=True)
 class LCMConfig:
+    # Checkpoint/export schema written from this config (R10). Old 24-byte
+    # headers and configs without this field are rejected on load.
+    format_version: int = FORMAT_VERSION
+
     # Dimensions
     d_model: int = 256          # Latent dimension
     vocab_size: int = 30000     # Vocabulary

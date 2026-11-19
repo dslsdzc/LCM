@@ -70,6 +70,15 @@ def _shared_train_step():
     return cfg, opt, make_train_step(cfg, opt)
 
 
+def _init_opt_and_ema(cfg, opt, params):
+    """Optimizer state on trainable only; a fresh EMA buffer (R3)."""
+    from train.ema_state import init_ema_state
+    from train.param_groups import partition_params
+
+    trainable, _, _ = partition_params(params)
+    return opt.init(trainable), init_ema_state(params, cfg)
+
+
 def _fake_qwen():
     """4-layer fake Qwen2.5-0.5B (d=896), dims mirror test_causal_mask.
 
@@ -108,13 +117,14 @@ def _run_steps(train_step, cfg, params, self_state, batch, n_steps=3, seed=123):
     opt = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.adamw(learning_rate=3e-4, weight_decay=0.0))
-    opt_state = opt.init({k: v for k, v in params.items() if k != 'qwen'})
+    opt_state, ema_state = _init_opt_and_ema(cfg, opt, params)
     rng = jax.random.PRNGKey(seed)
     losses = []
-    for _ in range(n_steps):
+    for step in range(n_steps):
         rng, step_rng = jax.random.split(rng)
-        params, opt_state, loss, aux = train_step(
-            params, opt_state, batch, 3e-4, step_rng, self_state=self_state)
+        params, opt_state, ema_state, loss, aux = train_step(
+            params, opt_state, ema_state, batch, 3e-4, step_rng,
+            self_state=self_state, step=step)
         if aux.get('self_state') is not None:
             self_state = aux['self_state']
         losses.append(float(loss))
@@ -187,16 +197,16 @@ def test_passive_target_is_next_token():
     t2 = jnp.array([[2, 3, 4, 5, 6, 7, 8, 42]])   # ONLY the last target differs
     i2 = inputs.at[0, ctx_len].set(9)             # ONLY the readout token differs
 
-    opt_state = opt.init({k: v for k, v in params.items() if k != 'qwen'})
+    opt_state, ema_state = _init_opt_and_ema(cfg, opt, params)
     # SAME rng for all calls: the self-lattice uses rng (Gumbel-Softmax), so a
     # differing rng would muddy the discriminator.
     rng = jax.random.PRNGKey(5)
-    _, _, loss_a, _ = train_step(params, opt_state, (inputs, t1), 3e-4, rng,
-                                 self_state=self_state)
-    _, _, loss_b, _ = train_step(params, opt_state, (inputs, t2), 3e-4, rng,
-                                 self_state=self_state)
-    _, _, loss_c, _ = train_step(params, opt_state, (i2, t1), 3e-4, rng,
-                                 self_state=self_state)
+    _, _, _, loss_a, _ = train_step(params, opt_state, ema_state, (inputs, t1),
+                                    3e-4, rng, self_state=self_state, step=0)
+    _, _, _, loss_b, _ = train_step(params, opt_state, ema_state, (inputs, t2),
+                                    3e-4, rng, self_state=self_state, step=0)
+    _, _, _, loss_c, _ = train_step(params, opt_state, ema_state, (i2, t1),
+                                    3e-4, rng, self_state=self_state, step=0)
     # The passive readout target must move the loss...
     assert abs(float(loss_a) - float(loss_c)) > 1e-4, \
         f"loss insensitive to inputs[:, {ctx_len}] (the passive readout target)"
@@ -212,11 +222,13 @@ def test_passive_target_is_next_token():
     params_q['qwen'] = _fake_qwen()
     params_q['z_proj'] = jax.random.normal(
         jax.random.PRNGKey(7), (896, cfg.d_model)) * (cfg.d_model ** -0.5)
-    opt_state_q = opt.init({k: v for k, v in params_q.items() if k != 'qwen'})
-    _, _, q1, _ = train_step(params_q, opt_state_q, (inputs, t1), 3e-4, rng,
-                             self_state=self_state_q)
-    _, _, q2, _ = train_step(params_q, opt_state_q, (inputs, t2), 3e-4, rng,
-                             self_state=self_state_q)
+    opt_state_q, ema_state_q = _init_opt_and_ema(cfg, opt, params_q)
+    _, _, _, q1, _ = train_step(params_q, opt_state_q, ema_state_q,
+                                (inputs, t1), 3e-4, rng,
+                                self_state=self_state_q, step=0)
+    _, _, _, q2, _ = train_step(params_q, opt_state_q, ema_state_q,
+                                (inputs, t2), 3e-4, rng,
+                                self_state=self_state_q, step=0)
     assert abs(float(q1) - float(q2)) > 1e-4, \
         f"active channel insensitive to the generation-segment targets " \
         f"({float(q1):.6f} vs {float(q2):.6f})"
