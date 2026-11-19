@@ -12,6 +12,7 @@ import pytest
 
 from train.conftest import build_tiny_corpus
 from train.cog_train import RunIdentity, verify_resume_identity
+from train.checkpoint import FORMAT_VERSION
 
 IDENTITY_KEYS = ("tokenizer_sha256", "token_data_sha256",
                  "document_spans_sha256", "model_vocab_size")
@@ -21,7 +22,8 @@ def _write_ckpt(tmp_path, meta, name="ckpt"):
     d = tmp_path / name
     d.mkdir()
     with open(d / "run_identity.json", "w") as f:
-        json.dump({k: meta[k] for k in IDENTITY_KEYS}, f)
+        json.dump({**{k: meta[k] for k in IDENTITY_KEYS},
+                   "format_version": FORMAT_VERSION}, f)
     return str(d)
 
 
@@ -80,3 +82,13 @@ def test_different_corpus_same_tokenizer_is_caught(tmp_path, registered_tiny):
 
     with pytest.raises(ValueError, match="token_data_sha256"):
         verify_resume_identity(ckpt, RunIdentity(registered_tiny, meta_b))
+
+
+def test_old_format_identity_is_rejected(tmp_path, identity):
+    """Schema v1 checkpoints are not resumed or migrated (R10)."""
+    d = tmp_path / "v1"
+    d.mkdir()
+    with open(d / "run_identity.json", "w") as f:
+        json.dump({k: identity.dataset_meta[k] for k in IDENTITY_KEYS}, f)
+    with pytest.raises(ValueError, match="old checkpoint format"):
+        verify_resume_identity(str(d), identity)

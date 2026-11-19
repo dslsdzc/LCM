@@ -33,7 +33,9 @@ import optax
 from train.config import LCMConfig
 from train.cog_train import init_cog_params, make_train_step
 from train.train_supervisor import Supervisor
-from train.checkpoint import _pack_header, _compute_checksum
+from train.checkpoint import (
+    FORMAT_VERSION, HEADER_FMT_V2, _pack_header, _compute_checksum,
+)
 import lcm as lcm_mod
 
 
@@ -317,11 +319,25 @@ def test_crc_mismatch_raises():
     # Valid file: same layout, correct CRC → loads fine
     good = os.path.join(tmp, "bar_codebook.bin")
     with open(good, 'wb') as f:
-        f.write(struct.pack('<iiiifI', M, d, 1, 1, 1.0, _compute_checksum(data)))
+        f.write(struct.pack(HEADER_FMT_V2, M, d, 1, 1, 1.0, FORMAT_VERSION,
+                            _compute_checksum(data)))
         f.write(data)
     arr, M2, d2 = lcm_mod.load_codebook_for_c(tmp, "bar_codebook.bin")
     assert (M2, d2) == (M, d) and arr.shape == (M * d,)
-    print("  #13 OK: corrupt CRC raises ValueError; valid file loads")
+
+    # A v1 24-byte header is rejected, not silently read as v2 (R10).
+    old = os.path.join(tmp, "old_codebook.bin")
+    with open(old, 'wb') as f:
+        f.write(struct.pack('<iiiifI', M, d, 1, 1, 1.0,
+                            _compute_checksum(data)))
+        f.write(data)
+    try:
+        lcm_mod.load_codebook_for_c(tmp, "old_codebook.bin")
+        raise AssertionError("expected ValueError on old 24-byte header")
+    except ValueError as e:
+        assert 'old checkpoint format' in str(e), str(e)
+    print("  #13 OK: corrupt CRC raises ValueError; valid v2 file loads; "
+          "old header rejected")
 
 
 class _FakeSpec:
@@ -353,7 +369,7 @@ def _fake_run_identity(tmp, vocab_size):
 # ── #9/#13: exported codebook .bin files round-trip through lcm.py ────────────
 
 def test_export_roundtrip_through_lcm():
-    """save_cog_checkpoint output must parse with 24-byte headers + valid CRC:
+    """save_cog_checkpoint output must parse with 32-byte v2 headers + valid CRC:
     gvalue (M=4), sparse (was written with a shadowed 36-byte writer), danger.
     """
     from train.cog_train import save_cog_checkpoint

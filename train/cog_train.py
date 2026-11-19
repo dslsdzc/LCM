@@ -45,6 +45,10 @@ from train.self_lattice import (
 from train.cog_loop import cog_loop_scan
 from train.lattices import contrast_info_nce_loss, manifold_orth_loss
 from train.qwen_lm import qwen_forward, load_qwen_params, QWEN_CONFIG
+from train.checkpoint import (
+    FORMAT_VERSION, HEADER_FMT_V2, HEADER_SIZE_V2, save_manifest,
+    _pack_header, _compute_checksum,
+)
 
 # Global Qwen params cache (load once, reuse across calls)
 _QWEN_PARAMS = None
@@ -215,6 +219,12 @@ def verify_resume_identity(resume_dir, run_identity):
     missing = [k for k in RESUME_IDENTITY_KEYS if k not in stored]
     if missing:
         raise ValueError(f"{path} is missing identity keys: {missing}")
+
+    stored_version = stored.get("format_version")
+    if stored_version != FORMAT_VERSION:
+        raise ValueError(
+            f"{path}: old checkpoint format; re-export required "
+            f"(format_version={stored_version!r}, expected {FORMAT_VERSION})")
 
     for key in RESUME_IDENTITY_KEYS:
         if stored[key] != current[key]:
@@ -873,28 +883,32 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
 
 # ─── Checkpoint ──────────────────────────────────────────────────────────────
 
-# 24-byte header format (matches checkpoint.py + lcm.py inference engine)
-_CB_HEADER_FMT = '<iiiifI'
+# Schema v2 header (32 bytes) — see train/checkpoint.py. The old 24-byte
+# header is rejected on load; there is no migration path (R10).
+_CB_HEADER_FMT = HEADER_FMT_V2
 
 
 def _pack_cb_header(M, d, n_layers, cb_type=1, curvature=1.0):
     import struct
-    return struct.pack(_CB_HEADER_FMT, int(M), int(d), int(n_layers), int(cb_type), float(curvature), 0)
+    return struct.pack(_CB_HEADER_FMT, int(M), int(d), int(n_layers),
+                       int(cb_type), float(curvature), FORMAT_VERSION, 0)
 
 
 def _write_cb_bin(dir_path, filename, mat, cb_type):
-    """Write single codebook matrix with 24-byte header."""
+    """Write single codebook matrix with 32-byte schema-v2 header."""
     import struct, zlib, os
     import numpy as _np
     mat = _np.asarray(mat, dtype=_np.float32)
     M, d = mat.shape
     data_bytes = mat.tobytes()
     crc = zlib.crc32(data_bytes) & 0xFFFFFFFF
-    hdr = struct.pack(_CB_HEADER_FMT, int(M), int(d), 1, int(cb_type), 1.0, crc)
+    hdr = struct.pack(_CB_HEADER_FMT, int(M), int(d), 1, int(cb_type), 1.0,
+                      FORMAT_VERSION, crc)
     path = os.path.join(dir_path, filename)
     with open(path, 'wb') as f:
         f.write(hdr)
         f.write(data_bytes)
+    return mat.ravel()
 
 
 def _write_flat_cb(dir_path, filename, arrays, cb_type=1):
@@ -904,19 +918,42 @@ def _write_flat_cb(dir_path, filename, arrays, cb_type=1):
     arrays = [_np.asarray(a, dtype=_np.float32) for a in arrays]
     M = arrays[0].shape[0]
     d = arrays[0].shape[1]
-    data_bytes = b''.join(a.tobytes() for a in arrays)
+    flat = _np.concatenate([a.ravel() for a in arrays]).astype(_np.float32)
+    data_bytes = flat.tobytes()
     crc = zlib.crc32(data_bytes) & 0xFFFFFFFF
-    hdr = struct.pack(_CB_HEADER_FMT, int(M), int(d), len(arrays), int(cb_type), 1.0, crc)
+    hdr = struct.pack(_CB_HEADER_FMT, int(M), int(d), len(arrays), int(cb_type),
+                      1.0, FORMAT_VERSION, crc)
     path = os.path.join(dir_path, filename)
     with open(path, 'wb') as f:
         f.write(hdr)
         f.write(data_bytes)
+    return flat
 
 
 def _to_np(x):
     """Convert jax array → numpy, no-op if already numpy."""
     import numpy as _np
     return _np.asarray(x)
+
+
+def _flatten_params_for_manifest(params):
+    """Flatten params leaves to ``params.<path>`` arrays for manifest.json."""
+    out = {}
+
+    def _walk(prefix, value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                _walk(f"{prefix}.{key}" if prefix else str(key), child)
+        elif isinstance(value, (list, tuple)):
+            for i, child in enumerate(value):
+                _walk(f"{prefix}[{i}]", child)
+        elif value is not None:
+            arr = _to_np(value)
+            if hasattr(arr, 'dtype'):
+                out[f"params.{prefix}"] = arr
+
+    _walk("", params)
+    return out
 
 
 def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
@@ -928,7 +965,7 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
     train_cfg is required because the exported config feeds Python inference,
     which reshapes attention by n_heads.
     """
-    import json, os, pickle, struct
+    import json, os, pickle, struct, hashlib, zlib
     import numpy as _np
     from train.gvalue import make_global_value_vectors
 
@@ -971,6 +1008,8 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
     # Nothing here is a literal any more: every entry is either a real tensor
     # shape or a training choice taken from train_cfg.
     export_cfg = {
+        # Schema v2 (R10): read back by lcm.py before it loads any tensor.
+        'format_version': FORMAT_VERSION,
         # Shape facts, from the tensors actually being saved.
         'd_model': d,
         'vocab_size': V,
@@ -1013,13 +1052,13 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
                 parts.append(_to_np(layer[k]).ravel())
         parts.append(_to_np(enc['q_pool']).ravel())
         parts.append(_to_np(enc['w_proj']).ravel())
-        _np.concatenate(parts).astype(_np.float32).tofile(
-            os.path.join(output_dir, "encoder.bin"))
+        enc_flat = _np.concatenate(parts).astype(_np.float32)
+        enc_flat.tofile(os.path.join(output_dir, "encoder.bin"))
     else:
         # dummy encoder (random) — exists for compatibility
         _np.random.seed(0)
-        dummy = _np.random.randn(1).astype(_np.float32)
-        dummy.tofile(os.path.join(output_dir, "encoder.bin"))
+        enc_flat = _np.random.randn(1).astype(_np.float32)
+        enc_flat.tofile(os.path.join(output_dir, "encoder.bin"))
 
     # decoder.bin (new format: gen_head)
     gh = params.get('gen_head', {})
@@ -1039,18 +1078,23 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
         dec = E.T.copy()
     dec.tofile(os.path.join(output_dir, "decoder.bin"))
 
+    # Manifest payloads: the exact float32 stream written to each .bin file.
+    # Named by logical tensor rather than path (R10: no paths in the manifest).
+    manifest_tensors = {'encoder': enc_flat, 'decoder': dec}
+
     # 导出所有 codebook .bin 文件（带 LCM_CB 头部）
     codebooks_dir = output_dir
-    cb_entries = []
 
     # HRQ: all layers stacked in one file (header + all layer data)
     hrq_layers = [_simvq_cb(params['hrq']['top'])]
     for fb in params['hrq'].get('fine', []):
         hrq_layers.append(_simvq_cb(fb))
-    _write_flat_cb(codebooks_dir, "hrq_codebook.bin", hrq_layers, 1)
+    manifest_tensors['hrq_codebook'] = _write_flat_cb(
+        codebooks_dir, "hrq_codebook.bin", hrq_layers, 1)
 
     # Sparse
-    _write_cb_bin(codebooks_dir, "sparse_codebook.bin", _to_np(params['sparse']['C']), 11)
+    manifest_tensors['sparse_codebook'] = _write_cb_bin(
+        codebooks_dir, "sparse_codebook.bin", _to_np(params['sparse']['C']), 11)
 
     # LowRank: U_0..U_k + V (raw U matrices, not reconstructed)
     lr = params['lowrank']
@@ -1059,13 +1103,15 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
     for u_k in lr['U']:
         parts_lr.append(_to_np(u_k).ravel())
     parts_lr.append(V_lr.ravel())
-    _np.concatenate(parts_lr).astype(_np.float32).tofile(
-        os.path.join(codebooks_dir, "lowrank_codebook.bin"))
+    lr_flat = _np.concatenate(parts_lr).astype(_np.float32)
+    lr_flat.tofile(os.path.join(codebooks_dir, "lowrank_codebook.bin"))
+    manifest_tensors['lowrank_codebook'] = lr_flat
 
     # Manifold: header + C + T
     C_m = _to_np(params['manifold']['C'])
     T_m = _to_np(params['manifold']['T'].reshape(C_m.shape[0], -1))
-    _write_flat_cb(codebooks_dir, "manifold_codebook.bin", [C_m, T_m], 2)
+    manifest_tensors['manifold_codebook'] = _write_flat_cb(
+        codebooks_dir, "manifold_codebook.bin", [C_m, T_m], 2)
 
     # Binding: single flat file (key_0, val_0, bind_0, key_1, ...)
     bind = params['binding']
@@ -1073,8 +1119,9 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
     for l in range(len(bind.get('key_cb', []))):
         for k in ['key_cb', 'val_cb', 'bind_cb']:
             parts_bind.append(_simvq_cb(bind[k][l]).ravel())
-    _np.concatenate(parts_bind).astype(_np.float32).tofile(
-        os.path.join(codebooks_dir, "bind_codebook.bin"))
+    bind_flat = _np.concatenate(parts_bind).astype(_np.float32)
+    bind_flat.tofile(os.path.join(codebooks_dir, "bind_codebook.bin"))
+    manifest_tensors['bind_codebook'] = bind_flat
 
     # Contrast: single flat file (C_a_0..C_a_n, C_b_0..C_b_n)
     contrast = params['contrast']
@@ -1083,8 +1130,9 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
         parts_ct.append(_simvq_cb(ca).ravel())
     for cb in contrast.get('C_b', []):
         parts_ct.append(_simvq_cb(cb).ravel())
-    _np.concatenate(parts_ct).astype(_np.float32).tofile(
-        os.path.join(codebooks_dir, "contrast_codebook.bin"))
+    ct_flat = _np.concatenate(parts_ct).astype(_np.float32)
+    ct_flat.tofile(os.path.join(codebooks_dir, "contrast_codebook.bin"))
+    manifest_tensors['contrast_codebook'] = ct_flat
 
     # The tokenizer this run actually trained with, not a probed default.
     # The old code copied data/tokenizer.json — the legacy 30k BPE — no matter
@@ -1095,6 +1143,7 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
 
     with open(os.path.join(output_dir, "run_identity.json"), "w") as f:
         json.dump({
+            "format_version": FORMAT_VERSION,
             "tokenizer_id": _spec.tokenizer_id,
             "tokenizer_sha256": _spec.sha256,
             "token_data_sha256": _meta["token_data_sha256"],
@@ -1105,12 +1154,10 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
             "step": int(step),
         }, f, indent=2)
 
-    # gvalue codebooks — standard 24-byte header. The old 36-byte custom
+    # gvalue codebooks — schema-v2 32-byte header. The old 36-byte custom
     # header made lcm.py parse M as garbage (gv_n wrong → C engine got
     # misaligned pointers).
     try:
-        import hashlib as _hl
-        from train.checkpoint import _pack_header, _compute_checksum
         C_pos, C_neg = make_global_value_vectors(d)
         C_p = _to_np(C_pos)
         # PLACEHOLDER — NOT A WORKING SAFETY LAYER.
@@ -1124,11 +1171,14 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
         C_n = C_p.copy()
         _hdr = bytearray(_pack_header(C_p.shape[0], d, 1, 2, 1.0))
         _data = C_p.tobytes() + C_n.tobytes()
-        struct.pack_into("<I", _hdr, 20, _compute_checksum(_data))
+        struct.pack_into("<I", _hdr, HEADER_SIZE_V2 - 4,
+                         _compute_checksum(_data))
         with open(os.path.join(output_dir, "gvalue_codebook.bin"), "wb") as _f:
             _f.write(_hdr)
             _f.write(_data)
-            _f.write(_hl.sha256(_data).digest())
+            _f.write(hashlib.sha256(_data).digest())
+        manifest_tensors['gvalue_codebook'] = _np.concatenate(
+            [C_p.ravel(), C_n.ravel()]).astype(_np.float32)
     except Exception as e:
         print(f"[CKPT] gvalue write skipped: {e}")
     # danger codebook — PLACEHOLDER, same story as gvalue above: identical
@@ -1138,21 +1188,28 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
     try:
         print("[CKPT] WARNING: exporting PLACEHOLDER danger codebook "
               "(threat == normal) — the danger lattice is INACTIVE")
-        import zlib as _zl
         M_d = export_cfg["M_danger"]
         _np.random.seed(0)
         danger_t = _np.random.randn(M_d, d).astype(_np.float32) * 0.02
         danger_n = danger_t.copy()
         _data_d = danger_t.tobytes() + danger_n.tobytes()
-        _sha_d = _hl.sha256(_data_d).digest()
-        _crc_d = _zl.crc32(_data_d) & 0xFFFFFFFF
-        _hdr_d = struct.pack("<iiiifI", int(M_d), int(d), 1, 2, 1.0, _crc_d)
+        _sha_d = hashlib.sha256(_data_d).digest()
+        _crc_d = zlib.crc32(_data_d) & 0xFFFFFFFF
+        _hdr_d = struct.pack(_CB_HEADER_FMT, int(M_d), int(d), 1, 2, 1.0,
+                             FORMAT_VERSION, _crc_d)
         with open(os.path.join(output_dir, "danger_codebook.bin"), "wb") as _f:
             _f.write(_hdr_d)
             _f.write(_data_d)
             _f.write(_sha_d)
+        manifest_tensors['danger_codebook'] = _np.concatenate(
+            [danger_t.ravel(), danger_n.ravel()]).astype(_np.float32)
     except Exception as e:
         print(f"[CKPT] danger write skipped: {e}")
+
+    # Per-tensor hashes for the exported files, plus a summary of the pickled
+    # training params so a resume can detect a truncated/mixed checkpoint.
+    manifest_tensors.update(_flatten_params_for_manifest(save_params))
+    save_manifest(output_dir, manifest_tensors)
 
     # 统计大小
     total_bytes = 0

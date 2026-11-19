@@ -27,7 +27,6 @@ import signal
 import struct
 import sys
 import time
-import zlib
 
 os.environ.setdefault("JAX_SKIP_CUDA_CONSTRAINTS_CHECK", "1")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -1099,26 +1098,6 @@ def _silu(x):
     return x * _sigmoid(x)
 
 
-HEADER_FMT = '<iiiifI'
-HEADER_SIZE = 24
-
-
-def _read_bin_header(path):
-    with open(path, 'rb') as f:
-        hdr = f.read(HEADER_SIZE)
-    M, dim, n_layers, cb_type, c, crc = struct.unpack(HEADER_FMT, hdr)
-    return int(M), int(dim), int(n_layers), int(cb_type), float(c), int(crc)
-
-
-def _read_bin_data(path, has_hash=False):
-    with open(path, 'rb') as f:
-        f.seek(HEADER_SIZE)
-        data = f.read()
-    if has_hash:
-        data = data[:-32]
-    return np.frombuffer(data, dtype=np.float32)
-
-
 def load_encoder(ckpt_dir, d, n_layers, V, d_ff, max_seq_len):
     path = Path(ckpt_dir) / "encoder.bin"
     flat = np.fromfile(path, dtype=np.float32)
@@ -1183,20 +1162,16 @@ def load_decoder(ckpt_dir, d, V):
 
 
 def load_codebook_for_c(ckpt_dir, filename):
+    """Load a schema-v2 codebook for the C engine.
+
+    Old 24-byte headers are rejected outright (R10); there is no migration.
+    """
+    from train.checkpoint import read_bin_v2
+
     path = Path(ckpt_dir) / filename
-    M, d, n_layers, cb_type, c, crc = _read_bin_header(path)
-    data = _read_bin_data(path,
-                          has_hash=(filename.startswith('gvalue') or filename.startswith('danger')))
-    # CRC covers the data section (SHA-256 suffix already stripped above).
-    # Raise on mismatch — a silently corrupt codebook misaligns the C
-    # engine's fixed-size arrays.
-    actual_crc = zlib.crc32(data) & 0xFFFFFFFF
-    if actual_crc != crc:
-        raise ValueError(
-            f"CRC mismatch in {path}: stored={crc:#010x}, "
-            f"actual={actual_crc:#010x} — file is corrupt or was written "
-            f"by an old writer; re-export the checkpoint")
-    return np.ascontiguousarray(data, dtype=np.float32), M, d
+    has_hash = (filename.startswith('gvalue') or filename.startswith('danger'))
+    header, data = read_bin_v2(str(path), has_hash=has_hash)
+    return np.ascontiguousarray(data, dtype=np.float32), header['M'], header['d']
 
 
 def _check_lcm_dim(lib, d_model):
@@ -1558,6 +1533,13 @@ class LCMInferEngine:
 
         with open(self.checkpoint_dir / "config.json") as f:
             self.cfg = json.load(f)
+        from train.checkpoint import FORMAT_VERSION
+        if self.cfg.get('format_version') != FORMAT_VERSION:
+            raise SystemExit(
+                f"[INFER] {self.checkpoint_dir / 'config.json'} has checkpoint "
+                f"format_version={self.cfg.get('format_version')!r}; this "
+                f"engine requires {FORMAT_VERSION}. Old checkpoints are not "
+                f"migrated — re-export required.")
         self.d = self.cfg['d_model']
         self.V = self.cfg['vocab_size']
         self.max_seq_len = self.cfg['max_seq_len']

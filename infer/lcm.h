@@ -54,6 +54,13 @@ extern "C" {
 #define LCM_CONVERGENCE_TOL       1e-3f
 #define LCM_DEFAULT_SAFETY_MARGIN 0.5f
 
+/* Checkpoint/export schema v2 (R10). Every header-bearing .bin file starts
+ * with a 32-byte header: int32 M, d, n_layers, type; float c; uint32
+ * format_version; uint32 checksum. Python owns manifest.json; the C side only
+ * needs the version tag to reject v1 files before pointers are passed in. */
+#define LCM_HEADER_SIZE_V2   32
+#define LCM_FORMAT_VERSION   2
+
 /* ─── Core types ─────────────────────────────────────────────────────────── */
 
 typedef float vec_t[LCM_D];                /* Single vector */

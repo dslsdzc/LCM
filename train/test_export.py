@@ -71,6 +71,30 @@ def test_exported_config_reports_the_tied_extent(exported):
         exported_cfg = json.load(f)
     assert exported_cfg["vocab_size"] == tiny_spec.model_vocab_size
     assert exported_cfg["d_model"] == cfg.d_model
+    assert exported_cfg["format_version"] == 2
+
+
+def test_manifest_covers_exported_tensors(exported):
+    """Every exported .bin has a per-tensor canonical hash (R10)."""
+    from train.checkpoint import FORMAT_VERSION, load_manifest
+    _, _, out, _, _ = exported
+    manifest = load_manifest(out)
+    assert manifest["format_version"] == FORMAT_VERSION
+    tensors = manifest["tensors"]
+    for name in ("encoder", "decoder", "hrq_codebook", "sparse_codebook",
+                 "lowrank_codebook", "manifold_codebook", "bind_codebook",
+                 "contrast_codebook", "gvalue_codebook", "danger_codebook"):
+        assert name in tensors, f"manifest is missing {name}"
+        entry = tensors[name]
+        assert entry["name"] == name
+        assert entry["dtype"] == "float32"
+        assert len(entry["sha256"]) == 64
+    assert "params.encoder.embed" in tensors
+    # offset/length locate each tensor in the canonical stream.
+    offset = 0
+    for entry in sorted(tensors.values(), key=lambda e: e["offset"]):
+        assert entry["offset"] == offset
+        offset += entry["length"]
 
 
 def test_exported_config_carries_the_real_training_config(exported):

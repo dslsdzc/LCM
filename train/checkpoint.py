@@ -2,12 +2,16 @@
 
 Each codebook .bin file uses:
   ┌──────────────────────┐
-  │ Header (24 bytes)    │  M, d, n_layers, type, c, checksum
+  │ Header (32 bytes, v2)│  M, d, n_layers, type, c, format_version, checksum
   ├──────────────────────┤
   │ Data (float32[])     │  flat vectors, M*d per layer
   ├──────────────────────┤
   │ SHA-256 (32 bytes)   │  (frozen modules only: gvalue, danger)
   └──────────────────────┘
+
+Schema v2 (R10) also writes manifest.json with a per-tensor SHA-256 over a
+canonical float32 little-endian serialization. 24-byte v1 headers are
+rejected, never migrated.
 
 Directory layout:
   checkpoint/
@@ -27,6 +31,7 @@ Directory layout:
   ├── opt_state.bin         # optimizer state (Python, not C-readable)
   ├── config.json           # all hyperparameters
   ├── tokenizer.json        # BPE vocabulary
+  ├── manifest.json         # schema v2: per-tensor shape/dtype/offset/sha256
   └── step.txt              # step number
 """
 import os
@@ -42,11 +47,19 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-# ── Binary header format ─────────────────────────────────────────────────────
-# struct: <iiifi = 4+4+4+4+4+4 = 24 bytes
-# 6 fields: M(int32), d(int32), n_layers(int32), type(int32), c(float32), checksum(uint32)
-HEADER_FMT = '<iiiifI'
-HEADER_SIZE = struct.calcsize(HEADER_FMT)
+# ── Binary header format (schema v2) ─────────────────────────────────────────
+# struct: <iiiifII = 4*5 + 4 + 4 = 32 bytes
+# fields: M(int32), d(int32), n_layers(int32), type(int32), c(float32),
+#         format_version(uint32), checksum(uint32)
+#
+# v1 used a 24-byte header (<iiiifI). It is rejected, never migrated: the
+# checksum/format-version field positions differ, so reading one as v2 would
+# silently misalign the data section.
+HEADER_FMT_V2 = '<iiiifII'
+HEADER_SIZE_V2 = struct.calcsize(HEADER_FMT_V2)
+FORMAT_VERSION = 2
+
+OLD_FORMAT_ERROR = "old checkpoint format; re-export required"
 
 # Codebook type constants
 CB_EUCLIDEAN = 1
@@ -54,16 +67,9 @@ CB_HYPERBOLIC = 2
 
 
 def _pack_header(M, d, n_layers, cb_type, curvature=1.0):
-    """Pack 24-byte codebook header."""
-    return struct.pack(HEADER_FMT, int(M), int(d), int(n_layers),
-                       int(cb_type), float(curvature), 0)
-
-
-def _unpack_header(data):
-    """Unpack 24-byte header → (M, d, n_layers, type, c, checksum_uint32)."""
-    raw = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
-    # Convert to standard ints
-    return raw
+    """Pack 32-byte schema-v2 codebook header."""
+    return struct.pack(HEADER_FMT_V2, int(M), int(d), int(n_layers),
+                       int(cb_type), float(curvature), FORMAT_VERSION, 0)
 
 
 def _compute_checksum(data):
@@ -75,15 +81,115 @@ def _sha256(data):
     return hashlib.sha256(data).digest()
 
 
+# ── Schema v2: canonical hashing and manifest ───────────────────────────────
+
+MANIFEST_NAME = "manifest.json"
+
+
+def _canonical_tensor_bytes(array):
+    """Canonical serialization of one tensor (R10).
+
+    float32 little-endian, with the shape as an int32[ndim] prefix. No names,
+    paths or timestamps: two runs that produced the same weights hash equal.
+    """
+    a = np.ascontiguousarray(np.asarray(array), dtype='<f4')
+    prefix = np.asarray(a.ndim, dtype='<i4').tobytes()
+    prefix += np.asarray(a.shape, dtype='<i4').tobytes()
+    return prefix + a.tobytes()
+
+
+def canonical_sha256(tensors):
+    """SHA-256 over tensors in name order, each in canonical form."""
+    h = hashlib.sha256()
+    for name in sorted(tensors):
+        h.update(_canonical_tensor_bytes(tensors[name]))
+    return h.hexdigest()
+
+
+def save_manifest(output_dir, tensors):
+    """Write manifest.json describing every tensor in canonical form.
+
+    ``offset``/``length`` locate the tensor in the canonical float32 stream
+    (name-sorted, concatenated), not in a particular .bin file: the manifest
+    is an integrity record, and the logical names map to files by convention.
+    """
+    entries = {}
+    offset = 0
+    for name in sorted(tensors):
+        a = np.ascontiguousarray(np.asarray(tensors[name]), dtype='<f4')
+        length = a.nbytes
+        entries[name] = {
+            'name': name,
+            'shape': [int(x) for x in a.shape],
+            'dtype': 'float32',
+            'offset': offset,
+            'length': length,
+            'sha256': hashlib.sha256(_canonical_tensor_bytes(a)).hexdigest(),
+        }
+        offset += length
+    manifest = {'format_version': FORMAT_VERSION, 'tensors': entries}
+    path = os.path.join(output_dir, MANIFEST_NAME)
+    with open(path, 'w') as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+    print(f"  [CKPT] {MANIFEST_NAME} ({len(entries)} tensors)")
+
+
+def load_manifest(output_dir):
+    """Read manifest.json, rejecting anything that is not schema v2."""
+    path = os.path.join(output_dir, MANIFEST_NAME)
+    if not os.path.exists(path):
+        raise ValueError(f"{path} missing; {OLD_FORMAT_ERROR}")
+    with open(path) as f:
+        manifest = json.load(f)
+    if manifest.get('format_version') != FORMAT_VERSION:
+        raise ValueError(f"{path}: {OLD_FORMAT_ERROR}")
+    return manifest
+
+
+def read_bin_v2(path, has_hash=False):
+    """Read a schema-v2 .bin file → (header_dict, float32 array).
+
+    The 32-byte header carries ``format_version``. A 24-byte header (or any
+    file too short to hold a v2 header) is rejected with ``ValueError``; there
+    is no migration path. ``has_hash`` strips the trailing 32-byte SHA-256
+    used by the frozen gvalue/danger codebooks before checksumming.
+    """
+    with open(path, 'rb') as f:
+        hdr_bytes = f.read(HEADER_SIZE_V2)
+        if len(hdr_bytes) < HEADER_SIZE_V2:
+            raise ValueError(f"{OLD_FORMAT_ERROR} ({path})")
+        raw = struct.unpack(HEADER_FMT_V2, hdr_bytes)
+        M, d, n_layers, cb_type, c, version, stored_crc = raw
+        if version != FORMAT_VERSION:
+            raise ValueError(f"{OLD_FORMAT_ERROR} ({path})")
+        data_bytes = f.read()
+
+    if has_hash:
+        if len(data_bytes) < 32:
+            raise ValueError(f"{path}: truncated SHA-256 suffix; re-export required")
+        data_bytes = data_bytes[:-32]
+
+    actual_crc = _compute_checksum(data_bytes)
+    if actual_crc != stored_crc:
+        raise ValueError(
+            f"CRC mismatch in {path}: stored={stored_crc:#010x}, "
+            f"actual={actual_crc:#010x} — file is corrupt or was written "
+            f"by an old writer; re-export the checkpoint")
+
+    header = {'M': M, 'd': d, 'n_layers': n_layers, 'type': cb_type,
+              'c': c, 'format_version': version}
+    return header, np.frombuffer(data_bytes, dtype=np.float32)
+
+
 # ── Save helpers ──────────────────────────────────────────────────────────────
 
 def _write_bin(path, header_bytes, data_bytes, sha256_digest=None):
     """Write .bin file: header + data + optional SHA256."""
     # Compute CRC32 over data
     checksum = _compute_checksum(data_bytes)
-    # Patch header with real checksum
-    hdr = struct.unpack(HEADER_FMT, header_bytes)
-    hdr_fixed = struct.pack(HEADER_FMT, *hdr[:5], checksum)
+    # Patch header with real checksum (v2: checksum is the last field)
+    hdr = struct.unpack(HEADER_FMT_V2, header_bytes)
+    hdr_fixed = struct.pack(HEADER_FMT_V2, *hdr[:6], checksum)
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'wb') as f:
@@ -100,31 +206,18 @@ def _read_bin(path, has_hash=False):
 
     For uniform codebooks (all layers same M), returns (n_layers, M, d) array.
     For variable-size codebooks (HRQ), returns flat 1D array — caller must reshape.
+    Legacy 24-byte headers are rejected by ``read_bin_v2``.
     """
-    with open(path, 'rb') as f:
-        hdr_bytes = f.read(HEADER_SIZE)
-        M, d, n_layers, cb_type, c, stored_crc = _unpack_header(hdr_bytes)
-        data_bytes = f.read()  # read all remaining bytes
-        sha = None
-        if has_hash:
-            sha = data_bytes[-32:]
-            data_bytes = data_bytes[:-32]
-
-        # Verify checksum (WARN, not raise: old checkpoints predate CRC or
-        # were written by writers that computed it differently — they must
-        # still load, but the corruption is surfaced clearly).
-        actual_crc = _compute_checksum(data_bytes)
-        if actual_crc != stored_crc:
-            print(f"  [WARN] CRC mismatch in {path}: stored={stored_crc:#x}, "
-                  f"actual={actual_crc:#x} — file is corrupt or was written "
-                  f"by an older writer; re-export the checkpoint")
-
-        data = np.frombuffer(data_bytes, dtype=np.float32)
-        expected = M * d * n_layers
-        if data.size == expected:
-            data = data.reshape(n_layers, M, d)
-
-    return {'M': M, 'd': d, 'n_layers': n_layers, 'type': cb_type, 'c': c}, data, sha
+    header, data = read_bin_v2(path, has_hash=has_hash)
+    sha = None
+    if has_hash:
+        with open(path, 'rb') as f:
+            f.seek(-32, os.SEEK_END)
+            sha = f.read(32)
+    expected = header['M'] * header['d'] * header['n_layers']
+    if data.size == expected:
+        data = data.reshape(header['n_layers'], header['M'], header['d'])
+    return header, data, sha
 
 
 # ── Per-module savers ────────────────────────────────────────────────────────
@@ -291,6 +384,7 @@ def save_checkpoint(state, cfg, output_dir="checkpoint", step=None):
 
     # 1. Config
     cfg_dict = {f.name: getattr(cfg, f.name) for f in dataclasses.fields(cfg)}
+    cfg_dict['format_version'] = FORMAT_VERSION
     with open(os.path.join(output_dir, "config.json"), 'w') as f:
         json.dump(cfg_dict, f, indent=2, default=str)
     print(f"  [CKPT] config.json")
