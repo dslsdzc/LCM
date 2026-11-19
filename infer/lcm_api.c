@@ -273,27 +273,28 @@ int lcm_infer_loop(const float* z, int d,
                     bind_C, bind_M, contrast_C, contrast_M,
                     n_lattices) != 0) return -1;
 
-    /* Build gvalue */
+    /* Build gvalue through gvalue_init so the anchors are projected into the
+     * Poincaré ball and hashed.  A raw memcpy here would feed
+     * gvalue_check_safety anchors from a different domain (R6). */
     gvalue_t gv;
     memset(&gv, 0, sizeof(gv));
     if (gv_pos && gv_neg && gv_n > 0) {
+        float pos_pad[LCM_N_VALUE_PAIRS * LCM_D];
+        float neg_pad[LCM_N_VALUE_PAIRS * LCM_D];
+        memset(pos_pad, 0, sizeof(pos_pad));
+        memset(neg_pad, 0, sizeof(neg_pad));
         int n_copy = gv_n < LCM_N_VALUE_PAIRS ? gv_n : LCM_N_VALUE_PAIRS;
-        for (int i = 0; i < n_copy; i++) {
-            memcpy(gv.C_pos[i], gv_pos + i * d, d * sizeof(float));
-            memcpy(gv.C_neg[i], gv_neg + i * d, d * sizeof(float));
-        }
-        gv.D = d;
+        memcpy(pos_pad, gv_pos, (size_t)n_copy * (size_t)d * sizeof(float));
+        memcpy(neg_pad, gv_neg, (size_t)n_copy * (size_t)d * sizeof(float));
+        gvalue_init(&gv, pos_pad, neg_pad, d);
     }
 
-    /* Build danger lattice */
+    /* Build danger lattice through danger_init (sets the R7 threshold and the
+     * shared SHA-256 integrity hash). */
     danger_lattice_t dl;
     memset(&dl, 0, sizeof(dl));
     if (danger_t && danger_n && danger_m > 0) {
-        dl.C_threats = (const vec_t*)danger_t;
-        dl.C_normal  = (const vec_t*)danger_n;
-        dl.M_danger  = danger_m;
-        dl.D         = d;
-        dl.safety_threshold = 0.005f;
+        danger_init(&dl, danger_t, danger_n, danger_m, d);
     }
 
     /* Build inference state */

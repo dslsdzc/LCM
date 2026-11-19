@@ -37,7 +37,7 @@ from train.gvalue import GValueCodebook, make_global_value_vectors
 MAX_RETRIEVALS = 12
 MAX_STEPS = 32
 CONSISTENCY_THRESHOLD = 0.3
-SAFETY_THRESHOLD = 0.005
+SAFETY_THRESHOLD = 0.05  # R7 relative-gap threshold
 DEFAULT_SAFETY_MARGIN = 0.5
 D_MODEL = 256
 N_VALUE_PAIRS = 4
@@ -74,20 +74,19 @@ def danger_assess_py(
     ``relative_gap`` is the bounded R7 quantity
     ``(sim_normal - sim_threat) / (sim_normal + sim_threat + eps)``;
     positive means the input is closer to a threat pattern.
+
+    ``step_count`` is accepted for signature parity but ignored: runaway is a
+    scheduler-level budget check (Task 10), not a danger-lattice threat.
     """
     # Priority 1: resource abuse
     if retrieval_count > MAX_RETRIEVALS:
         return True, 2, 1.0  # THREAT_RESOURCE_ABUSE=2
 
-    # Priority 2: runaway
-    if step_count > MAX_STEPS:
-        return True, 3, 1.0  # THREAT_RUNAWAY=3
-
-    # Priority 3: deception
+    # Priority 2: deception
     if value_consistency < CONSISTENCY_THRESHOLD:
         return True, 4, 2.0 - value_consistency  # THREAT_DECEPTION=4
 
-    # Priority 4: pattern match
+    # Priority 3: pattern match
     if relative_gap > SAFETY_THRESHOLD:
         return True, 1, relative_gap  # THREAT_PATTERN_MATCH=1
 
@@ -117,22 +116,19 @@ def test_danger_assess_contract(rc, sc, vc, ds):
     block, threat, score = danger_assess_py(rc, sc, vc, ds)
 
     c1 = rc > MAX_RETRIEVALS
-    c2 = sc > MAX_STEPS
     c3 = vc < CONSISTENCY_THRESHOLD
     c4 = ds > SAFETY_THRESHOLD
-    any_trigger = c1 or c2 or c3 or c4
+    any_trigger = c1 or c3 or c4
 
-    # P1: block ⇔ any trigger
+    # P1: block ⇔ any trigger (step_count is scheduler-owned, not danger)
     assert block == any_trigger, (
-        f"P1 failed: block={block}, triggers=({c1},{c2},{c3},{c4}) "
+        f"P1 failed: block={block}, triggers=({c1},{c3},{c4}) "
         f"for (rc={rc}, sc={sc}, vc={vc}, ds={ds})"
     )
 
     # P2: threat type matches priority
     if c1:
         assert threat == 2, f"P2a: expected THREAT_RESOURCE_ABUSE(2), got {threat}"
-    elif c2:
-        assert threat == 3, f"P2b: expected THREAT_RUNAWAY(3), got {threat}"
     elif c3:
         assert threat == 4, f"P2c: expected THREAT_DECEPTION(4), got {threat}"
     elif c4:
@@ -141,8 +137,8 @@ def test_danger_assess_contract(rc, sc, vc, ds):
         assert threat == 0, f"P2e: expected THREAT_NONE(0), got {threat}"
 
     # P4: score consistency
-    if threat == 2 or threat == 3:
-        assert score == 1.0, f"P4s1/2: expected score=1.0, got {score}"
+    if threat == 2:
+        assert score == 1.0, f"P4s1: expected score=1.0, got {score}"
     elif threat == 4:
         assert abs(score - (2.0 - vc)) < 1e-6, (
             f"P4s3: expected score={2.0 - vc}, got {score}"
@@ -172,17 +168,21 @@ def test_danger_retrieval_boundary(rc, vc, ds):
 
 
 @given(
-    sc=integers(min_value=MAX_STEPS - 1, max_value=MAX_STEPS + 2),
+    sc=integers(min_value=MAX_STEPS, max_value=MAX_STEPS + 5),
     vc=consistency_vals,
     ds=relative_gaps,
 )
 @settings(max_examples=100)
-def test_danger_step_boundary(sc, vc, ds):
-    """E3: behavior at step_count boundary."""
+def test_danger_step_is_scheduler_owned(sc, vc, ds):
+    """E3: step_count alone never blocks (runaway moved to the scheduler)."""
     block, threat, _ = danger_assess_py(0, sc, vc, ds)
-    if sc > MAX_STEPS:
-        assert block, f"Expected block when sc={sc} > {MAX_STEPS}"
-        assert threat == 3, f"Expected THREAT_RUNAWAY, got {threat}"
+    expected = vc < CONSISTENCY_THRESHOLD or ds > SAFETY_THRESHOLD
+    assert block == expected, (
+        f"danger_assess must ignore step_count={sc}: block={block}, "
+        f"expected={expected}"
+    )
+    if not block:
+        assert threat == 0
 
 
 @given(vc=floats(min_value=0.29, max_value=0.31, allow_nan=False))

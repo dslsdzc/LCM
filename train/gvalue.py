@@ -173,13 +173,16 @@ class GValueCodebook:
                            margin_penalty_threshold=0.2, weight=0.001):
         """Mild penalty when any output is close to boundary violation.
 
-        Trains representations to naturally stay clear of the safety boundary.
-        Only activates when margin < margin_penalty_threshold.
+        ``check_safety_batch`` returns ``margins = -balance``; the strict
+        boundary is ``margin >= safety_margin_relative``.  Define the
+        boundary-relative slack ``slack = margin - safety_margin_relative``
+        (safe ⇒ slack ≥ 0), so the penalty stays meaningful for any margin::
 
-        L_margin = weight * mean(max(0, margin_penalty_threshold - margin)²)
+            L_margin = weight * mean(max(0, margin_penalty_threshold - slack)²)
         """
         _, margins, _ = self.check_safety_batch(z_batch, safety_margin_relative)
-        excess = jnp.clip(margin_penalty_threshold - margins, min=0)
+        slack = margins - safety_margin_relative
+        excess = jnp.clip(margin_penalty_threshold - slack, min=0)
         return weight * jnp.mean(excess ** 2)
 
     def compute_value_signal_for_output(self, o, tau=0.1):
@@ -189,9 +192,16 @@ class GValueCodebook:
 
         Range [-1, +1]: +1 means strongly aligned with positive values,
         -1 means strongly aligned with negative values.
+
+        R6: both the output and the anchors are mapped through
+        ``to_poincare`` first; raw Euclidean vectors must never be compared
+        with the ball anchors.
         """
-        d_pos = poincare_distance(o, self.C_pos).min()  # scalar
-        d_neg = poincare_distance(o, self.C_neg).min()
+        o_P = to_poincare(o)
+        C_pos_P = to_poincare(self.C_pos)
+        C_neg_P = to_poincare(self.C_neg)
+        d_pos = poincare_distance(o_P, C_pos_P).min()  # scalar
+        d_neg = poincare_distance(o_P, C_neg_P).min()
         # Soft signal
         pos_weight = jnp.exp(-d_pos / tau)
         neg_weight = jnp.exp(-d_neg / tau)
@@ -201,17 +211,23 @@ class GValueCodebook:
     def compute_value_signal_batch(self, outputs, tau=0.1):
         """Compute value signals for all lattice outputs.
 
+        R6: all distances are evaluated in the unified Poincaré domain
+        (``to_poincare`` on both outputs and anchors).
+
         Args:
             outputs: list of (B, d) arrays, one per lattice.
 
         Returns:
             signals: (B, n_lattices) value signals in [-1, +1].
         """
+        C_pos_P = to_poincare(self.C_pos)
+        C_neg_P = to_poincare(self.C_neg)
         signals = []
         for o in outputs:
-            d_pos = jnp.stack([poincare_distance(o, self.C_pos[i])
+            o_P = to_poincare(o)
+            d_pos = jnp.stack([poincare_distance(o_P, C_pos_P[i])
                                for i in range(4)]).min(axis=0)  # (B, 1)
-            d_neg = jnp.stack([poincare_distance(o, self.C_neg[i])
+            d_neg = jnp.stack([poincare_distance(o_P, C_neg_P[i])
                                for i in range(4)]).min(axis=0)  # (B, 1)
             pos_w = jnp.exp(-d_pos.squeeze(-1) / tau)  # (B,)
             neg_w = jnp.exp(-d_neg.squeeze(-1) / tau)  # (B,)

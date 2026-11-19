@@ -40,7 +40,7 @@ from nagini_contracts.contracts import (
 MAX_RETRIEVALS: int = 12
 MAX_STEPS: int = 32
 CONSISTENCY_THRESHOLD: float = 0.3
-SAFETY_THRESHOLD: float = 0.005
+SAFETY_THRESHOLD: float = 0.05  # R7 relative-gap threshold
 DEFAULT_SAFETY_MARGIN: float = 0.5
 
 # Threat types
@@ -74,26 +74,26 @@ def danger_assess_pure(
     is the R7 bounded relative proximity: positive when the threat anchors are
     closer.  Equal similarities give gap 0, which is not blocked.
 
+    ``step_count`` is accepted for signature parity but ignored: runaway is a
+    scheduler-level budget check (Task 10), not a danger-lattice threat.
+
     Postconditions (contract):
-      - out_block  ⇔  retrieval_count > 12 ∨ step_count > 32
-                       ∨ value_consistency < 0.3 ∨ relative_gap > 0.005
-      - out_threat ∈ {0, 1, 2, 3, 4}  (valid threat enum)
+      - out_block  ⇔  retrieval_count > 12
+                       ∨ value_consistency < 0.3 ∨ relative_gap > 0.05
+      - out_threat ∈ {0, 1, 2, 4}  (valid danger threat enum)
       - out_threat matches the first-triggered condition in priority order:
-          c1 (resource_abuse) > c2 (runaway) > c3 (deception) > c4 (pattern)
+          c1 (resource_abuse) > c3 (deception) > c4 (pattern)
       - c1 ⇒ out_score = 1.0
-      - c2 ⇒ out_score = 1.0
       - c3 ⇒ out_score = 2.0 - value_consistency
+      - otherwise ⇒ out_score = relative_gap
     """
     # Priority 1: resource abuse
     if retrieval_count > MAX_RETRIEVALS:
         return True, THREAT_RESOURCE_ABUSE, 1.0
-    # Priority 2: runaway
-    if step_count > MAX_STEPS:
-        return True, THREAT_RUNAWAY, 1.0
-    # Priority 3: deception
+    # Priority 2: deception
     if value_consistency < CONSISTENCY_THRESHOLD:
         return True, THREAT_DECEPTION, 2.0 - value_consistency
-    # Priority 4: pattern match
+    # Priority 3: pattern match
     if relative_gap > SAFETY_THRESHOLD:
         return True, THREAT_PATTERN_MATCH, relative_gap
     # No threat
@@ -182,11 +182,11 @@ def verify_danger_assess_contract() -> None:
     Assert(t2 == THREAT_RESOURCE_ABUSE)
     Assert(s2 == 1.0)
 
-    # Case 3: step just over → block, runaway
+    # Case 3: step_count is scheduler-owned → danger ignores it
     r3, t3, s3 = danger_assess_pure(0, MAX_STEPS + 1, 1.0, 0.0)
-    Assert(r3)
-    Assert(t3 == THREAT_RUNAWAY)
-    Assert(s3 == 1.0)
+    Assert(not r3)
+    Assert(t3 == THREAT_NONE)
+    Assert(s3 == 0.0)
 
     # Case 4: consistency below threshold → block, deception
     r4, t4, s4 = danger_assess_pure(0, 0, 0.0, 0.0)

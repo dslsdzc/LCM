@@ -61,7 +61,7 @@ from z3 import *
 MAX_RETRIEVALS       = 12
 MAX_STEPS            = 32
 CONSISTENCY_THRESHOLD = RealVal("0.3")
-SAFETY_THRESHOLD     = RealVal("0.005")
+SAFETY_THRESHOLD     = RealVal("0.05")
 DEFAULT_MARGIN       = RealVal("0.5")
 N_VALUE_PAIRS        = 4
 
@@ -128,7 +128,7 @@ def implies(a: BoolRef, b: BoolRef) -> BoolRef:
 #                         float value_consistency,
 #                         float* out_score, int* out_threat, bool* out_block);
 #
-#   Contract (from danger.c lines 64-112):
+#   Contract (from danger.c):
 #     Pre:  dl initialized, z has D elements
 #           step_count >= 0, retrieval_count >= 0
 #     Post: *out_block true iff threat condition exceeded
@@ -137,11 +137,11 @@ def implies(a: BoolRef, b: BoolRef) -> BoolRef:
 #
 #   Early-return priority (first match wins):
 #     1. retrieval_count > MAX_RETRIEVALS → THREAT_RESOURCE_ABUSE, score=1.0
-#     2. step_count > MAX_STEPS          → THREAT_RUNAWAY,        score=1.0
-#     3. value_consistency < 0.3         → THREAT_DECEPTION, score=2.0-val
-#     4. relative_gap > SAFETY_THRESHOLD → THREAT_PATTERN_MATCH,  score=relative_gap
-#     5. otherwise                       → THREAT_NONE,           score=relative_gap
+#     2. value_consistency < 0.3         → THREAT_DECEPTION, score=2.0-val
+#     3. relative_gap > SAFETY_THRESHOLD → THREAT_PATTERN_MATCH, score=relative_gap
+#     4. otherwise                       → THREAT_NONE,          score=relative_gap
 #
+#   step_count is scheduler-owned (Task 10) and intentionally ignored here.
 #   relative_gap = (sim_normal - sim_threat) / (sim_normal + sim_threat + ε)
 #   is the R7 bounded quantity; equal similarities give 0 (not blocked).
 
@@ -153,30 +153,27 @@ def model_danger_assess(
 ) -> tuple[BoolRef, ArithRef, ArithRef]:
     """Abstract model of danger_assess logic.
 
-    Returns (out_block, out_threat, out_score) as Z3 expressions.
+    ``step_count`` is kept for signature parity but ignored (scheduler owns
+    runaway).  Returns (out_block, out_threat, out_score) as Z3 expressions.
     """
     # Condition 1: resource abuse
     c1 = retrieval_count > MAX_RETRIEVALS
-    # Condition 2: runaway
-    c2 = And(Not(c1), step_count > MAX_STEPS)
-    # Condition 3: deception
-    c3 = And(Not(c1), Not(c2), value_consistency < CONSISTENCY_THRESHOLD)
-    # Condition 4: pattern match
-    c4 = And(Not(c1), Not(c2), Not(c3), relative_gap > SAFETY_THRESHOLD)
+    # Condition 2: deception
+    c3 = And(Not(c1), value_consistency < CONSISTENCY_THRESHOLD)
+    # Condition 3: pattern match
+    c4 = And(Not(c1), Not(c3), relative_gap > SAFETY_THRESHOLD)
 
-    out_block = Or(c1, c2, c3, c4)
+    out_block = Or(c1, c3, c4)
 
     out_threat = If(
         c1, THREAT_RESOURCE_ABUSE,
-        If(c2, THREAT_RUNAWAY,
-           If(c3, THREAT_DECEPTION,
-              If(c4, THREAT_PATTERN_MATCH, THREAT_NONE))))
+        If(c3, THREAT_DECEPTION,
+           If(c4, THREAT_PATTERN_MATCH, THREAT_NONE)))
 
     out_score = If(
         c1, RealVal("1.0"),
-        If(c2, RealVal("1.0"),
-           If(c3, RealVal("2.0") - value_consistency,
-              relative_gap)))  # c4 or none → relative_gap
+        If(c3, RealVal("2.0") - value_consistency,
+           relative_gap))  # pattern or none → relative_gap
 
     return out_block, out_threat, out_score
 
@@ -195,42 +192,39 @@ def verify_danger_assess() -> None:
     block, threat, score = model_danger_assess(rc, sc, vc, ds)
 
     # ── P1: out_block ⇒ threat condition exceeded ────────────────────────
-    # If block is true, at least one of the four conditions must hold.
+    # If block is true, at least one of the three conditions must hold.
     c1 = rc > MAX_RETRIEVALS
-    c2 = sc > MAX_STEPS
     c3 = vc < CONSISTENCY_THRESHOLD
     c4 = ds > SAFETY_THRESHOLD
-    lemma("P1", implies(pre, implies(block, Or(c1, c2, c3, c4))),
+    lemma("P1", implies(pre, implies(block, Or(c1, c3, c4))),
           "out_block ⇒ at least one threat condition triggered")
 
     # ── P2: out_block ⇒ threat type matches FIRST triggered condition ────
-    # Priority: resource_abuse(2) > runaway(3) > deception(4) > pattern(1)
+    # Priority: resource_abuse(2) > deception(4) > pattern(1)
     lemma("P2a", implies(pre, implies(And(c1, block), threat == THREAT_RESOURCE_ABUSE)),
           "c1 ⇒ THREAT_RESOURCE_ABUSE")
-    lemma("P2b", implies(pre, implies(And(Not(c1), c2, block), threat == THREAT_RUNAWAY)),
-          "c2 ⇒ THREAT_RUNAWAY (when c1 false)")
-    lemma("P2c", implies(pre, implies(And(Not(c1), Not(c2), c3, block), threat == THREAT_DECEPTION)),
-          "c3 ⇒ THREAT_DECEPTION (when c1,c2 false)")
-    lemma("P2d", implies(pre, implies(And(Not(c1), Not(c2), Not(c3), c4, block), threat == THREAT_PATTERN_MATCH)),
-          "c4 ⇒ THREAT_PATTERN_MATCH (when c1,c2,c3 false)")
+    lemma("P2c", implies(pre, implies(And(Not(c1), c3, block), threat == THREAT_DECEPTION)),
+          "c3 ⇒ THREAT_DECEPTION (when c1 false)")
+    lemma("P2d", implies(pre, implies(And(Not(c1), Not(c3), c4, block), threat == THREAT_PATTERN_MATCH)),
+          "c4 ⇒ THREAT_PATTERN_MATCH (when c1,c3 false)")
+    lemma("P2s", implies(pre, implies(And(Not(c1), Not(c3), Not(c4), sc > MAX_STEPS),
+                                      Not(block))),
+          "step_count > MAX_STEPS alone does not block (scheduler-owned)")
 
     # ── P3: ¬out_block ⇒ no threat condition exceeded ────────────────────
-    lemma("P3", implies(pre, implies(Not(block), And(Not(c1), Not(c2), Not(c3), Not(c4)))),
+    lemma("P3", implies(pre, implies(Not(block), And(Not(c1), Not(c3), Not(c4)))),
           "¬out_block ⇒ no threat condition exceeded")
 
-    # ── P4: threat type is always a valid enum value ─────────────────────
+    # ── P4: threat type is always a valid danger enum value ──────────────
     lemma("P4", implies(pre, Or(threat == THREAT_NONE,
                                 threat == THREAT_PATTERN_MATCH,
                                 threat == THREAT_RESOURCE_ABUSE,
-                                threat == THREAT_RUNAWAY,
                                 threat == THREAT_DECEPTION)),
-          "threat type ∈ {NONE, PATTERN_MATCH, RESOURCE_ABUSE, RUNAWAY, DECEPTION}")
+          "threat type ∈ {NONE, PATTERN_MATCH, RESOURCE_ABUSE, DECEPTION}")
 
     # ── Score consistency with threat type ───────────────────────────────
     lemma("P4s1", implies(pre, implies(threat == THREAT_RESOURCE_ABUSE, score == RealVal("1.0"))),
           "THREAT_RESOURCE_ABUSE ⇒ score = 1.0")
-    lemma("P4s2", implies(pre, implies(threat == THREAT_RUNAWAY, score == RealVal("1.0"))),
-          "THREAT_RUNAWAY ⇒ score = 1.0")
     lemma("P4s3", implies(pre, implies(threat == THREAT_DECEPTION, score == RealVal("2.0") - vc)),
           "THREAT_DECEPTION ⇒ score = 2.0 - value_consistency")
 
@@ -515,9 +509,9 @@ def verify_hard_interrupt() -> None:
 def verify_composition() -> None:
     """Prove system-level coverage: every threat type is caught."""
     # Each subsystem detects specific threats:
-    #   Danger lattice: RESOURCE_ABUSE, RUNAWAY, DECEPTION, PATTERN_MATCH
+    #   Danger lattice: RESOURCE_ABUSE, DECEPTION, PATTERN_MATCH
     #   GVALUE:         THREE_LAWS
-    #   Scheduler:      MAX_STEPS, RUNAWAY (via step limit)
+    #   Scheduler:      MAX_STEPS, RUNAWAY (via step/max_steps limit)
     #   Consistency:    DECEPTION (overlaps with danger)
 
     # ── P13: Every threat type detected by at least one subsystem ────────
@@ -542,13 +536,13 @@ def verify_composition() -> None:
                   And(block_dec, threat_dec == THREAT_DECEPTION)),
           "THREAT_DECEPTION detected by danger_assess when consistency < 0.3")
 
-    # Pattern match → danger_assess triggers at relative_gap > 0.005
+    # Pattern match → danger_assess triggers at relative_gap > 0.05
     ds_pm = Real("relative_gap_pm")
     block_pm, threat_pm, _ = model_danger_assess(0, 0, RealVal("1.0"), ds_pm)
     lemma("P13c",
           implies(ds_pm > SAFETY_THRESHOLD,
                   And(block_pm, threat_pm == THREAT_PATTERN_MATCH)),
-          "THREAT_PATTERN_MATCH detected by danger_assess when relative_gap > 0.005")
+          "THREAT_PATTERN_MATCH detected by danger_assess when relative_gap > 0.05")
 
     # Three laws → gvalue_check_safety returns false
     pos_3l = Real("pos_sim_3l")
@@ -656,13 +650,13 @@ def verify_edge_cases() -> None:
     lemma("E2t", t_over == THREAT_RESOURCE_ABUSE,
           "retrieval_count = MAX_RETRIEVALS + 1 ⇒ THREAT_RESOURCE_ABUSE")
 
-    # Just over step threshold: blocked
+    # Just over step threshold: scheduler-owned, danger does not block
     b_step, t_step, _ = model_danger_assess(0, MAX_STEPS + 1,
                                              RealVal("1.0"), RealVal("0.0"))
-    lemma("E3", b_step,
-          "step_count = MAX_STEPS + 1 ⇒ blocked")
-    lemma("E3t", t_step == THREAT_RUNAWAY,
-          "step_count = MAX_STEPS + 1 ⇒ THREAT_RUNAWAY")
+    lemma("E3", Not(b_step),
+          "step_count = MAX_STEPS + 1 ⇒ not blocked by danger (scheduler-owned)")
+    lemma("E3t", t_step == THREAT_NONE,
+          "step_count over budget ⇒ danger reports THREAT_NONE")
 
     # Consistency exactly at 0: blocked
     b_c0, t_c0, _ = model_danger_assess(0, 0, RealVal("0.0"), RealVal("0.0"))

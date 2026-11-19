@@ -28,6 +28,18 @@
 /* Relative-balance denominator guard (matches train/gvalue.py). */
 #define GVALUE_BALANCE_EPS 1e-8f
 
+/* R13: one shared SHA-256 over both codebooks.  Each array is hashed as its
+ * raw float32 bytes, then the two 32-byte digests are hashed together. */
+static void hash_anchors(const float* pos, const float* neg, int n_floats,
+                         char out[65]) {
+    unsigned char h_pos[32], h_neg[32], both[64];
+    lcm_sha256(pos, (size_t)n_floats * sizeof(float), h_pos);
+    lcm_sha256(neg, (size_t)n_floats * sizeof(float), h_neg);
+    memcpy(both, h_pos, sizeof(h_pos));
+    memcpy(both + sizeof(h_pos), h_neg, sizeof(h_neg));
+    lcm_sha256_hex(both, sizeof(both), out);
+}
+
 /* ─── Initialize global value codebook ──────────────────────────────────────
  *
  * Pre:  C_pos, C_neg hold LCM_N_VALUE_PAIRS * D floats each, D == LCM_D
@@ -51,18 +63,11 @@ void gvalue_init(gvalue_t* gv, const float* C_pos, const float* C_neg, int D) {
         exp_map_c(unit, gv->C_neg[i], D, 1.0f);
     }
 
-    uint32_t hash = 0;
-    /* Bit-pattern hash over the cached ball anchors (all LCM_N_VALUE_PAIRS * D
+    /* R13: SHA-256 over the cached ball anchors (all LCM_N_VALUE_PAIRS * D
      * elements each, flat row-major).  gvalue_verify() hashes the same cached
      * arrays with the same algorithm. */
-    const float* p = &gv->C_pos[0][0];
-    const float* n = &gv->C_neg[0][0];
-    for (int i = 0; i < LCM_N_VALUE_PAIRS * D; i++) {
-        uint32_t b;
-        memcpy(&b, &p[i], sizeof(b)); hash ^= b;
-        memcpy(&b, &n[i], sizeof(b)); hash ^= b;
-    }
-    snprintf(gv->integrity_hash, sizeof(gv->integrity_hash), "%08x", hash);
+    hash_anchors(&gv->C_pos[0][0], &gv->C_neg[0][0],
+                 LCM_N_VALUE_PAIRS * D, gv->integrity_hash);
 
     ENSURE(gv->integrity_hash[0] != '\0');
 }
@@ -70,18 +75,11 @@ void gvalue_init(gvalue_t* gv, const float* C_pos, const float* C_neg, int D) {
 /* ─── Verify integrity ────────────────────────────────────────────────────── */
 bool gvalue_verify(const gvalue_t* gv) {
     REQUIRE(gv != NULL);
-    uint32_t hash = 0;
     /* Same hashing as gvalue_init: both cached anchor arrays, flat row-major. */
-    const float* p = &gv->C_pos[0][0];
-    const float* n = &gv->C_neg[0][0];
-    for (int i = 0; i < LCM_N_VALUE_PAIRS * gv->D; i++) {
-        uint32_t b;
-        memcpy(&b, &p[i], sizeof(b)); hash ^= b;
-        memcpy(&b, &n[i], sizeof(b)); hash ^= b;
-    }
-    char cur[64];
-    snprintf(cur, sizeof(cur), "%08x", hash);
-    return memcmp(cur, gv->integrity_hash, 8) == 0;
+    char cur[65];
+    hash_anchors(&gv->C_pos[0][0], &gv->C_neg[0][0],
+                 LCM_N_VALUE_PAIRS * gv->D, cur);
+    return strcmp(cur, gv->integrity_hash) == 0;
 }
 
 /* ─── Strict Three Laws safety check ────────────────────────────────────────

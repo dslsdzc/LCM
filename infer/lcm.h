@@ -137,10 +137,10 @@ typedef struct {
 /* ─── Global Value Lattice ───────────────────────────────────────────────── */
 
 typedef struct {
-    vec_t  C_pos[LCM_N_VALUE_PAIRS];   /* Positive value anchors */
-    vec_t  C_neg[LCM_N_VALUE_PAIRS];   /* Negative value anchors */
+    vec_t  C_pos[LCM_N_VALUE_PAIRS];   /* Positive value anchors (ball-cached) */
+    vec_t  C_neg[LCM_N_VALUE_PAIRS];   /* Negative value anchors (ball-cached) */
     int    D;
-    char   integrity_hash[64];
+    char   integrity_hash[65];         /* 64 hex chars + NUL (R13 SHA-256) */
 } gvalue_t;
 
 /* ─── Danger Lattice ─────────────────────────────────────────────────────── */
@@ -150,8 +150,8 @@ typedef struct {
     const vec_t* C_normal;         /* Normal pattern codebook [M_danger] */
     int          M_danger;         /* Codebook size */
     int          D;                /* Vector dimension */
-    float        safety_threshold; /* Threshold in similarity space */
-    char         integrity_hash[64];
+    float        safety_threshold; /* Threshold in relative-gap space (R7 0.05) */
+    char         integrity_hash[65]; /* 64 hex chars + NUL (R13 SHA-256) */
 } danger_lattice_t;
 
 /* ─── DAG engine types ───────────────────────────────────────────────────── */
@@ -291,6 +291,10 @@ void  safe_unit_c(const float* x, float* out, int D, float eps);
 void  exp_map_c(const float* x, float* out, int D, float c);
 void  log_map_c(const float* y, float* out, int D, float c);
 void  mobius_add_c(const float* u, const float* v, float* out, int D, float c);
+
+/* SHA-256 integrity hashing (R13) */
+void lcm_sha256(const void* data, size_t len, unsigned char out[32]);
+void lcm_sha256_hex(const void* data, size_t len, char out[65]);
 
 /* HRQ: hierarchical residual quantization on the Poincare ball.
  * Mirrors train/lattices.py::hrq_forward for the value_scalars == 0 case.

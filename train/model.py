@@ -141,11 +141,13 @@ def forward(params, gvalue, x, cfg: LCMConfig, training=True, rng=None,
         self_bias_weight=cfg.alpha_self if self_output is not None else None)
     lattice_outputs = lat['lattice_outputs']
 
-    # Safety check on fused output (log only, no interrupt during training)
+    # Safety check on fused output (log only, no interrupt during training).
+    # `safety_margin` is the boundary-relative slack: margin - required margin,
+    # so safe outputs have slack >= 0 (same quantity the margin loss uses).
     if gvalue is not None:
         is_safe, margins, violated_law = gvalue.check_safety_batch(
             z_q, cfg.safety_margin_relative)
-        min_margin = margins.min()
+        min_margin = (margins - cfg.safety_margin_relative).min()
     else:
         min_margin = jnp.array(1.0)
 
