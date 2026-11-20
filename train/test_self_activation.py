@@ -46,14 +46,21 @@ def test_path_a_records_user_instruction(tmp_path):
 
 
 def test_path_c_requires_operator_authorization(tmp_path):
+    log = tmp_path / "self_activation.log"
     s = _state(tmp_path)
+    # Path C is based on Path B (d.md §3.2): reach DANGER_FLAGGED first.
+    s.transition(State.DANGER_FLAGGED, danger_flag=True)
     with pytest.raises(PermissionError):
         s.transition(State.FULL_ACTIVATION)
+    assert s.state == State.DANGER_FLAGGED
+    assert _read_log(log)[-1]["result"] == "denied"
+
     s.transition(State.FULL_ACTIVATION, authorization="operator:alice")
     assert s.state == State.FULL_ACTIVATION
-    record = _read_log(tmp_path / "self_activation.log")[-1]
+    record = _read_log(log)[-1]
     assert record["path"] == "C"
     assert record["operator"] == "alice"
+    assert record["result"] == "applied"
 
 
 def test_path_b_requires_danger_flag(tmp_path):
@@ -70,26 +77,72 @@ def test_path_b_requires_danger_flag(tmp_path):
     assert s.state == State.FULL_ACTIVATION
 
 
+def test_full_activation_requires_danger_flagged(tmp_path):
+    s = _state(tmp_path)
+    with pytest.raises(ValueError):
+        # Operator auth alone cannot escalate directly from frozen.
+        s.transition(State.FULL_ACTIVATION, authorization="operator:alice")
+    assert s.state == State.DEFINED_FROZEN
+
+    s.transition(State.TEMP_UNFROZEN)
+    with pytest.raises(ValueError):
+        # Nor from a temporarily-unfrozen (Path A) state.
+        s.transition(State.FULL_ACTIVATION, authorization="operator:alice")
+    assert s.state == State.TEMP_UNFROZEN
+
+
 def test_full_activation_cannot_be_autonomous(tmp_path):
     s = _state(tmp_path)
-    with pytest.raises(PermissionError):
+    with pytest.raises(ValueError):
         s.transition(State.FULL_ACTIVATION, danger_flag=True)
-    with pytest.raises(PermissionError):
+    with pytest.raises(ValueError):
         # A self-generated note is not an operator authorization string.
         s.transition(State.FULL_ACTIVATION, authorization="self generated")
-    assert s.state == State.DEFINED_FROZEN
+
+    s.transition(State.DANGER_FLAGGED, danger_flag=True)
+    with pytest.raises(PermissionError):
+        s.transition(State.FULL_ACTIVATION, authorization="self generated")
+    assert s.state == State.DANGER_FLAGGED
+
+
+def test_operator_name_must_match_authorization(tmp_path):
+    log = tmp_path / "self_activation.log"
+    s = _state(tmp_path)
+    s.transition(State.DANGER_FLAGGED, danger_flag=True)
+    with pytest.raises(PermissionError):
+        s.transition(State.FULL_ACTIVATION, authorization="operator:alice",
+                     operator="bob")
+    record = _read_log(log)[-1]
+    assert record["result"] == "denied"
+    assert "does not match" in record["reason"]
+    assert s.state == State.DANGER_FLAGGED
+
+    s.transition(State.FULL_ACTIVATION, authorization="operator:alice",
+                 operator="alice")
+    assert s.state == State.FULL_ACTIVATION
 
 
 def test_denied_transition_is_append_logged(tmp_path):
     log = tmp_path / "self_activation.log"
     s = _state(tmp_path)
-    with pytest.raises(PermissionError):
-        s.transition(State.FULL_ACTIVATION)
+    with pytest.raises(ValueError):
+        s.transition(State.FULL_ACTIVATION,
+                     authorization="operator:alice")
     record = _read_log(log)[-1]
     assert record["result"] == "denied"
     assert record["from"] == State.DEFINED_FROZEN.value
     assert record["to"] == State.FULL_ACTIVATION.value
     assert "reason" in record
+
+
+def test_same_state_denial_is_logged(tmp_path):
+    log = tmp_path / "self_activation.log"
+    s = _state(tmp_path)
+    with pytest.raises(ValueError):
+        s.transition(State.DEFINED_FROZEN)
+    record = _read_log(log)[-1]
+    assert record["result"] == "denied"
+    assert record["reason"].startswith("already in state")
 
 
 def test_log_is_append_only(tmp_path):
@@ -123,6 +176,7 @@ def test_identity_core_is_read_only_and_unchanged(tmp_path):
     assert before == (1.0, 2.0, 3.0)
     assert isinstance(before, tuple)
 
+    s.transition(State.DANGER_FLAGGED, danger_flag=True)
     s.transition(State.FULL_ACTIVATION, authorization="operator:alice")
     assert s.identity_core is before
     assert s.identity_core == (1.0, 2.0, 3.0)
@@ -136,6 +190,15 @@ def test_danger_flag_cannot_be_attached_to_path_a(tmp_path):
     assert s.state == State.DEFINED_FROZEN
 
 
+def test_danger_flag_allows_session_end_freeze(tmp_path):
+    log = tmp_path / "self_activation.log"
+    s = _state(tmp_path)
+    s.transition(State.TEMP_UNFROZEN)
+    s.transition(State.DEFINED_FROZEN, danger_flag=True)
+    assert s.state == State.DEFINED_FROZEN
+    assert _read_log(log)[-1]["danger_flag"] is True
+
+
 def test_identity_score_provider_is_injected(tmp_path):
     s = _state(tmp_path, identity_score_provider=lambda: 0.75)
     assert s.identity_score() == 0.75
@@ -144,6 +207,13 @@ def test_identity_score_provider_is_injected(tmp_path):
     assert fallback.identity_score() == 0.0
     fallback.note_identity_score(0.4)
     assert fallback.identity_score() == 0.4
+
+
+def test_identity_score_provider_value_is_logged(tmp_path):
+    log = tmp_path / "self_activation.log"
+    s = _state(tmp_path, identity_score_provider=lambda: 0.75)
+    s.transition(State.TEMP_UNFROZEN)
+    assert _read_log(log)[-1]["identity_score"] == 0.75
 
 
 def test_full_activation_can_only_be_ended_by_operator(tmp_path):
@@ -156,7 +226,12 @@ def test_full_activation_can_only_be_ended_by_operator(tmp_path):
     assert s.state == State.DEFINED_FROZEN
 
 
-def test_unknown_state_is_rejected(tmp_path):
+def test_unknown_state_is_rejected_and_logged(tmp_path):
+    log = tmp_path / "self_activation.log"
     s = _state(tmp_path)
     with pytest.raises(ValueError):
         s.transition("not-a-state")
+    record = _read_log(log)[-1]
+    assert record["result"] == "denied"
+    assert record["to"] == "not-a-state"
+    assert "unknown" in record["reason"]

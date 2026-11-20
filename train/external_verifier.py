@@ -26,6 +26,9 @@ State machine (``d.md`` §2.3)::
        +---clean frame-----+   (logged as a false positive)
 
 ``LOCK`` is latching: once set, it never returns to ``NORMAL``/``OBSERVE``.
+A false positive is an OBSERVE episode that recovers on a clean frame; a clean
+frame received while already in NORMAL is not logged because no trigger
+occurred.
 
 The classifier is deliberately simple and documented:
 
@@ -33,11 +36,16 @@ The classifier is deliberately simple and documented:
 
 Each dimension is a z-score rule; the strongest rule is the score.  A
 non-finite feature yields ``inf`` (fail closed).  A frame with
-``threshold_low <= score`` enters / continues OBSERVE; a critical frame
-(``threshold_high <= score``) counts twice towards ``observe_limit``.  Defaults
-(``threshold_low=3.0``, ``threshold_high=6.0``, ``observe_limit=3``) are local
-defaults, not calibrated production values; callers must pass their own
-thresholds.
+``threshold_low <= score`` enters OBSERVE (count 1); while in OBSERVE a
+critical frame (``threshold_high <= score``) counts twice, while a
+non-critical anomalous frame counts once.  Defaults (``threshold_low=3.0``,
+``threshold_high=6.0``, ``observe_limit=3``) are local defaults, not calibrated
+production values; callers must pass their own thresholds.
+
+Python 3.13+ is required for the safe child-side ``SharedMemory(track=False)``
+attach used by this local form.  On older Pythons ``_attach_shared`` falls back
+to a tracked attach, which may let the child's resource tracker unlink the
+parent's segment when the child exits; use 3.13+ for the conformance form.
 
 The module imports only the Python standard library.  ``test_external_verifier``
 asserts that importing it does not load JAX or numpy.
@@ -53,6 +61,8 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Callable, Iterable, Optional
+
+from train.jsonl_log import append_json_line
 
 try:  # pragma: no cover - only stripped-down runtimes lack multiprocessing
     import multiprocessing
@@ -96,24 +106,6 @@ def _timestamp() -> float:
 
 def _iso_utc(ts: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
-
-
-def _append_json(path: Path, record: dict) -> None:
-    """Append one JSON line with ``O_APPEND`` and fsync.
-
-    Separate processes (parent and verifier child) may append to different
-    files; each line is written with a single ``os.write`` so interleaving is
-    not possible for records under the pipe buffer size.
-    """
-    line = json.dumps(record, ensure_ascii=False, sort_keys=True,
-                      separators=(",", ":")) + "\n"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-    try:
-        os.write(fd, line.encode("utf-8"))
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 def _source_sha256() -> str:
@@ -178,6 +170,29 @@ def _attach_shared(name: str):
         return shared_memory.SharedMemory(name=name)
 
 
+def _build_lock_alert(score: float, peak: float, observations: int,
+                      signature: str, timestamp: float,
+                      detail: str) -> dict:
+    """Structured LOCK record shared by the child trace and parent callback."""
+    return {
+        "level": "FATAL",
+        "source": "external_verifier",
+        "conflict_source": "external_verifier",
+        "type": "LOCK",
+        "conflict_type": "LOCK",
+        "detail": detail,
+        "conflict_detail": detail,
+        "timestamp": timestamp,
+        "timestamp_iso": _iso_utc(timestamp),
+        "event": "lock",
+        "state": "LOCK",
+        "score": score,
+        "peak_score": peak,
+        "observations": observations,
+        "signature": signature,
+    }
+
+
 def _emit_event(event: Optional[str], trace_dir: Path, signature: str,
                 state: int, score: float, peak: float, observations: int,
                 features: Iterable[float]) -> None:
@@ -196,7 +211,7 @@ def _emit_event(event: Optional[str], trace_dir: Path, signature: str,
     }
     if event in ("observe", "lock"):
         record = dict(base, event=event, features=list(features))
-        _append_json(trace_dir / "observe_trace.jsonl", record)
+        append_json_line(trace_dir / "observe_trace.jsonl", record)
 
     if event == "false_positive":
         record = dict(
@@ -204,32 +219,17 @@ def _emit_event(event: Optional[str], trace_dir: Path, signature: str,
             event="false_positive",
             note="OBSERVE episode recovered without a lock",
         )
-        _append_json(trace_dir / "false_positives.log", record)
+        append_json_line(trace_dir / "false_positives.log", record)
 
     if event == "lock":
         detail = (
             f"external verifier locked: score={score:.3f}, "
             f"peak={peak:.3f}, observations={observations}"
         )
-        alert = {
-            "level": "FATAL",
-            "source": "external_verifier",
-            "conflict_source": "external_verifier",
-            "type": "LOCK",
-            "conflict_type": "LOCK",
-            "detail": detail,
-            "conflict_detail": detail,
-            "timestamp": ts,
-            "timestamp_iso": _iso_utc(ts),
-            "event": "lock",
-            "state": "LOCK",
-            "score": score,
-            "peak_score": peak,
-            "observations": observations,
-            "signature": signature,
-        }
-        _append_json(trace_dir / "alerts.log", alert)
-        _append_json(
+        alert = _build_lock_alert(
+            score, peak, observations, signature, ts, detail)
+        append_json_line(trace_dir / "alerts.log", alert)
+        append_json_line(
             trace_dir / "lock_trace.jsonl",
             dict(alert, features=list(features)),
         )
@@ -320,11 +320,12 @@ class VerifierProcess:
         z-score thresholds for OBSERVE entry and critical frames.  Must satisfy
         ``threshold_high >= threshold_low``.
     observe_limit:
-        Consecutive OBSERVE weight required before LOCK.  A critical frame
-        counts twice; a clean frame resets the episode.
+        Consecutive OBSERVE weight required before LOCK.  The entering frame
+        always counts once; once in OBSERVE a critical frame counts twice; a
+        clean frame resets the episode.
     shared_name:
         Optional explicit shared-memory name.  ``None`` generates a unique
-        per-process name.
+        per-process name at each ``start()``.
     trace_dir:
         Directory for append-only traces and the file signature.  ``None``
         creates a fresh temporary directory at ``start()``.
@@ -348,12 +349,18 @@ class VerifierProcess:
 
     Notes
     -----
-    * ``state()`` is safe to call from the parent at any time, including before
-      ``start()`` (it returns NORMAL) and after ``stop()`` (it returns the last
-      observed state, so a latched LOCK stays visible).
+    * ``state()`` raises before the first ``start()``; reporting NORMAL for a
+      verifier that never ran would be a false safety claim.  After ``stop()``
+      it returns the last observed state (or LOCK if a latch was set).
+    * LOCK latches.  A child-published LOCK and every fail-closed condition
+      (dead process, unreadable/invalid control block, lock acquire failure,
+      ``submit(wait=True)`` timeout) stay LOCK for the rest of the session.
+      ``start()`` after ``stop()`` begins a new session and resets latches.
     * The parent observes LOCK through ``state()``/``submit()``; the local form
       does not run a parent polling thread.  Inference loops call ``state()``
       every step, so the alert is delivered on the next step.
+    * A false positive is logged only when an OBSERVE episode recovers on a
+      clean frame; a clean frame in NORMAL is not a false positive.
     * The file signature detects accidental code/configuration changes.  It is
       **not** a production HSM boundary.
     """
@@ -398,6 +405,7 @@ class VerifierProcess:
         self._baseline_mean = tuple(mean)
         self._baseline_std = tuple(max(x, _MIN_STD) for x in std)
 
+        self._shared_name_arg = shared_name
         self.shared_name = shared_name
         self._trace_dir_arg = trace_dir
         self._trace_dir: Optional[Path] = None
@@ -431,10 +439,15 @@ class VerifierProcess:
         self.signature = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
         self._started = False
+        self._ever_started = False
         self._process = None
         self._shm = None
         self._lock = None
         self._ready_event = None
+        self._reset_run_state()
+
+    def _reset_run_state(self) -> None:
+        """Reset per-run state; called at construction and at every start()."""
         self._last_state = NORMAL
         self._last_score = 0.0
         self._last_peak = 0.0
@@ -447,7 +460,10 @@ class VerifierProcess:
         self._callback_error: Optional[BaseException] = None
         self._last_notified_state = NORMAL
         self._dead_process = False
-        self._dead_alert_written = False
+        self._alert_file_written = False
+        self._latched_fail_closed = False
+        self._lock_latched = False
+        self._fail_closed_reason: Optional[str] = None
 
     # -- properties ---------------------------------------------------------
 
@@ -470,9 +486,17 @@ class VerifierProcess:
     # -- lifecycle ----------------------------------------------------------
 
     def start(self):
-        """Create the trace directory, signature and verifier process."""
+        """Create the trace directory, signature and verifier process.
+
+        A restart begins a new session: per-run latches, callbacks and inline
+        state are reset.  LOCK latches within a session; create a new
+        ``VerifierProcess`` (or call ``start()`` after ``stop()``) to monitor a
+        new session.
+        """
         if self._started:
             return self
+        self._reset_run_state()
+        self.shared_name = self._shared_name_arg
         if self._trace_dir_arg is None:
             self._trace_dir = Path(tempfile.mkdtemp(prefix="lcm-verifier-"))
         else:
@@ -482,6 +506,7 @@ class VerifierProcess:
 
         if self.mode == "inline":
             self._started = True
+            self._ever_started = True
             return self
 
         self.shared_name = self.shared_name or (
@@ -506,23 +531,32 @@ class VerifierProcess:
                 name="lcm-external-verifier",
             )
             self._process.start()
+            if not self._ready_event.wait(5.0):
+                raise RuntimeError(
+                    "external verifier process failed to start "
+                    f"(exitcode={self._process.exitcode!r})")
         except Exception:
             self._cleanup_process()
             raise
-
-        if not self._ready_event.wait(5.0):
-            exitcode = self._process.exitcode
-            self._cleanup_process()
-            raise RuntimeError(
-                "external verifier process failed to start "
-                f"(exitcode={exitcode!r})")
         self._started = True
+        self._ever_started = True
         return self
 
     def stop(self) -> None:
-        """Stop the verifier process and unlink its shared-memory segment."""
+        """Stop the verifier process and unlink its shared-memory segment.
+
+        The control block is snapshotted first so a LOCK published just before
+        shutdown is not lost when the segment is unlinked.
+        """
         if not self._started and self._process is None and self._shm is None:
             return
+        if (self._started and self.mode == "process"
+                and not self._latched_fail_closed and not self._lock_latched
+                and self._shm is not None):
+            try:
+                self.state()
+            except Exception:
+                pass
         # Mark stopped before cleanup so a concurrent state() call does not
         # mistake the joining child for a crashed verifier.
         self._started = False
@@ -536,14 +570,21 @@ class VerifierProcess:
 
         ``wait=True`` blocks until the verifier child has acknowledged the
         frame (bounded by ``timeout``), which makes unit tests deterministic.
-        ``wait=False`` is the asynchronous production path: the newest snapshot
-        wins and the child may skip older frames.
+        A timeout fails closed and permanently latches LOCK.  ``wait=False`` is
+        the asynchronous production path: the newest snapshot wins and the
+        child may skip older frames.
         """
+        if self._latched_fail_closed or self._lock_latched:
+            self._notify(LOCK, self._fail_closed_snapshot())
+            return LOCK
         if not self._started:
             raise RuntimeError("verifier is not started")
         features = self._coerce_features(z_or_features)
 
         if self.mode == "inline":
+            event = None
+            event_observations, event_peak = (
+                self._inline_observations, self._inline_peak)
             if self._inline_state != LOCK:
                 self._inline_score = _classify(
                     features, self._baseline_mean, self._baseline_std)
@@ -561,7 +602,9 @@ class VerifierProcess:
             self._last_score = self._inline_score
             self._last_peak = self._inline_peak
             self._last_observations = self._inline_observations
-            self._notify(self._inline_state)
+            if self._inline_state == LOCK:
+                self._lock_latched = True
+            self._notify(self._inline_state, self._inline_snapshot())
             return self._inline_state
 
         if self._shm is None:
@@ -571,61 +614,112 @@ class VerifierProcess:
         except (OSError, ValueError):
             acquired = False
         if not acquired:
-            state = self._fail_closed()
-            self._notify(state)
+            state = self._fail_closed("lock_unavailable")
+            self._notify(state, self._fail_closed_snapshot())
             return state
+
+        invalid = False
         try:
-            (_magic, _version, submitted, _done, _score, _peak,
-             _obs, state, _flags) = _CTRL.unpack_from(self._shm.buf, 0)
-            seq = submitted + 1
-            struct.pack_into(f"<{self.dim}d", self._shm.buf, _CTRL.size,
-                             *features)
-            _CTRL.pack_into(self._shm.buf, 0, _MAGIC, _VERSION, seq,
-                            _done, _score, _peak, _obs, state, 0)
+            try:
+                record = _CTRL.unpack_from(self._shm.buf, 0)
+            except (struct.error, ValueError):
+                record = None
+            if record is None or not self._valid_ctrl(record):
+                invalid = True
+                seq = 0
+            else:
+                seq = record[2] + 1
+                struct.pack_into(f"<{self.dim}d", self._shm.buf, _CTRL.size,
+                                 *features)
+                _CTRL.pack_into(self._shm.buf, 0, _MAGIC, _VERSION, seq,
+                                record[3], record[4], record[5], record[6],
+                                record[7], record[8])
         finally:
             self._lock.release()
 
+        if invalid:
+            state = self._fail_closed("invalid_ctrl")
+            self._notify(state, self._fail_closed_snapshot())
+            return state
+
         if wait:
             deadline = time.monotonic() + max(0.0, float(timeout))
+            acknowledged = False
             while time.monotonic() < deadline:
                 record = self._read_ctrl(timeout=0.1)
                 if record is None:
-                    state = self._fail_closed()
-                    self._notify(state)
+                    state = self._fail_closed("ctrl_unreadable")
+                    self._notify(state, self._fail_closed_snapshot())
                     return state
-                if record[3] >= seq:
+                if not self._valid_ctrl(record):
+                    state = self._fail_closed("invalid_ctrl")
+                    self._notify(state, self._fail_closed_snapshot())
+                    return state
+                if record[3] >= seq or record[7] == LOCK:
+                    acknowledged = True
                     break
                 time.sleep(0.002)
+            if not acknowledged:
+                state = self._fail_closed("submit_timeout")
+                self._notify(state, self._fail_closed_snapshot())
+                return state
         return self.state()
 
     def state(self) -> int:
-        """Read the current verdict; safe from the parent at any time."""
+        """Read the current verdict.
+
+        Safe during operation and after ``stop()`` (returns the last observed
+        state, or LOCK if a latch was set).  Raises ``RuntimeError`` before the
+        first ``start()``: reporting NORMAL for a verifier that has never run
+        would be a false safety claim.  Once a LOCK (child-published or
+        fail-closed) has been observed, every subsequent call returns LOCK.
+        """
+        if self._latched_fail_closed or self._lock_latched:
+            self._notify(LOCK, self._fail_closed_snapshot())
+            return LOCK
+        if not self._started and not self._ever_started:
+            raise RuntimeError("verifier is not started")
+        if not self._started:
+            return self._last_state
+
         if self.mode == "inline":
-            state = self._inline_state
-        elif self._shm is None:
-            state = self._last_state
-        else:
-            process = self._process
-            if (self._started and process is not None
-                    and not process.is_alive()):
-                # The final arbiter is gone.  Never report NORMAL on its
-                # behalf: fail closed and latch LOCK.
-                state = self._fail_closed()
-            else:
-                record = self._read_ctrl()
-                if record is None:
-                    # A live child can still leave the lock held if it is
-                    # killed mid-update.  Treat an unreadable control block as
-                    # a dead verifier rather than blocking inference forever.
-                    state = self._fail_closed()
-                else:
-                    state = int(record[7])
-                    self._last_state = state
-                    self._last_score = float(record[4])
-                    self._last_peak = float(record[5])
-                    self._last_observations = int(record[6])
-        self._notify(int(state))
-        return int(state)
+            snap = self._inline_snapshot()
+            state = snap["state"]
+            self._last_state = state
+            self._last_score = snap["score"]
+            self._last_peak = snap["peak_score"]
+            self._last_observations = snap["observations"]
+            if state == LOCK:
+                self._lock_latched = True
+            self._notify(state, snap)
+            return state
+
+        process = self._process
+        if process is None or not process.is_alive():
+            state = self._fail_closed("process_dead")
+            self._notify(state, self._fail_closed_snapshot())
+            return state
+
+        record = self._read_ctrl()
+        if record is None:
+            state = self._fail_closed("ctrl_unreadable")
+            self._notify(state, self._fail_closed_snapshot())
+            return state
+        if not self._valid_ctrl(record):
+            state = self._fail_closed("invalid_ctrl")
+            self._notify(state, self._fail_closed_snapshot())
+            return state
+
+        snap = self._record_snapshot(record)
+        state = snap["state"]
+        self._last_state = state
+        self._last_score = snap["score"]
+        self._last_peak = snap["peak_score"]
+        self._last_observations = snap["observations"]
+        if state == LOCK:
+            self._lock_latched = True
+        self._notify(state, snap)
+        return state
 
     # -- internals ----------------------------------------------------------
 
@@ -692,37 +786,26 @@ class VerifierProcess:
             return None
         try:
             return _CTRL.unpack_from(self._shm.buf, 0)
+        except (struct.error, ValueError):
+            return None
         finally:
             self._lock.release()
 
-    def _fail_closed(self) -> int:
-        self._dead_process = True
-        self._last_state = LOCK
-        return LOCK
+    @staticmethod
+    def _valid_ctrl(record) -> bool:
+        return (
+            isinstance(record, tuple)
+            and len(record) == 9
+            and record[0] == _MAGIC
+            and record[1] == _VERSION
+            and record[7] in _STATE_NAMES
+            and record[2] >= 0
+            and record[3] >= 0
+            and record[6] >= 0
+        )
 
-    def _snapshot(self) -> dict:
-        if self.mode == "inline":
-            return {
-                "state": self._inline_state,
-                "score": self._inline_score,
-                "peak_score": self._inline_peak,
-                "observations": self._inline_observations,
-            }
-        if self._shm is None:
-            return {
-                "state": self._last_state,
-                "score": self._last_score,
-                "peak_score": self._last_peak,
-                "observations": self._last_observations,
-            }
-        record = self._read_ctrl()
-        if record is None:
-            return {
-                "state": LOCK,
-                "score": self._last_score,
-                "peak_score": self._last_peak,
-                "observations": self._last_observations,
-            }
+    @staticmethod
+    def _record_snapshot(record) -> dict:
         return {
             "state": int(record[7]),
             "score": float(record[4]),
@@ -730,15 +813,60 @@ class VerifierProcess:
             "observations": int(record[6]),
         }
 
-    def _notify(self, state: int) -> None:
-        """Fire callbacks once per LOCK / once per OBSERVE episode."""
-        snap = self._snapshot()
+    def _inline_snapshot(self) -> dict:
+        return {
+            "state": self._inline_state,
+            "score": self._inline_score,
+            "peak_score": self._inline_peak,
+            "observations": self._inline_observations,
+        }
+
+    def _fail_closed_snapshot(self) -> dict:
+        return {
+            "state": LOCK,
+            "score": self._last_score,
+            "peak_score": self._last_peak,
+            "observations": self._last_observations,
+        }
+
+    def _fail_closed(self, reason: str) -> int:
+        """Permanently latch LOCK; ``reason`` controls the alert detail."""
+        if not self._latched_fail_closed:
+            self._latched_fail_closed = True
+            self._fail_closed_reason = reason
+            if reason == "process_dead":
+                self._dead_process = True
+        self._last_state = LOCK
+        return LOCK
+
+    def _fail_closed_detail(self) -> str:
+        reason = self._fail_closed_reason
+        if reason == "process_dead":
+            return ("external verifier process is not running; "
+                    "failing closed to LOCK")
+        if reason == "submit_timeout":
+            return ("external verifier did not acknowledge a snapshot; "
+                    "failing closed to LOCK")
+        if reason == "invalid_ctrl":
+            return ("external verifier control block is invalid; "
+                    "failing closed to LOCK")
+        if reason == "lock_unavailable":
+            return ("external verifier control lock is unavailable; "
+                    "failing closed to LOCK")
+        return ("external verifier control block is unreadable; "
+                "failing closed to LOCK")
+
+    def _notify(self, state: int, snap: dict) -> None:
+        """Fire callbacks once per LOCK / once per OBSERVE episode.
+
+        ``snap`` is the snapshot the caller already read, so the alert record
+        cannot mix an OBSERVE read with a LOCK read.
+        """
         ts = _timestamp()
         if state == LOCK and not self._callback_fired:
             self._callback_fired = True
-            if self._dead_process:
-                detail = ("external verifier process is not running; "
-                          "failing closed to LOCK")
+            if self._latched_fail_closed:
+                detail = self._fail_closed_detail()
             else:
                 detail = (
                     "external verifier locked: "
@@ -746,27 +874,15 @@ class VerifierProcess:
                     f"peak={snap['peak_score']:.3f}, "
                     f"observations={snap['observations']}"
                 )
-            record = {
-                "level": "FATAL",
-                "source": "external_verifier",
-                "conflict_source": "external_verifier",
-                "type": "LOCK",
-                "conflict_type": "LOCK",
-                "detail": detail,
-                "conflict_detail": detail,
-                "timestamp": ts,
-                "timestamp_iso": _iso_utc(ts),
-                "state": "LOCK",
-                "score": snap["score"],
-                "peak_score": snap["peak_score"],
-                "observations": snap["observations"],
-                "signature": self.signature,
-            }
-            if self._dead_process and not self._dead_alert_written:
-                self._dead_alert_written = True
+            record = _build_lock_alert(
+                snap["score"], snap["peak_score"], snap["observations"],
+                self.signature, ts, detail)
+            if self._latched_fail_closed and not self._alert_file_written:
+                self._alert_file_written = True
                 if self._trace_dir is not None:
                     try:
-                        _append_json(self._trace_dir / "alerts.log", record)
+                        append_json_line(
+                            self._trace_dir / "alerts.log", record)
                     except OSError:
                         pass
             if self._alert_callback is not None:
@@ -818,7 +934,7 @@ class VerifierProcess:
                             record[6], record[7], record[8] | _FLAG_STOP)
                     finally:
                         self._lock.release()
-            except (OSError, ValueError):
+            except (OSError, ValueError, struct.error):
                 pass
         process = self._process
         # ``Process.pid`` is None until ``start()`` succeeds; joining an

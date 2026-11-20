@@ -23,10 +23,12 @@ State graph (``d.md`` §3.1/§3.2)::
 * **Path B** requires ``danger_flag=True`` (the danger lattice / external
   verifier flags intrinsic self-recognition).  Being flagged never authorizes
   full activation by itself.
-* **Path C** requires an explicit operator authorization: either
-  ``operator="alice"`` together with a non-empty authorization string, or an
-  authorization string of the form ``"operator:alice"``.  Full activation can
-  never be reached autonomously.
+* **Path C** is reachable **only** from ``DANGER_FLAGGED`` and requires an
+  explicit operator authorization: either ``operator="alice"`` together with a
+  non-empty authorization string, or an authorization string of the form
+  ``"operator:alice"``.  If both forms are supplied they must name the same
+  operator.  Full activation can never be reached autonomously, and the
+  operator's decision to leave ``FULL_ACTIVATION`` is also required.
 
 Every applied transition and every denied attempt is appended to
 ``self_activation.log`` as one JSON object per line (timestamp, from/to,
@@ -41,7 +43,6 @@ frozen core did not change.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import struct
 import threading
@@ -49,6 +50,8 @@ import time
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable, Optional
+
+from train.jsonl_log import append_json_line
 
 __all__ = [
     "State",
@@ -88,16 +91,16 @@ _DEFAULT_LOG_PATH = "self_activation.log"
 # Conservative transition table.  Any state may escalate to FULL_ACTIVATION
 # with operator authorization (the brief's Path C example starts from frozen),
 # but FULL_ACTIVATION may only be left with operator authorization.
+# d.md §3.1: Path C is only reachable from DANGER_FLAGGED.  Full activation is
+# never an escalation from the frozen or temporarily-unfrozen paths.
 _ALLOWED = {
     State.DEFINED_FROZEN: frozenset({
         State.TEMP_UNFROZEN,
         State.DANGER_FLAGGED,
-        State.FULL_ACTIVATION,
     }),
     State.TEMP_UNFROZEN: frozenset({
         State.DEFINED_FROZEN,
         State.DANGER_FLAGGED,
-        State.FULL_ACTIVATION,
     }),
     State.DANGER_FLAGGED: frozenset({
         State.DEFINED_FROZEN,
@@ -134,12 +137,14 @@ class SelfActivationState:
     -----
     * The default ``identity_core`` is a four-element placeholder.  Production
       code must pass the real frozen ``C_self[0]`` from the self lattice.
-    * Path C is accepted from any non-full state when operator authorization is
-      present (the brief's Path C test starts from ``DEFINED_FROZEN``); it is
-      never reachable without that authorization.  Leaving
-      ``FULL_ACTIVATION`` likewise requires operator authorization.
+    * Path C is only reachable from ``DANGER_FLAGGED`` (d.md §3.1/§3.2); an
+      operator authorization cannot escalate directly from
+      ``DEFINED_FROZEN`` or ``TEMP_UNFROZEN``.  Leaving ``FULL_ACTIVATION``
+      requires operator authorization.
     * ``danger_flag`` is only meaningful for Path B / Path C; attaching it to a
-      Path A transition is rejected so danger cannot be silently ignored.
+      Path A *unfreeze* is rejected.  A session-end freeze
+      (``TEMP_UNFROZEN → DEFINED_FROZEN``) remains allowed even while danger is
+      flagged because freezing is the safe direction.
     """
 
     def __init__(self, *, identity_core: Optional[Iterable[float]] = None,
@@ -201,28 +206,41 @@ class SelfActivationState:
         Raises
         ------
         ValueError
-            Unknown target state or illegal graph edge.
+            Unknown target state, same-state transition, or an illegal graph
+            edge (including a direct frozen/temp → full escalation).
         PermissionError
             Path B without ``danger_flag``; Path C without operator
-            authorization; or any attempt to leave ``FULL_ACTIVATION``
-            without operator authorization.
+            authorization; an operator-name mismatch; or any attempt to leave
+            ``FULL_ACTIVATION`` without operator authorization.
         """
-        try:
-            target = State(target)
-        except ValueError:
-            raise ValueError(f"unknown self activation state: {target!r}") from None
-
         with self._mutex:
             current = self._state
-            if target == current:
-                raise ValueError(f"already in state {current.value}")
+            try:
+                target_state = State(target)
+            except ValueError:
+                reason = f"unknown self activation state: {target!r}"
+                self._log(
+                    current, target, path="denied", result="denied",
+                    reason=reason, authorization=authorization,
+                    operator=operator, danger_flag=danger_flag,
+                )
+                raise ValueError(reason) from None
+
+            if target_state == current:
+                reason = f"already in state {current.value}"
+                self._log(
+                    current, target_state, path="denied", result="denied",
+                    reason=reason, authorization=authorization,
+                    operator=operator, danger_flag=danger_flag,
+                )
+                raise ValueError(reason)
 
             try:
                 path, resolved_operator = self._authorize(
-                    current, target, authorization, danger_flag, operator)
+                    current, target_state, authorization, danger_flag, operator)
             except (PermissionError, ValueError) as exc:
                 self._log(
-                    current, target, path="denied", result="denied",
+                    current, target_state, path="denied", result="denied",
                     reason=str(exc), authorization=authorization,
                     operator=operator, danger_flag=danger_flag,
                 )
@@ -231,12 +249,12 @@ class SelfActivationState:
             # Fail closed: if the append-only audit write fails, the state does
             # not change.  This is the record d.md §3.2 Path C requires.
             self._log(
-                current, target, path=path, result="applied",
+                current, target_state, path=path, result="applied",
                 authorization=authorization, operator=resolved_operator,
                 danger_flag=danger_flag,
             )
-            self._state = target
-            return target
+            self._state = target_state
+            return target_state
 
     def _authorize(self, current: State, target: State,
                    authorization: Optional[str], danger_flag: bool,
@@ -246,11 +264,11 @@ class SelfActivationState:
                 f"illegal self activation transition: "
                 f"{current.value} -> {target.value}")
 
-        if danger_flag and target not in (State.DANGER_FLAGGED,
-                                          State.FULL_ACTIVATION):
+        if danger_flag and target == State.TEMP_UNFROZEN:
             raise PermissionError(
                 "danger_flag requires Path B (target DANGER_FLAGGED) or an "
-                "operator-authorized Path C; it cannot be attached to Path A")
+                "operator-authorized Path C; it cannot be attached to a "
+                "Path A unfreeze")
 
         if target == State.DANGER_FLAGGED:
             if not danger_flag:
@@ -260,6 +278,7 @@ class SelfActivationState:
             return "B", operator
 
         if target == State.FULL_ACTIVATION:
+            # _ALLOWED guarantees this is DANGER_FLAGGED -> FULL_ACTIVATION.
             return "C", self._require_operator(authorization, operator)
 
         if current == State.FULL_ACTIVATION:
@@ -276,7 +295,8 @@ class SelfActivationState:
             return "A", operator
 
         if target == State.DEFINED_FROZEN:
-            # Path A session end.
+            # Path A session end (including freezing while danger is flagged:
+            # freezing is the safe direction).
             return "A", operator
 
         raise ValueError(
@@ -291,8 +311,14 @@ class SelfActivationState:
             raise PermissionError(
                 "FULL_ACTIVATION requires explicit operator authorization")
         resolved = "" if operator is None else str(operator).strip()
-        if not resolved and auth.lower().startswith("operator:"):
-            resolved = auth.split(":", 1)[1].strip()
+        auth_operator = None
+        if auth.lower().startswith("operator:"):
+            auth_operator = auth.split(":", 1)[1].strip()
+        if auth_operator and resolved and auth_operator != resolved:
+            raise PermissionError(
+                f"operator {resolved!r} does not match "
+                f"authorization 'operator:{auth_operator}'")
+        resolved = resolved or auth_operator or ""
         if not resolved:
             raise PermissionError(
                 "operator name required: pass operator='<name>' or "
@@ -301,39 +327,37 @@ class SelfActivationState:
 
     # -- append-only audit log ---------------------------------------------
 
-    def _log(self, current: State, target: State, *, path: str,
+    @staticmethod
+    def _state_label(value) -> str:
+        return value.value if isinstance(value, State) else str(value)
+
+    def _log(self, current, target, *, path: str,
              result: str, reason: Optional[str] = None,
              authorization: Optional[str] = None,
              operator: Optional[str] = None,
              danger_flag: bool = False) -> None:
         ts = time.time()
+        try:
+            identity_score = float(self.identity_score())
+        except Exception:
+            # The audit record must still be written if the provider is
+            # temporarily unavailable; fall back to the cached value.
+            identity_score = float(self._last_identity_score)
         record = {
             "event": "self_activation_transition",
             "timestamp": ts,
             "timestamp_iso": _iso_utc(ts),
-            "from": current.value,
-            "to": target.value,
+            "from": self._state_label(current),
+            "to": self._state_label(target),
             "path": path,
             "result": result,
             "authorization": (None if authorization is None
                               else str(authorization)),
             "operator": None if operator is None else str(operator),
             "danger_flag": bool(danger_flag),
-            "identity_score": float(self._last_identity_score),
+            "identity_score": identity_score,
             "identity_core_sha256": self._identity_core_digest,
         }
         if reason is not None:
             record["reason"] = reason
-        self._append(record)
-
-    def _append(self, record: dict) -> None:
-        path = Path(self.log_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(record, ensure_ascii=False, sort_keys=True,
-                          separators=(",", ":")) + "\n"
-        fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-        try:
-            os.write(fd, line.encode("utf-8"))
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        append_json_line(self.log_path, record)
