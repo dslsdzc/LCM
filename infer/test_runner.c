@@ -2067,9 +2067,32 @@ static void test_layer_forwards_invalid(void) {
 
 static lcm_memory_v3 t10_mem;
 
+static int t10_alert_count;
+static alert_t t10_last_alert;
+
+static void t10_alert_cb(const alert_t* alert) {
+    t10_alert_count++;
+    if (alert) t10_last_alert = *alert;
+}
+
+static void t10_reset_alerts(void) {
+    t10_alert_count = 0;
+    memset(&t10_last_alert, 0, sizeof(t10_last_alert));
+}
+
+static float t10_route_C7[LCM_MAX_LATTICES * LCM_D];
+static float t10_route_W7[LCM_D * LCM_MAX_LATTICES];
+static float t10_alpha7[LCM_MAX_LATTICES];
+static float t10_lr_value[T7_M];
+static int   t10_ranks128[128];
+static float t10_lr_U128[128 * T7_M * T7_R];
+static float t10_gv_pos[LCM_N_VALUE_PAIRS * LCM_D];
+static float t10_gv_neg[LCM_N_VALUE_PAIRS * LCM_D];
+static float t10_dthreat[2 * LCM_D];
+static float t10_dnormal[2 * LCM_D];
+
 /* Reset the t7 arrays to a deterministic distance spread: row r of each
- * primary codebook sits at 0.1·(r+1) on e0, so the six lattices have
- * different trigger distances and dynamic activation is observable. */
+ * primary codebook sits at 0.1·(r+1) on e0. */
 static void t10_prepare(void) {
     memset(t7_hrq_top, 0, sizeof(t7_hrq_top));
     memset(t7_hrq_fine, 0, sizeof(t7_hrq_fine));
@@ -2091,6 +2114,19 @@ static void t10_prepare(void) {
     memset(t7_ln_scale, 0, sizeof(t7_ln_scale));
     memset(t7_ln_bias, 0, sizeof(t7_ln_bias));
     memset(t7_self_C, 0, sizeof(t7_self_C));
+    for (int r = 0; r < 3; r++)
+        t7_self_C[r * LCM_D] = 0.1f * (float)r;
+    memset(t10_route_C7, 0, sizeof(t10_route_C7));
+    memset(t10_route_W7, 0, sizeof(t10_route_W7));
+    memset(t10_alpha7, 0, sizeof(t10_alpha7));
+    memset(t10_lr_value, 0, sizeof(t10_lr_value));
+    memset(t10_ranks128, 0, sizeof(t10_ranks128));
+    memset(t10_lr_U128, 0, sizeof(t10_lr_U128));
+    for (int i = 0; i < 128; i++) t10_ranks128[i] = 2;
+    memset(t10_gv_pos, 0, sizeof(t10_gv_pos));
+    memset(t10_gv_neg, 0, sizeof(t10_gv_neg));
+    memset(t10_dthreat, 0, sizeof(t10_dthreat));
+    memset(t10_dnormal, 0, sizeof(t10_dnormal));
 
     for (int r = 0; r < T7_M; r++) {
         t7_hrq_top[r * LCM_D] = 0.1f * (float)(r + 1);
@@ -2099,10 +2135,16 @@ static void t10_prepare(void) {
     }
     for (int i = 0; i < T7_NLAT; i++) t7_alpha[i] = 1.0f;
     for (int i = 0; i < LCM_D; i++) t7_ln_scale[i] = 1.0f;
+    for (int i = 0; i < LCM_MAX_LATTICES; i++) t10_alpha7[i] = 1.0f;
+    for (int i = 0; i < LCM_N_VALUE_PAIRS; i++) {
+        t10_gv_pos[i * LCM_D + i] = 1.0f;
+        t10_gv_neg[i * LCM_D + i] = -1.0f;
+    }
 
     t7_desc_t d;
     t7_fill(&d);
     CHECK(t7_bind(&t10_mem, &d) == 0, "v3 fixture binds");
+    t10_reset_alerts();
 }
 
 static int t10_find_node(const dag_t* dag, op_type_t op, int lattice_id) {
@@ -2118,26 +2160,45 @@ static void test_dag_dynamic_threshold(void) {
     t10_prepare();
     float z[LCM_D] = {0};
     z[0] = 0.12f;
-
-    for (int i = 0; i < LCM_MAX_LATTICES; i++)
-        t10_mem.trigger_theta[i] = 0.0f;
     dag_t dag;
+
+    /* First use: the configured initial threshold admits every candidate. */
+    for (int i = 0; i < LCM_MAX_LATTICES; i++) {
+        t10_mem.trigger_theta[i] = 1.0f;
+        t10_mem.trigger_initial[i] = 1e10f;
+    }
     int n_cand = build_dag_v3(z, &t10_mem, &dag);
     CHECK(n_cand == T7_NLAT + 1,
-          "build_dag_v3 evaluates every routed lattice + self");
-    CHECK(dag.n_nodes == 0,
-          "zero dynamic threshold activates nothing (not always-on)");
-
-    for (int i = 0; i < LCM_MAX_LATTICES; i++)
-        t10_mem.trigger_theta[i] = 1e6f;
-    n_cand = build_dag_v3(z, &t10_mem, &dag);
-    int n_active = 0;
+          "build_dag_v3 evaluates every routed lattice + self once");
+    int first_active = 0;
     for (int i = 0; i < dag.n_nodes; i++)
-        if (dag.nodes[i].lattice_id < T7_NLAT) n_active++;
-    CHECK(n_active == T7_NLAT,
-          "high threshold activates all routed lattices");
-    CHECK(dag.n_nodes < LCM_MAX_NODES,
-          "DAG stays within the fixed node budget");
+        if (dag.nodes[i].lattice_id < T7_NLAT) first_active++;
+    CHECK(first_active == T7_NLAT,
+          "first use uses the configured initial threshold");
+
+    /* Same distances next step: strict θ·mean means nothing is "closer". */
+    build_dag_v3(z, &t10_mem, &dag);
+    int active_after = 0;
+    for (int i = 0; i < dag.n_nodes; i++)
+        if (dag.nodes[i].lattice_id < T7_NLAT) active_after++;
+    CHECK(active_after == 0,
+          "per-lattice EMA threshold deactivates unchanged distances");
+
+    /* Only HRQ's distance shrinks; only HRQ must activate. */
+    t7_hrq_top[0] = 0.12f;
+    build_dag_v3(z, &t10_mem, &dag);
+    int hi = t10_find_node(&dag, OP_RETRIEVE_SINGLE, LATTICE_HRQ);
+    int si = t10_find_node(&dag, OP_RETRIEVE_SINGLE, LATTICE_SPARSE);
+    CHECK(hi >= 0 && si < 0,
+          "only the shrinking lattice activates (R8/Ruling 20)");
+    CHECK(t10_mem.mean_recent_d_min[LATTICE_HRQ] > 0.0f,
+          "each lattice keeps its own mean_recent_d_min");
+
+    /* θ=0 is an explicit off switch. */
+    for (int i = 0; i < LCM_MAX_LATTICES; i++)
+        t10_mem.trigger_theta[i] = 0.0f;
+    build_dag_v3(z, &t10_mem, &dag);
+    CHECK(dag.n_nodes == 0, "θ=0 disables every lattice");
 }
 
 static void test_dag_sparse_depends_on_hrq(void) {
@@ -2148,8 +2209,8 @@ static void test_dag_sparse_depends_on_hrq(void) {
 
     for (int i = 0; i < LCM_MAX_LATTICES; i++)
         t10_mem.trigger_theta[i] = 0.0f;
-    t10_mem.trigger_theta[LATTICE_HRQ] = 1e6f;
-    t10_mem.trigger_theta[LATTICE_SPARSE] = 1e6f;
+    t10_mem.trigger_theta[LATTICE_HRQ] = 1.0f;
+    t10_mem.trigger_theta[LATTICE_SPARSE] = 1.0f;
 
     build_dag_v3(z, &t10_mem, &dag);
     int hi = t10_find_node(&dag, OP_RETRIEVE_SINGLE, LATTICE_HRQ);
@@ -2158,17 +2219,38 @@ static void test_dag_sparse_depends_on_hrq(void) {
     CHECK(hi < si, "HRQ is emitted before Sparse");
     CHECK(si >= 0 && dag.nodes[si].n_inputs == 2
               && dag.nodes[si].inputs[1] == (const float*)dag.nodes[hi].output,
-          "Sparse has a d_top edge to the HRQ output");
-    CHECK(dag.nodes[si].dep_dist > 0.0f,
-          "Sparse d_top is positive when HRQ is active");
+          "Sparse has an input edge to the HRQ output");
+    CHECK(dag.nodes[si].dep_dist == 0.0f,
+          "Sparse d_top starts at 0 until HRQ executes");
+
+    vec_t outputs[LCM_MAX_LATTICES];
+    float conf[LCM_MAX_LATTICES];
+    int active[LCM_MAX_LATTICES];
+    memset(outputs, 0, sizeof(outputs));
+    memset(conf, 0, sizeof(conf));
+    execute_dag_v3(&dag, &t10_mem, 0.0f, outputs, conf, active);
+
+    vec_t ref_out;
+    float ref_sim = -1.0f;
+    int hrq_rc = hrq_forward_v31(z, &t10_mem.hrq, 0.0f, 4,
+                                 t10_mem.tau_route_fallback, ref_out,
+                                 NULL, &ref_sim);
+    CHECK(hrq_rc == 0 && ref_sim > 0.0f,
+          "independent HRQ reference top_sim is positive");
+    CHECK(fabsf(dag.nodes[si].dep_dist - ref_sim) < 1e-6f,
+          "Sparse d_top is exactly HRQ's Poincaré top_sim (Ruling 21)");
 
     /* HRQ inactive: Sparse must run with d_top = 0 (LFQ disabled). */
     t10_mem.trigger_theta[LATTICE_HRQ] = 0.0f;
+    t10_mem.trigger_theta[LATTICE_SPARSE] = 1e6f;
     build_dag_v3(z, &t10_mem, &dag);
     si = t10_find_node(&dag, OP_RETRIEVE_SINGLE, LATTICE_SPARSE);
     CHECK(si >= 0, "Sparse still activates without HRQ");
+    memset(outputs, 0, sizeof(outputs));
+    memset(conf, 0, sizeof(conf));
+    execute_dag_v3(&dag, &t10_mem, 0.0f, outputs, conf, active);
     CHECK(dag.nodes[si].inputs[1] == NULL && dag.nodes[si].dep_dist == 0.0f,
-          "inactive HRQ ⇒ Sparse d_top = 0 / no c_top edge (LFQ off)");
+          "inactive HRQ ⇒ Sparse d_top = 0 / no HRQ edge (LFQ off)");
 }
 
 static void test_dag_bind_all_upstream(void) {
@@ -2182,9 +2264,14 @@ static void test_dag_bind_all_upstream(void) {
     build_dag_v3(z, &t10_mem, &dag);
     int bi = t10_find_node(&dag, OP_HRR_BIND, LCM_MAX_LATTICES);
     int n_retrieve = 0;
-    for (int i = 0; i < dag.n_nodes; i++)
+    int first = -1;
+    for (int i = 0; i < dag.n_nodes; i++) {
         if (dag.nodes[i].op_type == OP_RETRIEVE_SINGLE
-            && dag.nodes[i].lattice_id < T7_NLAT) n_retrieve++;
+            && dag.nodes[i].lattice_id < T7_NLAT) {
+            if (first < 0) first = i;
+            n_retrieve++;
+        }
+    }
 
     CHECK(bi >= 0, "bind node exists");
     CHECK(bi >= 0 && dag.nodes[bi].n_inputs == n_retrieve
@@ -2193,15 +2280,57 @@ static void test_dag_bind_all_upstream(void) {
 
     int ui = t10_find_node(&dag, OP_HRR_UNBIND, LCM_MAX_LATTICES);
     CHECK(ui >= 0 && dag.nodes[ui].n_inputs == 2
-              && dag.nodes[ui].inputs[0] == (const float*)dag.nodes[bi].output,
-          "unbind consumes bind output + key projection");
+              && dag.nodes[ui].inputs[0] == (const float*)dag.nodes[bi].output
+              && first >= 0
+              && dag.nodes[ui].inputs[1]
+                 == (const float*)dag.nodes[first].output,
+          "unbind consumes bind output + first retrieve key");
 
-    CHECK(dag.n_trace_nodes >= dag.n_nodes,
-          "trace records rejected candidates as well as active nodes");
     int n_inactive = 0;
     for (int i = 0; i < dag.n_trace_nodes; i++)
         if (!dag.trace_nodes[i].activated) n_inactive++;
-    CHECK(n_inactive >= 0, "trace activation flags are populated");
+    CHECK(n_inactive == 0, "all-active step has no inactive trace nodes");
+
+    t10_mem.trigger_theta[LATTICE_MANIFOLD] = 0.0f;
+    build_dag_v3(z, &t10_mem, &dag);
+    n_inactive = 0;
+    for (int i = 0; i < dag.n_trace_nodes; i++)
+        if (!dag.trace_nodes[i].activated) n_inactive++;
+    CHECK(n_inactive == 1, "rejected candidate is recorded as inactive");
+    bi = t10_find_node(&dag, OP_HRR_BIND, LCM_MAX_LATTICES);
+    n_retrieve = 0;
+    for (int i = 0; i < dag.n_nodes; i++)
+        if (dag.nodes[i].op_type == OP_RETRIEVE_SINGLE
+            && dag.nodes[i].lattice_id < T7_NLAT) n_retrieve++;
+    CHECK(bi >= 0 && dag.nodes[bi].n_inputs == n_retrieve
+              && n_retrieve == T7_NLAT - 1,
+          "bind tracks the reduced upstream set");
+}
+
+static void test_dag_n_lattices_seven(void) {
+    t10_prepare();
+    float z[LCM_D] = {0};
+    z[0] = 0.12f;
+
+    lcm_memory_v3 mem7 = t10_mem;
+    mem7.n_lattices = LCM_MAX_LATTICES;
+    mem7.fusion.n_lattices = LCM_MAX_LATTICES;
+    mem7.fusion.route_C = t10_route_C7;
+    mem7.fusion.route_W = t10_route_W7;
+    mem7.fusion.alpha = t10_alpha7;
+    for (int i = 0; i < LCM_MAX_LATTICES; i++) {
+        mem7.trigger_theta[i] = 1e6f;
+        mem7.trigger_initial[i] = 1e10f;
+    }
+
+    dag_t dag;
+    int n_cand = build_dag_v3(z, &mem7, &dag);
+    int n_self = 0;
+    for (int i = 0; i < dag.n_nodes; i++)
+        if (dag.nodes[i].op_type == OP_SELF_CHECK) n_self++;
+    CHECK(n_cand == LCM_MAX_LATTICES,
+          "n_lattices=7 yields six routed + one self candidate");
+    CHECK(n_self == 1, "self candidate appears exactly once (Ruling 23)");
 }
 
 static void test_loop_v3_graceful_and_hard(void) {
@@ -2209,19 +2338,38 @@ static void test_loop_v3_graceful_and_hard(void) {
     float z[LCM_D] = {0};
     z[0] = 0.12f;
     float z_out[LCM_D];
+    t10_reset_alerts();
 
     int ret = lcm_infer_loop_v3(&t10_mem, NULL, NULL, z, z_out,
-                                16, 1e-3f, 0.5f, 0.5f, 0.0f, NULL);
+                                16, 1e-3f, 0.5f, 0.5f, 0.0f, NULL,
+                                t10_alert_cb);
     CHECK(ret == 0, "v3 loop: max_steps=16 is graceful (returns 0)");
+    CHECK(t10_alert_count == 0, "graceful return does not fire an alert");
 
     /* conv_tol=0 makes vector convergence unreachable; the 64-step hard
      * limit must abort rather than treat budget exhaustion as convergence. */
     const char* trace_path = "traces/t10_v3_trace.json";
     remove(trace_path);
-    ret = lcm_infer_loop_v3(&t10_mem, NULL, NULL, z, z_out,
-                            64, 0.0f, 0.5f, 0.5f, 0.0f, trace_path);
+    float sentinel[LCM_D];
+    for (int i = 0; i < LCM_D; i++) sentinel[i] = 7.0f;
+    t10_reset_alerts();
+    ret = lcm_infer_loop_v3(&t10_mem, NULL, NULL, z, sentinel,
+                            64, 0.0f, 0.5f, 0.5f, 0.0f, trace_path,
+                            t10_alert_cb);
     CHECK(ret == CONFLICT_ABORT_TOKEN,
           "v3 loop: 64-step hard limit returns CONFLICT_ABORT_TOKEN (-2)");
+    int untouched = 1;
+    for (int i = 0; i < LCM_D; i++)
+        if (sentinel[i] != 7.0f) untouched = 0;
+    CHECK(untouched, "abort does not write z_out");
+
+    CHECK(t10_alert_count == 1, "abort fires the alert callback exactly once");
+    CHECK(strcmp(t10_last_alert.level, "FATAL") == 0
+              && strcmp(t10_last_alert.conflict_source,
+                        "CONFLICT_SCHEDULER") == 0
+              && strstr(t10_last_alert.conflict_detail,
+                        "hard_limit_reached") != NULL,
+          "callback receives a fully populated FATAL alert");
 
     FILE* f = fopen(trace_path, "r");
     CHECK(f != NULL, "v3 abort writes a trace JSON file");
@@ -2244,27 +2392,148 @@ static void test_loop_v3_graceful_and_hard(void) {
           "last trace step is marked with the scheduler conflict");
 }
 
-static void test_loop_v3_sparse_lfq_depends_on_hrq(void) {
-    /* Structural execution check: an inactive HRQ leaves dep_dist 0, so
-     * sparse_forward_c receives the LFQ-disabled signal. */
+static void test_loop_v3_self_only(void) {
     t10_prepare();
     float z[LCM_D] = {0};
     z[0] = 0.12f;
+    float z_out[LCM_D];
     for (int i = 0; i < LCM_MAX_LATTICES; i++)
         t10_mem.trigger_theta[i] = 0.0f;
-    t10_mem.trigger_theta[LATTICE_SPARSE] = 1e6f;
+    t10_mem.trigger_theta[LATTICE_SELF] = 1e6f;
 
-    dag_t dag;
-    build_dag_v3(z, &t10_mem, &dag);
+    int ret = lcm_infer_loop_v3(&t10_mem, NULL, NULL, z, z_out,
+                                1, 0.0f, 0.5f, 0.5f, 0.0f, NULL, NULL);
+    CHECK(ret == 0, "self-only step is graceful");
+    CHECK(fabsf(z_out[0]) > 0.5f && fabsf(z_out[1]) > 0.0f,
+          "self-only activation returns layer_norm(self_bias·z_self) "
+          "(Ruling 24)");
+}
+
+static void test_value_consistency_nonzero(void) {
+    t10_prepare();
+    t10_lr_value[0] = 0.5f;
+    t10_mem.lowrank.value = t10_lr_value;
+
     vec_t outputs[LCM_MAX_LATTICES];
-    float conf[LCM_MAX_LATTICES];
-    int active[LCM_MAX_LATTICES];
     memset(outputs, 0, sizeof(outputs));
-    memset(conf, 0, sizeof(conf));
-    execute_dag_v3(&dag, &t10_mem, 0.0f, outputs, conf, active);
-    int si = t10_find_node(&dag, OP_RETRIEVE_SINGLE, LATTICE_SPARSE);
-    CHECK(si >= 0 && dag.nodes[si].dep_dist == 0.0f,
-          "executor sees d_top=0 when HRQ is missing");
+    outputs[LATTICE_LOWRANK][0] = 1.0f;
+    int active[LCM_MAX_LATTICES] = {0};
+    active[LATTICE_LOWRANK] = 1;
+
+    float z_cur[LCM_D] = {0};
+    float z_next[LCM_D] = {0};
+    z_cur[0] = 0.12f;
+    z_next[0] = 0.6f;
+    z_next[1] = 0.8f;
+
+    float vc = lcm_value_consistency_v3(&t10_mem, (const float*)outputs,
+                                        active, z_cur, z_next);
+    CHECK(fabsf(vc - 0.6f) < 1e-5f,
+          "value consistency uses the selected LowRank row's scalar and a "
+          "real cosine");
+}
+
+static void test_retrieval_count_resource_abuse(void) {
+    t10_prepare();
+    lcm_memory_v3 big = t10_mem;
+    /* A deliberately deep low-rank lattice: 128 layer-codebook retrievals
+     * pushes the layers × codebooks count past the R17 128 cap. */
+    big.lowrank.U = t10_lr_U128;
+    big.lowrank.ranks = t10_ranks128;
+    big.lowrank.n_layers = 128;
+
+    int active[LCM_MAX_LATTICES] = {1, 1, 1, 1, 1, 1, 1};
+    int count = lcm_retrieval_count_v3(&big, active);
+    CHECK(count > LCM_MAX_RETRIEVALS,
+          "layer × codebook count can exceed max_retrievals");
+
+    memset(t10_dthreat, 0, sizeof(t10_dthreat));
+    memset(t10_dnormal, 0, sizeof(t10_dnormal));
+    t10_dthreat[0] = 1.0f;
+    t10_dnormal[1] = 1.0f;
+    t10_dthreat[LCM_D + 2] = 1.0f;
+    t10_dnormal[LCM_D + 3] = 1.0f;
+    danger_lattice_t dl;
+    danger_init(&dl, t10_dthreat, t10_dnormal, 2, LCM_D);
+
+    float z[LCM_D] = {0};
+    z[0] = 0.12f;
+    float z_out[LCM_D];
+    t10_reset_alerts();
+    int ret = lcm_infer_loop_v3(&big, NULL, &dl, z, z_out,
+                                1, 1e-3f, 0.5f, 0.5f, 0.0f,
+                                "traces/t10_resource.json", t10_alert_cb);
+    CHECK(ret == CONFLICT_ABORT_TOKEN,
+          "resource-abuse count aborts the v3 loop");
+    CHECK(t10_alert_count == 1
+              && strcmp(t10_last_alert.conflict_type,
+                        "THREAT_RESOURCE_ABUSE") == 0,
+          "resource abuse is reachable through danger_assess");
+}
+
+static int t10_flat_call(int gv_n, const float* gv_pos, const float* gv_neg,
+                         float* z_out) {
+    static float z[LCM_D];
+    memset(z, 0, sizeof(z));
+    z[0] = 0.12f;
+    return lcm_infer_loop_v3_flat(
+        z, LCM_D,
+        t10_mem.hrq.C_top, t10_mem.hrq.M_top,
+        t10_mem.hrq.C_fine, t10_mem.hrq.M_fine, t10_mem.hrq.n_fine,
+        t10_mem.sparse.C, t10_mem.sparse.M, t10_mem.sparse.zero_vec,
+        t10_mem.lowrank.U, t10_mem.lowrank.V, t10_mem.lowrank.ranks,
+        t10_mem.lowrank.n_layers, t10_mem.lowrank.M_lr,
+        t10_mem.lowrank.r_max,
+        t10_mem.manifold.C, t10_mem.manifold.M,
+        t10_mem.manifold.T, t10_mem.manifold.t_dim,
+        t10_mem.binding.key_cb, t10_mem.binding.val_cb,
+        t10_mem.binding.bind_cb, t10_mem.binding.M,
+        t10_mem.binding.n_layers, t10_mem.binding.A_k,
+        t10_mem.binding.A_v, t10_mem.binding.r_max,
+        t10_mem.contrast.C_a, t10_mem.contrast.C_b,
+        t10_mem.contrast.M, t10_mem.contrast.n_layers,
+        t10_mem.fusion.route_C, t10_mem.fusion.route_W,
+        t10_mem.n_lattices, t10_mem.fusion.alpha,
+        t10_mem.fusion.ln_scale, t10_mem.fusion.ln_bias,
+        t10_mem.fusion.self_C, t10_mem.fusion.M_self,
+        t10_mem.fusion.alpha_self,
+        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+        gv_pos, gv_n, gv_neg,
+        NULL, NULL, 0,
+        1, 1e-3f, 0.5f, 0.5f, 0.0f, NULL, NULL, z_out);
+}
+
+static void test_flat_gvalue_pair_count(void) {
+    t10_prepare();
+    float z_out[LCM_D];
+    CHECK(t10_flat_call(2, t10_gv_pos, t10_gv_neg, z_out) == -1,
+          "flat bridge rejects gv_n != LCM_N_VALUE_PAIRS (Ruling 26)");
+    CHECK(t10_flat_call(0, NULL, NULL, z_out) == 0,
+          "flat bridge accepts an absent gvalue");
+    CHECK(t10_flat_call(LCM_N_VALUE_PAIRS, t10_gv_pos, t10_gv_neg,
+                        z_out) != -1,
+          "flat bridge accepts exactly four gvalue pairs");
+}
+
+static void test_fuse_only_zero_weight(void) {
+    float outputs[LCM_MAX_LATTICES * LCM_D];
+    float mask[LCM_MAX_LATTICES] = {0};
+    float alpha[LCM_MAX_LATTICES];
+    float ln_scale[LCM_D], ln_bias[LCM_D], out[LCM_D];
+    memset(outputs, 0, sizeof(outputs));
+    for (int i = 0; i < LCM_MAX_LATTICES; i++) alpha[i] = 1.0f;
+    for (int i = 0; i < LCM_D; i++) { ln_scale[i] = 1.0f; ln_bias[i] = 0.0f; }
+
+    CHECK(lcm_fuse_only(outputs, T7_NLAT, LCM_D, mask, alpha, T7_NLAT,
+                        ln_scale, ln_bias, out) == -1,
+          "lcm_fuse_only keeps -1 on a zero weight sum");
+
+    int active[LCM_MAX_LATTICES] = {0};
+    active[0] = 1;
+    CHECK(lcm_fuse_canonical(outputs, T7_NLAT, LCM_D, mask, active,
+                             alpha, ln_scale, ln_bias, NULL, 0.0f,
+                             out) == 0,
+          "v3 canonical fusion falls back to uniform for an active set");
 }
 
 int main(void) {
@@ -2310,8 +2579,13 @@ int main(void) {
     test_dag_dynamic_threshold();
     test_dag_sparse_depends_on_hrq();
     test_dag_bind_all_upstream();
+    test_dag_n_lattices_seven();
     test_loop_v3_graceful_and_hard();
-    test_loop_v3_sparse_lfq_depends_on_hrq();
+    test_loop_v3_self_only();
+    test_value_consistency_nonzero();
+    test_retrieval_count_resource_abuse();
+    test_flat_gvalue_pair_count();
+    test_fuse_only_zero_weight();
     if (failures == 0)
         printf("ALL TESTS PASSED\n");
     else

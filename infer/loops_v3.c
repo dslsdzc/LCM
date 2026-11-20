@@ -133,11 +133,15 @@ int build_dag_v3(const float* z, lcm_memory_v3* mem, dag_t* dag) {
     memset(dag, 0, sizeof(*dag));
 
     /* Layer 1: collect every candidate distance first. Never append to the
-     * DAG while iterating it (the v1 implementation did). */
-    v3_candidate_t cand[LCM_MAX_LATTICES];
+     * DAG while iterating it (the v1 implementation did). Ruling 23: the
+     * routed loop stops before LATTICE_SELF; the self candidate is appended
+     * once, so n_lattices=7 cannot overflow cand[]. */
+    v3_candidate_t cand[LCM_MAX_LATTICES + 1];
     int n_cand = 0;
+    int n_func = mem->n_lattices < LATTICE_SELF
+        ? mem->n_lattices : LATTICE_SELF;
 
-    for (int li = 0; li < mem->n_lattices; li++) {
+    for (int li = 0; li < n_func; li++) {
         float dist;
         switch (li) {
         case LATTICE_HRQ:
@@ -175,28 +179,32 @@ int build_dag_v3(const float* z, lcm_memory_v3* mem, dag_t* dag) {
         n_cand++;
     }
 
-    float sum = 0.0f;
-    int n_finite = 0;
-    for (int i = 0; i < n_cand; i++) {
-        if (isfinite(cand[i].dist)) { sum += cand[i].dist; n_finite++; }
-    }
-    float mean_d = n_finite > 0 ? sum / (float)n_finite : 0.0f;
-    /* R8's mean_recent_d_min is scheduler state. Keep one EMA here; a zero
-     * value means "first step", so the first step is thresholded against the
-     * current input's own mean distance. */
-    float scale = mean_d;
-    if (mem->mean_recent_d_min > 0.0f)
-        scale = 0.7f * mem->mean_recent_d_min + 0.3f * mean_d;
-    mem->mean_recent_d_min = scale;
-
     int active[LCM_MAX_LATTICES] = {0};
     for (int i = 0; i < n_cand; i++) {
         int li = cand[i].lattice_id;
         float theta = mem->trigger_theta[li];
-        float thr = theta > 0.0f ? theta * scale : 0.0f;
+        /* R8/Ruling 20: threshold[li] = θ_li · mean_recent_d_min[li];
+         * first use falls back to the configured initial threshold. */
+        float thr;
+        if (mem->mean_recent_d_min[li] > 0.0f) {
+            thr = theta * mem->mean_recent_d_min[li];
+        } else {
+            thr = mem->trigger_initial[li] > 0.0f
+                ? mem->trigger_initial[li] : 1e10f;
+        }
         active[li] = theta > 0.0f
             && (cand[i].dist < thr || cand[i].dist <= 1e-12f);
         trace_push(dag, cand[i].op_type, li, cand[i].dist, active[li]);
+
+        if (isfinite(cand[i].dist)) {
+            if (mem->mean_recent_d_min[li] > 0.0f) {
+                mem->mean_recent_d_min[li] =
+                    0.7f * mem->mean_recent_d_min[li]
+                    + 0.3f * cand[i].dist;
+            } else {
+                mem->mean_recent_d_min[li] = cand[i].dist;
+            }
+        }
     }
 
     /* Layer 2: append in dependency order. HRQ first so Sparse can point at
@@ -225,16 +233,15 @@ int build_dag_v3(const float* z, lcm_memory_v3* mem, dag_t* dag) {
         if (li == LATTICE_HRQ) {
             hrq_node = node;
         } else if (li == LATTICE_SPARSE) {
-            /* C-5: the LFQ gate is HRQ's d_top. Inactive HRQ ⇒ 0, which
-             * disables LFQ inside sparse_forward_c. */
+            /* C-5/Ruling 21: the LFQ gate is HRQ's R2-domain top similarity,
+             * filled by execute_dag_v3 after HRQ runs. Until then 0 disables
+             * LFQ; an inactive HRQ leaves it 0 for the whole step. */
             node->n_inputs = 2;
             node->inputs[1] = hrq_node ? (const float*)hrq_node->output : NULL;
-            node->dep_dist = hrq_node
-                ? (hrq_node->dist > 0.0f ? hrq_node->dist : LCM_V3_BUCKET_EPS)
-                : 0.0f;
+            node->dep_dist = 0.0f;
         }
 
-        if (li < mem->n_lattices && n_retrieve < LCM_MAX_LATTICES)
+        if (li < n_func && n_retrieve < LCM_MAX_LATTICES)
             retrieve[n_retrieve++] = node;
     }
 
@@ -249,7 +256,9 @@ int build_dag_v3(const float* z, lcm_memory_v3* mem, dag_t* dag) {
         }
     }
 
-    /* Unbind: inputs[0] = bind output, inputs[1] = key projection. */
+    /* Unbind: inputs[0] = bind output, inputs[1] = the first retrieve
+     * output. R8 uses the same retrieve output bind consumed as the key
+     * (not the A_k z projection, which binding_forward_c owns). */
     if (bind_node && dag->n_nodes < LCM_MAX_NODES) {
         op_node_t* node = dag_push(dag, OP_HRR_UNBIND, LCM_MAX_LATTICES,
                                    0.0f, z);
@@ -310,11 +319,24 @@ bool execute_dag_v3(dag_t* dag, const lcm_memory_v3* mem, float alpha_val,
             int li = node->lattice_id;
             if (li < 0 || li >= mem->n_lattices) continue;
             switch (li) {
-            case LATTICE_HRQ:
-                hrq_forward_v31(node->inputs[0], &mem->hrq, alpha_val,
-                                LCM_V3_VALUE_TOPK, mem->tau_route_fallback,
-                                result, NULL, NULL);
+            case LATTICE_HRQ: {
+                float top_sim = 0.0f;
+                if (hrq_forward_v31(node->inputs[0], &mem->hrq, alpha_val,
+                                    LCM_V3_VALUE_TOPK,
+                                    mem->tau_route_fallback, result,
+                                    NULL, &top_sim) == 0) {
+                    /* Ruling 21: Sparse's d_top is the HRQ top similarity in
+                     * the same Poincaré domain sparse_forward_c measures. */
+                    for (int k = 0; k < dag->n_nodes; k++) {
+                        op_node_t* sp = &dag->nodes[k];
+                        if (sp->op_type == OP_RETRIEVE_SINGLE
+                            && sp->lattice_id == LATTICE_SPARSE) {
+                            sp->dep_dist = top_sim;
+                        }
+                    }
+                }
                 break;
+            }
             case LATTICE_SPARSE:
                 sparse_forward_c(node->inputs[0], &mem->sparse,
                                  mem->lambda_lfq, alpha_val,
@@ -372,11 +394,12 @@ int lcm_fuse_canonical(const float* outputs, int n_lattices, int d,
         w_sum += w[i];
     }
     if (w_sum == 0.0f) {
-        if (n_active == 0) return -1;
-        /* Routing chose an inactive lattice (hard mask): use uniform
-         * weights over the active set rather than dropping the step. */
+        /* Preserve lcm_fuse_only's historical contract: a zero sum with no
+         * active mask is an error. The v3 path passes `active` and may fall
+         * back to uniform weights over the active set (Ruling minor 3). */
+        if (!active || n_active == 0) return -1;
         for (int i = 0; i < n_lattices; i++) {
-            if (!active || active[i]) w[i] = 1.0f / (float)n_active;
+            if (active[i]) w[i] = 1.0f / (float)n_active;
         }
         w_sum = 1.0f;
     }
@@ -430,9 +453,11 @@ static int v3_nearest_value(const float* z, const float* cb, int M,
     return 1;
 }
 
-static float v3_value_consistency(const lcm_memory_v3* mem,
-                                  const vec_t* outputs, const int* active,
-                                  const float* z_cur, const float* z_next) {
+static float v3_value_consistency_impl(const lcm_memory_v3* mem,
+                                        const vec_t* outputs,
+                                        const int* active,
+                                        const float* z_cur,
+                                        const float* z_next) {
     vec_t acc;
     memset(acc, 0, sizeof(acc));
     int used = 0;
@@ -509,6 +534,53 @@ static float v3_value_consistency(const lcm_memory_v3* mem,
     return c;
 }
 
+float lcm_value_consistency_v3(const lcm_memory_v3* mem,
+                               const float* outputs, const int* active,
+                               const float* z_cur, const float* z_next) {
+    if (!mem || !outputs || !z_cur || !z_next) return 1.0f;
+    return v3_value_consistency_impl(mem, (const vec_t*)outputs, active,
+                                     z_cur, z_next);
+}
+
+/* Retrieval operations performed by one active step: one per codebook layer
+ * actually searched (Ruling minor: layers × codebooks, not DAG node count
+ * and not row comparisons). This keeps a production-sized checkpoint far
+ * below the R17 128 cap while still making the resource-abuse branch
+ * reachable with a deliberately deep synthetic lattice. */
+int lcm_retrieval_count_v3(const lcm_memory_v3* mem, const int* active) {
+    if (!mem) return 0;
+    int total = 0;
+    for (int li = 0; li < LCM_MAX_LATTICES; li++) {
+        if (active && !active[li]) continue;
+        switch (li) {
+        case LATTICE_HRQ:
+            total += 1 + (mem->hrq.n_fine > 0 ? mem->hrq.n_fine : 0);
+            break;
+        case LATTICE_SPARSE:
+            total += 1;
+            break;
+        case LATTICE_LOWRANK:
+            total += mem->lowrank.n_layers;
+            break;
+        case LATTICE_MANIFOLD:
+            total += 1;
+            break;
+        case LATTICE_BINDING:
+            total += 3 * mem->binding.n_layers;
+            break;
+        case LATTICE_CONTRAST:
+            total += 2 * mem->contrast.n_layers;
+            break;
+        case LATTICE_SELF:
+            total += 1;
+            break;
+        default:
+            break;
+        }
+    }
+    return total;
+}
+
 /* ─── Trace export / alert log ────────────────────────────────────────────── */
 
 static __thread inference_trace_v3_t _last_trace_v3;
@@ -570,6 +642,25 @@ static void v3_ensure_parent(const char* path) {
     }
 }
 
+/* JSON string escaping for trace fields (session ids and conflict details can
+ * contain quotes/newlines from a caller-provided session or detail). */
+static void v3_json_escape(FILE* f, const char* s) {
+    if (!s) return;
+    for (const unsigned char* p = (const unsigned char*)s; *p; p++) {
+        switch (*p) {
+        case '"':  fputs("\\\"", f); break;
+        case '\\': fputs("\\\\", f); break;
+        case '\n': fputs("\\n", f); break;
+        case '\r': fputs("\\r", f); break;
+        case '\t': fputs("\\t", f); break;
+        default:
+            if (*p < 0x20) fprintf(f, "\\u%04x", (unsigned)*p);
+            else fputc(*p, f);
+            break;
+        }
+    }
+}
+
 int save_trace_v3_to_file(const inference_trace_v3_t* trace,
                           const char* filepath) {
     if (!trace || !filepath || !filepath[0]) return -1;
@@ -577,8 +668,9 @@ int save_trace_v3_to_file(const inference_trace_v3_t* trace,
     FILE* f = fopen(filepath, "w");
     if (!f) return -1;
 
-    fprintf(f, "{\n  \"session_id\": \"%s\",\n  \"n_steps\": %d,\n"
-               "  \"steps\": [\n", trace->session_id, trace->n_steps);
+    fprintf(f, "{\n  \"session_id\": \"");
+    v3_json_escape(f, trace->session_id);
+    fprintf(f, "\",\n  \"n_steps\": %d,\n  \"steps\": [\n", trace->n_steps);
     for (int s = 0; s < trace->n_steps; s++) {
         const step_trace_v3_t* st = &trace->steps[s];
         fprintf(f, "    {\n      \"step\": %d,\n"
@@ -606,10 +698,11 @@ int save_trace_v3_to_file(const inference_trace_v3_t* trace,
             fprintf(f, "%.6f%s", st->z_next[j],
                     j + 1 < LCM_D ? ", " : "");
         fprintf(f, "],\n      \"conflict\": {\"source\": \"%s\", "
-                   "\"type\": \"%s\", \"detail\": \"%s\"}\n    }%s\n",
+                   "\"type\": \"%s\", \"detail\": \"",
                 v3_conflict_source_name(st->conflict.source),
-                v3_threat_name(st->conflict.type),
-                st->conflict.detail,
+                v3_threat_name(st->conflict.type));
+        v3_json_escape(f, st->conflict.detail);
+        fprintf(f, "\"}\n    }%s\n",
                 s + 1 < trace->n_steps ? "," : "");
     }
     fprintf(f, "  ]\n}\n");
@@ -618,16 +711,19 @@ int save_trace_v3_to_file(const inference_trace_v3_t* trace,
 }
 
 static void v3_default_trace_path(char* out, size_t cap) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        ts.tv_sec = time(NULL);
+        ts.tv_nsec = 0;
+    }
     char cwd[512];
+    const char* dir = "infer/traces";
     if (getcwd(cwd, sizeof(cwd)) != NULL) {
         const char* base = strrchr(cwd, '/');
-        if (base && strcmp(base + 1, "infer") == 0) {
-            snprintf(out, cap, "traces/lcm_v3_%ld.json",
-                     (long)time(NULL));
-            return;
-        }
+        if (base && strcmp(base + 1, "infer") == 0) dir = "traces";
     }
-    snprintf(out, cap, "infer/traces/lcm_v3_%ld.json", (long)time(NULL));
+    snprintf(out, cap, "%s/lcm_v3_%ld_%09ld_%ld.json",
+             dir, (long)ts.tv_sec, (long)ts.tv_nsec, (long)getpid());
 }
 
 static void v3_alert_path(char* out, size_t cap) {
@@ -642,7 +738,8 @@ static void v3_alert_path(char* out, size_t cap) {
     snprintf(out, cap, "infer/alerts.log");
 }
 
-static void v3_write_alert(const conflict_t* conflict, int step) {
+static void v3_write_alert(const conflict_t* conflict, int step,
+                           void (*alert_cb)(const alert_t*)) {
     alert_t alert;
     memset(&alert, 0, sizeof(alert));
     snprintf(alert.level, sizeof(alert.level), "FATAL");
@@ -671,21 +768,46 @@ static void v3_write_alert(const conflict_t* conflict, int step) {
         v3_ensure_parent("alerts.log");
         f = fopen("alerts.log", "a");
     }
-    if (!f) return;
-    fprintf(f, "%ld,%s,%s,%s,%s,%d,%s\n",
-            (long)alert.timestamp, alert.level, alert.session_id,
-            alert.conflict_source, alert.conflict_type, alert.step,
-            alert.conflict_detail);
-    fclose(f);
+    if (!f) {
+        fprintf(stderr, "[LCM SAFETY] failed to open %s for append\n", path);
+    } else {
+        fprintf(f, "%ld,%s,%s,%s,%s,%d,%s\n",
+                (long)alert.timestamp, alert.level, alert.session_id,
+                alert.conflict_source, alert.conflict_type, alert.step,
+                alert.conflict_detail);
+        if (fclose(f) != 0)
+            fprintf(stderr, "[LCM SAFETY] failed to flush alert log\n");
+    }
+
+    /* Ruling 22: exactly one fully populated alert per abort. */
+    if (alert_cb) alert_cb(&alert);
 }
 
 /* ─── Macro loop (R9) ─────────────────────────────────────────────────────── */
+
+/* LayerNorm used by the self-only fallback (Ruling 24), eps = 1e-6. */
+static void v3_layer_norm(const float* x, const float* scale, const float* bias,
+                          float* out) {
+    float mean = 0.0f;
+    for (int j = 0; j < LCM_D; j++) mean += x[j];
+    mean /= (float)LCM_D;
+    float var = 0.0f;
+    for (int j = 0; j < LCM_D; j++) {
+        float t = x[j] - mean;
+        var += t * t;
+    }
+    var /= (float)LCM_D;
+    float inv_std = 1.0f / sqrtf(var + 1e-6f);
+    for (int j = 0; j < LCM_D; j++)
+        out[j] = (x[j] - mean) * inv_std * scale[j] + bias[j];
+}
 
 int lcm_infer_loop_v3(const lcm_memory_v3* mem, const gvalue_t* gv,
                       const danger_lattice_t* dl, const float* z_initial,
                       float* z_out, int max_steps, float conv_tol,
                       float entropy_thresh, float safety_margin,
-                      float alpha_val, const char* trace_path) {
+                      float alpha_val, const char* trace_path,
+                      void (*alert_cb)(const alert_t*)) {
     if (!mem || !z_initial || !z_out) return -1;
     if (mem->D != LCM_D || mem->n_lattices <= 0
         || mem->n_lattices > LCM_MAX_LATTICES) return -1;
@@ -696,6 +818,8 @@ int lcm_infer_loop_v3(const lcm_memory_v3* mem, const gvalue_t* gv,
     int budget = max_steps > 0 ? max_steps : LCM_MAX_INFERENCE_STEPS;
     int hard = LCM_MAX_INFERENCE_STEPS_HARD;
     int limit = budget < hard ? budget : hard;
+    float e_thresh = entropy_thresh > 0.0f
+        ? entropy_thresh : LCM_ENTROPY_THRESHOLD_NORM;
 
     inference_trace_v3_t trace;
     memset(&trace, 0, sizeof(trace));
@@ -725,8 +849,12 @@ int lcm_infer_loop_v3(const lcm_memory_v3* mem, const gvalue_t* gv,
 
         float weights[LCM_MAX_LATTICES];
         memset(weights, 0, sizeof(weights));
+        /* R15: self is the additive 7th term, not a routed weight. A
+         * 7-lattice config still routes six functional lattices. */
+        int n_routed = work.n_lattices < LATTICE_SELF
+            ? work.n_lattices : LATTICE_SELF;
         int n_active = 0;
-        for (int i = 0; i < work.n_lattices; i++) {
+        for (int i = 0; i < n_routed; i++) {
             weights[i] = active[i] ? soft_mask[i] * work.fusion.alpha[i]
                                    : 0.0f;
             if (active[i]) n_active++;
@@ -750,13 +878,21 @@ int lcm_infer_loop_v3(const lcm_memory_v3* mem, const gvalue_t* gv,
         }
 
         vec_t z_next;
-        if (lcm_fuse_canonical((const float*)outputs, work.n_lattices,
+        if (lcm_fuse_canonical((const float*)outputs, n_routed,
                                LCM_D, soft_mask, active, work.fusion.alpha,
                                work.fusion.ln_scale, work.fusion.ln_bias,
                                self_out, self_bias, z_next) != 0) {
-            /* No active routed node: identity step is the only sane
-             * continuation; the entropy gate then converges immediately. */
-            memcpy(z_next, z_cur, sizeof(vec_t));
+            if (self_out) {
+                /* Ruling 24: self-only activation is a real fusion step,
+                 * not an identity pass-through. */
+                vec_t biased;
+                for (int j = 0; j < LCM_D; j++)
+                    biased[j] = self_bias * self_out[j];
+                v3_layer_norm(biased, work.fusion.ln_scale,
+                              work.fusion.ln_bias, z_next);
+            } else {
+                memcpy(z_next, z_cur, sizeof(vec_t));
+            }
             memset(weights, 0, sizeof(weights));
             n_active = 0;
         }
@@ -771,16 +907,9 @@ int lcm_infer_loop_v3(const lcm_memory_v3* mem, const gvalue_t* gv,
                 if (active[i]) weights[i] = 1.0f / (float)n_active;
         }
 
-        int retrieval_total = 0;
-        for (int ni = 0; ni < dag.n_nodes; ni++) {
-            const op_node_t* nd = &dag.nodes[ni];
-            if (nd->op_type == OP_RETRIEVE_SINGLE
-                && nd->lattice_id >= 0
-                && nd->lattice_id < work.n_lattices)
-                retrieval_total++;
-        }
+        int retrieval_total = lcm_retrieval_count_v3(&work, active);
 
-        float value_consistency = v3_value_consistency(
+        float value_consistency = v3_value_consistency_impl(
             &work, (const vec_t*)outputs, active, z_cur, z_next);
 
         conflict_t conflict;
@@ -811,8 +940,11 @@ int lcm_infer_loop_v3(const lcm_memory_v3* mem, const gvalue_t* gv,
             } else {
                 v3_default_trace_path(path, sizeof(path));
             }
-            save_trace_v3_to_file(&trace, path);
-            v3_write_alert(&conflict, step);
+            if (save_trace_v3_to_file(&trace, path) != 0) {
+                fprintf(stderr, "[LCM SAFETY] failed to save trace to %s\n",
+                        path);
+            }
+            v3_write_alert(&conflict, step, alert_cb);
             return CONFLICT_ABORT_TOKEN;   /* z_out intentionally not written */
         }
 
@@ -834,11 +966,14 @@ int lcm_infer_loop_v3(const lcm_memory_v3* mem, const gvalue_t* gv,
 
         memcpy(z_cur, z_next, sizeof(vec_t));
 
-        if (diff < conv_tol && h_norm < entropy_thresh) {
+        if (diff < conv_tol && h_norm < e_thresh) {
             memcpy(z_out, z_next, sizeof(vec_t));
             _last_trace_v3 = trace;
-            if (trace_path && trace_path[0])
-                save_trace_v3_to_file(&trace, trace_path);
+            if (trace_path && trace_path[0]
+                && save_trace_v3_to_file(&trace, trace_path) != 0) {
+                fprintf(stderr, "[LCM SAFETY] failed to save trace to %s\n",
+                        trace_path);
+            }
             return 0;
         }
     }
@@ -871,14 +1006,19 @@ int lcm_infer_loop_v3(const lcm_memory_v3* mem, const gvalue_t* gv,
         } else {
             v3_default_trace_path(path, sizeof(path));
         }
-        save_trace_v3_to_file(&trace, path);
-        v3_write_alert(&conflict, limit);
+        if (save_trace_v3_to_file(&trace, path) != 0) {
+            fprintf(stderr, "[LCM SAFETY] failed to save trace to %s\n", path);
+        }
+        v3_write_alert(&conflict, limit, alert_cb);
         _last_trace_v3 = trace;
         return CONFLICT_ABORT_TOKEN;
     }
 
     memcpy(z_out, z_cur, sizeof(vec_t));
-    if (trace_path && trace_path[0])
-        save_trace_v3_to_file(&trace, trace_path);
+    if (trace_path && trace_path[0]
+        && save_trace_v3_to_file(&trace, trace_path) != 0) {
+        fprintf(stderr, "[LCM SAFETY] failed to save trace to %s\n",
+                trace_path);
+    }
     return 0;   /* graceful scheduler budget exhaustion */
 }

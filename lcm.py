@@ -33,6 +33,23 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 CONFLICT_ABORT_TOKEN = -2  # R13: distinct from ordinary error -1
 
+
+class _AlertT(ctypes.Structure):
+    """Mirror of C `alert_t` (infer/lcm.h), for the v3 callback."""
+    _fields_ = [
+        ("level", ctypes.c_char * 8),
+        ("session_id", ctypes.c_char * 64),
+        ("conflict_source", ctypes.c_char * 32),
+        ("conflict_type", ctypes.c_char * 32),
+        ("conflict_detail", ctypes.c_char * 256),
+        ("step", ctypes.c_int),
+        ("timestamp", ctypes.c_double),
+        ("message", ctypes.c_char * 1024),
+    ]
+
+
+_ALERT_CB = ctypes.CFUNCTYPE(None, ctypes.POINTER(_AlertT))
+
 import numpy as np
 from tqdm import tqdm
 
@@ -1526,6 +1543,30 @@ def trace_step_conflict_source(trace_step):
     return None
 
 
+def validate_safety_codebooks(gv_pos, gv_neg, gv_n,
+                              danger_t, danger_n, danger_M):
+    """Reject placeholder safety codebooks (R13/Ruling 28).
+
+    Placeholders are structurally valid but semantically empty: equal
+    positive/negative anchors or equal threat/normal rows make the safety
+    checks meaningless. Refuse the checkpoint instead of silently disabling
+    a check. Raises SystemExit so `lcm.py -i` fails loudly.
+    """
+    if gv_n not in (0, 4):   # LCM_N_VALUE_PAIRS == 4 (Ruling 26)
+        raise SystemExit(
+            f"[GVAL] gvalue header has {gv_n} law pairs; the C bridge "
+            f"requires exactly 4 — re-export required")
+    if gv_n > 0 and np.array_equal(gv_pos, gv_neg):
+        raise SystemExit(
+            "[GVAL] placeholder gvalue codebook detected (C_pos == C_neg); "
+            "re-export with real anchors — refusing to load")
+    if danger_M > 0 and np.array_equal(danger_t, danger_n):
+        raise SystemExit(
+            "[DANGER] placeholder danger codebook detected "
+            "(C_threats == C_normal); re-export with distinct rows — "
+            "refusing to load")
+
+
 # ── LCMInferEngine ──────────────────────────────────────────────────────────
 
 class LCMInferEngine:
@@ -1604,6 +1645,28 @@ class LCMInferEngine:
         self.causal = None  # CausalSubject — lazy init via enable_causal()
         self._last_agency_mod = {'tension': 0.0, 'explore': 0.0}
         self._last_loop_ret = 0
+        self._alerts = []
+        self.last_alert = None
+
+        def _on_alert(ptr):
+            a = ptr.contents
+            record = {
+                'level': a.level.decode(errors='replace'),
+                'session_id': a.session_id.decode(errors='replace'),
+                'conflict_source': a.conflict_source.decode(errors='replace'),
+                'conflict_type': a.conflict_type.decode(errors='replace'),
+                'conflict_detail': a.conflict_detail.decode(errors='replace'),
+                'step': int(a.step),
+                'timestamp': float(a.timestamp),
+                'message': a.message.decode(errors='replace'),
+            }
+            self.last_alert = record
+            self._alerts.append(record)
+            print(f"[SAFETY] {record['level']} {record['conflict_source']}/"
+                  f"{record['conflict_type']} at step {record['step']}",
+                  file=sys.stderr)
+
+        self._alert_cb = _ALERT_CB(_on_alert)
 
     def _load_codebooks(self):
         """Load every layer and side tensor from the v2 manifest (R10).
@@ -1699,14 +1762,6 @@ class LCMInferEngine:
         gv_data, gv_n, _ = load_codebook_for_c(ckpt, "gvalue_codebook.bin")
         gv_pos = gv_data[:gv_n * self.d]
         gv_neg = gv_data[gv_n * self.d:]
-        if gv_n > 0 and np.array_equal(gv_pos, gv_neg):
-            # Placeholder export (C_pos == C_neg): the C engine's margin check
-            # (pos > neg - margin ⇒ unsafe) fires on nearly every input when
-            # use_safety is on, silently skipping the cognitive loop. Real
-            # anchors are not trained yet — disable the check (gv_n=0 → the
-            # engine builds no gv and skips gvalue entirely).
-            print("[GVAL] Placeholder gvalue detected (pos==neg) — safety check disabled")
-            gv_n = 0
         self.gv_n = gv_n
         self.gv_pos = np.ascontiguousarray(gv_pos, dtype=np.float32)
         self.gv_neg = np.ascontiguousarray(gv_neg, dtype=np.float32)
@@ -1721,6 +1776,10 @@ class LCMInferEngine:
             self.danger_t = np.zeros(1, dtype=np.float32)
             self.danger_n = np.zeros(1, dtype=np.float32)
             self.danger_M = 0
+
+        validate_safety_codebooks(
+            self.gv_pos, self.gv_neg, self.gv_n,
+            self.danger_t, self.danger_n, self.danger_M)
 
     def _ptr(self, arr):
         return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
@@ -1845,7 +1904,7 @@ class LCMInferEngine:
             # Scheduler / fusion / trace
             ctypes.c_int(modulated_max), ctypes.c_float(modulated_tol),
             ctypes.c_float(entropy_thresh), ctypes.c_float(0.5),
-            ctypes.c_float(alpha_val), None,
+            ctypes.c_float(alpha_val), None, self._alert_cb,
             self._ptr(z_out),
         )
         self._last_loop_ret = ret
@@ -2048,10 +2107,11 @@ class LCMInferEngine:
                     z, use_safety=use_safety,
                     agency_tension_mod=self._last_agency_mod['tension'],
                     agency_explore_mod=self._last_agency_mod['explore'])
-                if getattr(self, '_last_loop_ret', 0) == CONFLICT_ABORT_TOKEN:
-                    # R13: safety abort produces no token at all. The C
-                    # engine already wrote infer/alerts.log and the trace.
-                    print("[SAFETY] generation terminated by CONFLICT_ABORT_TOKEN",
+                if getattr(self, '_last_loop_ret', 0) != 0:
+                    # R13/Ruling minor: any nonzero v3 return is an
+                    # abort/error. Never decode the untouched z_out.
+                    print(f"[SAFETY] generation terminated (v3 ret="
+                          f"{self._last_loop_ret}); see infer/alerts.log",
                           file=sys.stderr)
                     return
                 if show_trace:

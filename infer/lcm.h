@@ -45,7 +45,7 @@ extern "C" {
 #define LCM_N_VALUE_PAIRS  4     /* 4 law pairs (pos/neg) */
 #endif
 #ifndef LCM_MAX_RETRIEVALS
-#define LCM_MAX_RETRIEVALS 12    /* Max retrievals per step */
+#define LCM_MAX_RETRIEVALS 128   /* Max retrievals per step (R17/R13) */
 #endif
 #ifndef LCM_HRQ_MAX_TOPK
 #define LCM_HRQ_MAX_TOPK   1024  /* Stack cap for R1's value-rescoring top-k */
@@ -70,7 +70,8 @@ extern "C" {
 
 /* Derived constants */
 #define LCM_CONSISTENCY_THRESHOLD 0.3f
-#define LCM_ENTROPY_THRESHOLD     0.5f  /* R9: normalised H(w)/ln(n_active) */
+#define LCM_ENTROPY_THRESHOLD     2.0f  /* v1: unnormalised H, effectively off */
+#define LCM_ENTROPY_THRESHOLD_NORM 0.5f /* R9: v3 H(w)/ln(n_active) */
 #define LCM_CONVERGENCE_TOL       1e-3f
 #define LCM_DEFAULT_SAFETY_MARGIN 0.5f
 #define LCM_MAX_INFERENCE_STEPS      16  /* R9: scheduler budget (graceful) */
@@ -265,13 +266,15 @@ typedef struct {
     float tau_route_fallback;   /* HRQ relative-gap threshold (0.1) */
     float tau_self;             /* self familiarity temperature (1.0) */
     float lambda_lfq;           /* sparse LFQ multiplier (1.5) */
-    /* R8 dynamic trigger state. The scheduler owns these fields; build_dag_v3
-     * updates mean_recent_d_min with an EMA of the current per-step mean
-     * trigger distance and uses theta[li] * scale as the node threshold.
+    /* R8/Ruling 20 dynamic trigger state. The scheduler owns these fields;
+     * build_dag_v3 updates each lattice's own mean_recent_d_min[li] with an
+     * EMA of that lattice's trigger distance and uses
+     * threshold[li] = theta[li] * mean_recent_d_min[li].
      * lcm_infer_loop_v3 keeps a private shallow copy, so a caller's memory
      * descriptor is not mutated across sessions. */
-    float trigger_theta[LCM_MAX_LATTICES]; /* θ_li (default 1.0) */
-    float mean_recent_d_min;               /* EMA scale, 0 = unset */
+    float trigger_theta[LCM_MAX_LATTICES];   /* θ_li (default 1.0) */
+    float mean_recent_d_min[LCM_MAX_LATTICES]; /* per-lattice EMA, 0 = unset */
+    float trigger_initial[LCM_MAX_LATTICES]; /* first-use threshold (default 1e10) */
 } lcm_memory_v3;
 
 /* ─── Global Value Lattice ───────────────────────────────────────────────── */
@@ -450,12 +453,14 @@ bool  execute_dag(dag_t* dag, const memory_t* mem, vec_t* outputs, float* confid
  *
  * Builds the step graph from the full v3 memory. Candidate trigger distances
  * are collected first (never appending while iterating), and a node is added
- * only when d_min < theta_li * mean_recent_d_min. The scale is an EMA stored
- * in mem->mean_recent_d_min (the caller may pass a private copy; the macro
- * loop does). HRQ is emitted before Sparse so Sparse can depend on its output;
- * Sparse receives dep_dist = HRQ distance (0 when HRQ is inactive, disabling
- * LFQ). Bind consumes every routed retrieve node; unbind consumes bind + the
- * first retrieve as key. OP_DISTANCE_FUSION is never a node.
+ * only when d_min < threshold_li, where threshold_li is
+ * theta_li * mean_recent_d_min[li] once that lattice has history, and the
+ * configured trigger_initial[li] on first use (R8/Ruling 20). HRQ is emitted
+ * before Sparse so Sparse can depend on its output. Sparse's dep_dist is
+ * filled after HRQ executes with the R2-domain top similarity (poincaré),
+ * not the Euclidean trigger distance; until then it is 0 so LFQ stays off.
+ * Bind consumes every routed retrieve node; unbind consumes bind + the first
+ * retrieve output as its key (the same retrieve output bind used).
  *
  * Returns the number of candidate nodes (>=0), or -1 on invalid arguments.
  * `dag` is zeroed first.
@@ -475,7 +480,10 @@ bool execute_dag_v3(dag_t* dag, const lcm_memory_v3* mem, float alpha_val,
  *   z = layer_norm(Σ_{active} w_i/Σw · o_i + self_bias · o_self)
  * with w_i = soft_mask_i * alpha_i. `outputs` is a flat [n * d] array.
  * active == NULL means every index participates (the lcm_fuse_only case).
- * Returns 0 on success, -1 on invalid arguments or a zero weight sum.
+ * With an active mask and a zero weight sum (e.g. the hard router chose an
+ * inactive lattice), it falls back to uniform weights over the active set.
+ * Returns 0 on success, -1 on invalid arguments (and, for active == NULL, a
+ * zero weight sum).
  */
 int lcm_fuse_canonical(const float* outputs, int n_lattices, int d,
                        const float* soft_mask, const int* active,
@@ -504,7 +512,22 @@ int lcm_infer_loop_v3(const lcm_memory_v3* mem, const gvalue_t* gv,
                       const danger_lattice_t* dl, const float* z_initial,
                       float* z_out, int max_steps, float conv_tol,
                       float entropy_thresh, float safety_margin,
-                      float alpha_val, const char* trace_path);
+                      float alpha_val, const char* trace_path,
+                      void (*alert_cb)(const alert_t*));
+
+/* R13 value consistency over active lattices: cosine of
+ * Σ tanh(v_j)·c_j (the selected primary-codebook rows) against z_next.
+ * Returns 1.0 when no value vector/direction is available. Exposed for the
+ * focused conformance test. */
+float lcm_value_consistency_v3(const lcm_memory_v3* mem,
+                               const float* outputs, const int* active,
+                               const float* z_cur, const float* z_next);
+
+/* Count the retrieval operations performed by one v3 step: one per codebook
+ * layer actually searched (HRQ top + fine layers, low-rank layers, three
+ * binding families per layer, two contrast families per layer). Exposed so
+ * the resource-abuse path can be exercised without a production checkpoint. */
+int lcm_retrieval_count_v3(const lcm_memory_v3* mem, const int* active);
 
 /* Copy the last v3 trace into `out`; returns the number of steps (0 when no
  * loop has run). Thread-local, like lcm_get_trace. */

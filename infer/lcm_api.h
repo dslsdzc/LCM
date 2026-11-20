@@ -10,6 +10,8 @@
 #ifndef LCM_API_H
 #define LCM_API_H
 
+#include "lcm.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -91,7 +93,10 @@ int lcm_infer_step_v2(const float* z, int d,
  * `outputs` is a flat [n_lattices * d] row-major array in the usual order
  * (HRQ, SPARSE, LOWRANK, MANIFOLD, BINDING, CONTRAST).
  *
- * Returns 0 on success, -1 on error.
+ * Returns 0 on success, -1 on invalid arguments. A zero weight sum is an
+ * error here (active == NULL, the historical lcm_fuse_only contract). The v3
+ * caller passes an active mask and gets a uniform fallback over that set
+ * instead (Ruling minor 3).
  */
 int lcm_fuse_only(const float* outputs, int n_lattices, int d,
                   const float* soft_mask,
@@ -155,6 +160,8 @@ int lcm_get_trace(float* trace_buf, int buf_capacity_floats);
  *
  * Returns 0 (converged or graceful budget), -1 (argument error), or
  * CONFLICT_ABORT_TOKEN (-2, safety abort; z_out must not be used).
+ * `alert_cb` (optional) receives the fully populated FATAL alert exactly once
+ * on any abort.
  */
 int lcm_infer_loop_v3_flat(
     const float* z, int d,
@@ -182,6 +189,7 @@ int lcm_infer_loop_v3_flat(
     const float* danger_t, const float* danger_n, int danger_M,
     int max_steps, float conv_tol, float entropy_thresh,
     float safety_margin, float alpha_val, const char* trace_path,
+    void (*alert_cb)(const alert_t*),
     float* z_out);
 
 

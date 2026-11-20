@@ -145,6 +145,23 @@ def _build_engine(danger_threat, danger_normal):
     eng._last_loop_ret = 0
     eng._test_z = np.zeros(D, np.float32)
     eng._test_z[1] = 1.0   # safe direction (near C_normal)
+    eng.alerts = []
+    eng.last_alert = None
+
+    def _on_alert(ptr):
+        a = ptr.contents
+        record = {
+            'level': a.level.decode(errors='replace'),
+            'conflict_source': a.conflict_source.decode(errors='replace'),
+            'conflict_type': a.conflict_type.decode(errors='replace'),
+            'conflict_detail': a.conflict_detail.decode(errors='replace'),
+            'step': int(a.step),
+            'message': a.message.decode(errors='replace'),
+        }
+        eng.last_alert = record
+        eng.alerts.append(record)
+
+    eng._alert_cb = lcm._ALERT_CB(_on_alert)
     return eng
 
 
@@ -161,7 +178,7 @@ def _danger_codebooks():
 @pytest.fixture
 def engine(monkeypatch):
     if not SO_PATH.exists():
-        pytest.skip(f"{SO_PATH} not built; run `make -C infer` first")
+        pytest.fail(f"{SO_PATH} not built; run `make -C infer test` (now builds the .so)")
     threat, normal = _danger_codebooks()
     eng = _build_engine(threat, normal)
 
@@ -175,7 +192,7 @@ def engine(monkeypatch):
 
 def test_shared_object_exports_v3_loop():
     if not SO_PATH.exists():
-        pytest.skip(f"{SO_PATH} not built; run `make -C infer` first")
+        pytest.fail(f"{SO_PATH} not built; run `make -C infer test` (now builds the .so)")
     out = subprocess.run(["nm", "-D", str(SO_PATH)],
                          check=True, capture_output=True, text=True).stdout
     assert "lcm_infer_loop_v3" in out
@@ -186,6 +203,16 @@ def test_normal_input_returns_tokens(engine):
     tokens = list(engine.generate("hello", max_new=1))
     assert tokens == [4]
     assert engine._last_loop_ret == 0
+    assert engine.alerts == []
+
+    # The default v3 budget is graceful: 16 steps without convergence still
+    # return 0 (never -2; only the 64-step hard limit aborts).
+    _, converged = engine.cognitive_loop(engine._test_z, max_steps=16,
+                                         conv_tol=0.0)
+    assert engine._last_loop_ret == 0
+    # cognitive_loop's bool is "returned 0" (converged OR graceful budget).
+    assert converged is True
+    assert engine.alerts == []
 
 
 def test_dangerous_vector_returns_empty(engine):
@@ -195,4 +222,41 @@ def test_dangerous_vector_returns_empty(engine):
     engine._test_z[0] = 1.0
     assert list(engine.generate("hello", max_new=1)) == []
     assert engine._last_loop_ret == CONFLICT_ABORT_TOKEN
+    assert len(engine.alerts) == 1, "callback fires exactly once per abort"
+    alert = engine.alerts[0]
+    assert alert['level'] == "FATAL"
+    assert alert['conflict_source'] == "CONFLICT_DANGER"
+    assert alert['conflict_detail']
+    assert alert['message'].startswith("[LCM SAFETY HALT]")
     assert engine.generate_text("hello", max_new=1) == ""
+
+
+def test_hard_limit_aborts_and_writes_trace(engine):
+    before = set((SO_PATH.parent / "traces").glob("lcm_v3_*.json"))
+    _, converged = engine.cognitive_loop(
+        engine._test_z, max_steps=64, conv_tol=0.0)
+    assert converged is False
+    assert engine._last_loop_ret == CONFLICT_ABORT_TOKEN
+    assert len(engine.alerts) == 1
+    assert engine.alerts[0]['conflict_source'] == "CONFLICT_SCHEDULER"
+    assert engine.alerts[0]['level'] == "FATAL"
+    after = set((SO_PATH.parent / "traces").glob("lcm_v3_*.json"))
+    assert after - before, "hard abort saved a v3 trace JSON"
+
+
+def test_placeholder_codebooks_rejected():
+    gv_a = np.arange(4, dtype=np.float32)
+    danger_a = np.arange(6, dtype=np.float32).reshape(2, 3)
+    danger_b = danger_a + 1.0
+    with pytest.raises(SystemExit, match="placeholder gvalue"):
+        lcm.validate_safety_codebooks(gv_a, gv_a.copy(), 4,
+                                      danger_a, danger_b, 2)
+    with pytest.raises(SystemExit, match="placeholder danger"):
+        lcm.validate_safety_codebooks(gv_a, gv_a + 1.0, 4,
+                                      danger_a, danger_a.copy(), 2)
+    with pytest.raises(SystemExit, match="requires exactly 4"):
+        lcm.validate_safety_codebooks(gv_a, gv_a + 1.0, 2,
+                                      danger_a, danger_b, 2)
+    # Distinct codebooks pass.
+    lcm.validate_safety_codebooks(gv_a, gv_a + 1.0, 4,
+                                  danger_a, danger_b, 2)

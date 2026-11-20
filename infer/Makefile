@@ -57,8 +57,8 @@ liblcm.so: $(OBJS)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # ── Test target ──────────────────────────────────────────────────────────────
-test: CFLAGS += -g -O0 -DDEBUG -DLCM_USE_CONTRACTS
-test: test_runner.c liblcm.a
+test: CFLAGS += -g -O0 -DDEBUG -DLCM_USE_CONTRACTS -fPIC
+test: test_runner.c liblcm.a liblcm.so
 	$(CC) $(CFLAGS) -o test_runner test_runner.c -L. -llcm $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./test_runner
 

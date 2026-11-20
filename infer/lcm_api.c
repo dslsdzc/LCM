@@ -131,11 +131,14 @@ int lcm_bind_memory_v3(lcm_memory_v3* mem, int D, int n_lattices,
     mem->tau_route_fallback = 0.1f;
     mem->tau_self = 1.0f;
     mem->lambda_lfq = 1.5f;
-    /* R8: with θ=1 a first step activates the below-average portion of the
-     * candidate set; callers may raise θ to keep more lattices on. */
-    for (int i = 0; i < LCM_MAX_LATTICES; i++)
+    /* R8/Ruling 20: θ=1 means the threshold tracks each lattice's own recent
+     * distance. The first use is governed by trigger_initial (generous by
+     * default so a fresh session can populate the EMA). */
+    for (int i = 0; i < LCM_MAX_LATTICES; i++) {
         mem->trigger_theta[i] = 1.0f;
-    mem->mean_recent_d_min = 0.0f;
+        mem->mean_recent_d_min[i] = 0.0f;
+        mem->trigger_initial[i] = 1e10f;
+    }
     return 0;
 }
 
@@ -458,6 +461,7 @@ int lcm_infer_loop_v3_flat(
     const float* danger_t, const float* danger_n, int danger_M,
     int max_steps, float conv_tol, float entropy_thresh,
     float safety_margin, float alpha_val, const char* trace_path,
+    void (*alert_cb)(const alert_t*),
     float* z_out) {
     if (!z || !z_out || d != LCM_D) return -1;
 
@@ -540,14 +544,14 @@ int lcm_infer_loop_v3_flat(
     gvalue_t gv_local;
     memset(&gv_local, 0, sizeof(gv_local));
     const gvalue_t* gvp = NULL;
-    if (gv_pos && gv_neg && gv_n > 0) {
+    if (gv_n != 0) {
+        /* Ruling 26: no zero-padding. The bridge accepts exactly the four
+         * law pairs lcm_memory_v3/gvalue_t are compiled for. */
+        if (!gv_pos || !gv_neg || gv_n != LCM_N_VALUE_PAIRS) return -1;
         float pos_pad[LCM_N_VALUE_PAIRS * LCM_D];
         float neg_pad[LCM_N_VALUE_PAIRS * LCM_D];
-        memset(pos_pad, 0, sizeof(pos_pad));
-        memset(neg_pad, 0, sizeof(neg_pad));
-        int n_copy = gv_n < LCM_N_VALUE_PAIRS ? gv_n : LCM_N_VALUE_PAIRS;
-        memcpy(pos_pad, gv_pos, (size_t)n_copy * (size_t)d * sizeof(float));
-        memcpy(neg_pad, gv_neg, (size_t)n_copy * (size_t)d * sizeof(float));
+        memcpy(pos_pad, gv_pos, sizeof(pos_pad));
+        memcpy(neg_pad, gv_neg, sizeof(neg_pad));
         gvalue_init(&gv_local, pos_pad, neg_pad, d);
         gvp = &gv_local;
     }
@@ -555,14 +559,15 @@ int lcm_infer_loop_v3_flat(
     danger_lattice_t dl_local;
     memset(&dl_local, 0, sizeof(dl_local));
     const danger_lattice_t* dlp = NULL;
-    if (danger_t && danger_n && danger_M > 0) {
+    if (danger_M > 0) {
+        if (!danger_t || !danger_n) return -1;
         danger_init(&dl_local, danger_t, danger_n, danger_M, d);
         dlp = &dl_local;
     }
 
     int ret = lcm_infer_loop_v3(&mem, gvp, dlp, z, z_out, max_steps,
                                 conv_tol, entropy_thresh, safety_margin,
-                                alpha_val, trace_path);
+                                alpha_val, trace_path, alert_cb);
 
     /* Keep the v1 trace export populated for lcm.py's get_trace(). */
     inference_trace_v3_t vt;
