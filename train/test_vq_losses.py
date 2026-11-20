@@ -3,17 +3,29 @@
 Run from repo root:
     JAX_PLATFORMS=cpu be/bin/python -m pytest train/test_vq_losses.py -v
 """
+from types import SimpleNamespace
+
 import jax
 import jax.numpy as jnp
 import pytest
 
 from train.config import LCMConfig
 from train.encoder import encoder_forward
-from train.hyp import safe_unit
-from train.lattices import init_route_params, route_commit_loss, routing_gate
+from train.hyp import exp_map, log_map, mobius_add, poincare_similarity, safe_unit
+from train.lattices import (
+    contrast_forward, hrq_forward, init_contrast_params, init_hrq_params,
+    init_lowrank_params, init_route_params, init_simvq, lowrank_forward,
+    route_commit_loss, routing_gate,
+)
 from train.losses import (
     codebook_loss, cognitive_vq_losses, commitment_loss, hrq_vq_loss,
 )
+from train.param_groups import EMA_PATHS
+
+
+def _leaf_mass(tree):
+    return sum(float(jnp.sum(jnp.abs(x)))
+               for x in jax.tree_util.tree_leaves(tree))
 
 
 def test_codebook_loss_grad_only_to_C():
@@ -50,12 +62,142 @@ def test_route_commit_loss_gives_C_route_gradient():
     assert not jnp.allclose(g, 0.0), "C_route must receive gradient"
 
 
+# ── HRQ loss geometry (Important 1) ─────────────────────────────────────────
+
+def _two_proto_hrq(top_vectors, tau_fallback=0.0):
+    d = top_vectors.shape[-1]
+    return {
+        'top': {'A': top_vectors, 'W': jnp.eye(d)},
+        'fine': [init_simvq(jax.random.PRNGKey(7), 1, d)],
+    }
+
+
+def test_hrq_fine_pair_is_log_map_of_composed_state_not_tangent_residual():
+    """cont_k must be log_map(c_top ⊕ r), not log_map(r).
+
+    c_top sits far from the origin so the two differ by much more than the
+    test tolerance; the fine codebook is tiny, so the comparison isolates the
+    composition, not the quantised code.
+    """
+    C_top = jnp.array([[0.9, 0.0], [0.0, 0.0]])
+    params = _two_proto_hrq(C_top)
+    # z_P lands near the far prototype (Poincaré similarity is larger=farther,
+    # so the nearest is argmin), making c_top far from the origin.
+    z = jnp.array([[0.6, 0.0]])
+
+    _, top_idx, _, pairs = hrq_forward(params, z, tau_fallback=0.0)
+
+    C_top_P = exp_map(C_top)
+    c_top = C_top_P[int(top_idx[0])]
+    r0 = mobius_add(exp_map(z), -c_top)
+    want = log_map(mobius_add(c_top, r0))       # composed-output space
+    wrong = log_map(r0)                          # tangent residual
+    assert jnp.allclose(pairs['cont'][1], want, atol=1e-5)
+    assert not jnp.allclose(want, wrong, atol=1e-4), \
+        "test setup must separate the two spaces"
+
+
+def test_hrq_fallback_top_term_targets_the_softmax_blend():
+    """On the fallback branch the top target is log_map(c_top_w), not c_top*."""
+    C_top = jnp.array([[0.5, 0.0], [-0.5, 0.0]])
+    params = _two_proto_hrq(C_top)
+    z = jnp.zeros((1, 2))  # exactly between the two prototypes → fallback
+
+    _, _, _, pairs = hrq_forward(params, z, tau_fallback=0.1)
+
+    C_top_P = exp_map(C_top)
+    sims = poincare_similarity(
+        exp_map(z)[:, None, :], C_top_P[None, :, :]).squeeze(-1)
+    weights = jax.nn.softmax(-sims, axis=-1)
+    c_top_w = jnp.einsum('bm,md->bd', weights, C_top_P)
+    assert jnp.allclose(pairs['quant'][0], log_map(c_top_w), atol=1e-5)
+
+
+def test_hrq_vq_loss_requires_aux_key():
+    params = _two_proto_hrq(jnp.array([[0.9, 0.0], [0.0, 0.0]]))
+    z = jnp.array([[0.3, 0.0]])
+    cfg = SimpleNamespace(beta_vq=0.25)
+    with pytest.raises(KeyError, match="hrq_vq"):
+        hrq_vq_loss(params, z, {'wrong_key': None}, cfg)
+
+
+# ── Per-layer count/gradient coverage (n_layers > 1) ────────────────────────
+
+def test_per_layer_gradients_and_layer_counts_with_multiple_layers():
+    d, B = 4, 2
+    key = jax.random.PRNGKey(0)
+    z = jax.random.normal(key, (B, d)) * 0.1
+    beta = SimpleNamespace(beta_vq=0.25)
+
+    # HRQ: top + two fine layers, both terms; every fine codebook gets gradient.
+    hp = init_hrq_params(key, d, 4, 3, n_layers=2)
+    _, _, _, pairs = hrq_forward(hp, z, tau_fallback=0.0)
+    assert len(pairs['cont']) == 3 and len(pairs['quant']) == 3
+    cb, cm = hrq_vq_loss(hp, z, pairs, beta)
+    assert cb.shape == (3,) and cm.shape == (3,)
+
+    def hrq_codebook(p):
+        _, _, _, pr = hrq_forward(p, z, tau_fallback=0.0)
+        return jnp.sum(hrq_vq_loss(p, z, pr, beta)[0])
+
+    g_hrq = jax.grad(hrq_codebook)(hp)
+    assert _leaf_mass(g_hrq['top']) > 0.0
+    for layer in g_hrq['fine']:
+        assert _leaf_mass(layer) > 0.0
+
+    # LowRank: two rank layers; U_k, A_V and W_V all receive codebook gradient.
+    ranks = (1, 2)
+    lp = init_lowrank_params(key, d, 3, ranks)
+    _, lr_aux = lowrank_forward(lp, z, ranks, return_aux=True)
+    assert len(lr_aux['residuals']) == len(ranks) == 2
+
+    def lowrank_codebook(p):
+        _, aux = lowrank_forward(p, z, ranks, return_aux=True)
+        V = p['A_V'] @ p['W_V']
+        total = jnp.array(0.0)
+        for u_k, rank, res, idx in zip(
+                p['U'], ranks, aux['residuals'], aux['indices']):
+            total = total + codebook_loss(
+                res, u_k @ V[:, :rank].T, idx, 0.25)
+        return total
+
+    g_lr = jax.grad(lowrank_codebook)(lp)
+    assert _leaf_mass(g_lr['A_V']) > 0.0
+    assert _leaf_mass(g_lr['W_V']) > 0.0
+    for layer in g_lr['U']:
+        assert _leaf_mass(layer) > 0.0
+
+    # Contrast: two layers per family; C_b (and C_a) get gradient on every layer.
+    cp = init_contrast_params(key, d, 3, n_layers=2)
+    _, ct_aux = contrast_forward(cp, z, return_aux=True)
+    assert len(ct_aux['a']['residuals']) == len(ct_aux['b']['residuals']) == 2
+
+    def contrast_codebook(p):
+        _, aux = contrast_forward(p, z, return_aux=True)
+        total = jnp.array(0.0)
+        for fam in ('a', 'b'):
+            for cb, res, idx in zip(
+                    p[f'C_{fam}'], aux[fam]['residuals'],
+                    aux[fam]['indices']):
+                total = total + codebook_loss(
+                    res, cb['A'] @ cb['W'], idx, 0.25)
+        return total
+
+    g_ct = jax.grad(contrast_codebook)(cp)
+    for fam in ('a', 'b'):
+        assert len(g_ct[f'C_{fam}']) == 2
+        for layer in g_ct[f'C_{fam}']:
+            assert _leaf_mass(layer) > 0.0
+
+
+# ── Full-step composition ──────────────────────────────────────────────────
+
 CFG = LCMConfig(
-    d_model=16, d_ff=24, n_heads=2, d_head=8, vocab_size=32,
-    max_seq_len=8, n_encoder_layers=1,
-    M_top=8, M_fine=4, n_hrq_layers=1,
-    M_sparse=8, M_lr=8, M_man=8, M_bind=8, M_contrast=8,
-    n_bind_layers=1, n_contrast_layers=1, n_self_codes=4,
+    d_model=8, d_ff=12, n_heads=2, d_head=4, vocab_size=16,
+    max_seq_len=6, n_encoder_layers=1,
+    M_top=6, M_fine=3, n_hrq_layers=1,
+    M_sparse=6, M_lr=6, M_man=6, M_bind=6, M_contrast=6,
+    n_bind_layers=1, n_contrast_layers=1, n_self_codes=3,
     use_bf16=False, max_inference_steps=2,
 )
 
@@ -86,11 +228,11 @@ def test_hrq_vq_loss_has_top_plus_each_fine_layer(built):
 
 
 def test_ema_codebook_loss_skipped_but_commitment_trains_r(built):
-    """Sparse is EMA-owned: no codebook term, but commitment still moves r.
+    """EMA-owned codebooks get no codebook gradient; commitment still moves r.
 
-    The gradient check runs through the real step composition, so it also pins
-    R18's routing: EMA codebooks get *exactly* zero gradient, pure-gradient
-    codebooks get a non-zero one.
+    The skip set is iterated from ``EMA_PATHS`` (the parameter-group truth),
+    not from a second hardcoded list. The gradient check runs through the real
+    step composition.
     """
     from train.cognitive_step import six_lattice_step
 
@@ -99,6 +241,18 @@ def test_ema_codebook_loss_skipped_but_commitment_trains_r(built):
     assert float(parts['sparse_codebook']) == 0.0
     assert float(parts['sparse_commitment']) > 0.0
     assert float(total) > 0.0
+
+    # Reported codebook terms for the EMA-managed lattices must be zero too.
+    ema_codebook_parts = {
+        ('sparse', 'C'): 'sparse_codebook',
+        ('manifold', 'C'): 'manifold_codebook',
+        ('binding', 'key_cb'): 'binding_codebook',
+        ('binding', 'val_cb'): 'binding_codebook',
+        ('binding', 'bind_cb'): 'binding_codebook',
+    }
+    assert set(ema_codebook_parts) <= set(EMA_PATHS)
+    for path, part in ema_codebook_parts.items():
+        assert float(parts[part]) == 0.0, f"{path} codebook term must be 0"
 
     def loss_fn(p, zz):
         _, a = six_lattice_step(
@@ -109,63 +263,36 @@ def test_ema_codebook_loss_skipped_but_commitment_trains_r(built):
     assert not jnp.allclose(g_z, 0.0), \
         "commitment loss must give the encoder-side input a gradient"
 
-    def leaf_mass(tree):
-        return sum(float(jnp.sum(jnp.abs(x)))
-                   for x in jax.tree_util.tree_leaves(tree))
-
-    for path in (('sparse', 'C'), ('manifold', 'C'),
-                 ('binding', 'key_cb'), ('binding', 'val_cb'),
-                 ('binding', 'bind_cb')):
+    for path in sorted(EMA_PATHS):
         node = g_params
+        present = True
         for key in path:
+            if not isinstance(node, dict) or key not in node:
+                present = False  # e.g. self.C_self arrives with Task 13
+                break
             node = node[key]
-        assert leaf_mass(node) == 0.0, \
+        if not present:
+            continue
+        assert _leaf_mass(node) == 0.0, \
             f"EMA codebook {path} must not receive a codebook gradient"
 
     for path in (('hrq',), ('lowrank', 'U'), ('contrast', 'C_a'),
-                 ('route', 'C_route')):
+                 ('contrast', 'C_b'), ('route', 'C_route')):
         node = g_params
         for key in path:
             node = node[key]
-        assert leaf_mass(node) > 0.0, \
+        assert _leaf_mass(node) > 0.0, \
             f"pure-gradient codebook {path} must receive gradient"
 
 
-def test_train_step_joint_false_still_runs_layered_vq_losses():
-    """R18: codebook/commitment losses are the main loss, not Stage-3 extras."""
-    import optax
+def test_legacy_compute_vq_loss_route_matches_r18_formula(built):
+    """The legacy Stage-1/2 path keeps the R18 routing formula."""
+    from train.losses import compute_vq_loss
 
-    from train.cog_train import make_train_step
-    from train.ema_state import init_ema_state
-    from train.model import init_all_params
-    from train.param_groups import partition_params
-
-    cfg = LCMConfig(
-        d_model=16, d_ff=24, n_heads=2, d_head=8, vocab_size=32,
-        max_seq_len=8, n_encoder_layers=1,
-        M_top=8, M_fine=4, n_hrq_layers=1,
-        M_sparse=8, M_lr=8, M_man=8, M_bind=8, M_contrast=8,
-        n_bind_layers=1, n_contrast_layers=1, n_self_codes=4,
-        use_bf16=False, max_inference_steps=2,
-    )
-    params, _, _ = init_all_params(cfg, jax.random.PRNGKey(0))
-    trainable, _, _ = partition_params(params)
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate=1.0),
-    )
-    opt_state = optimizer.init(trainable)
-    ema_state = init_ema_state(params, cfg)
-    step_fn = make_train_step(cfg, optimizer, joint=False)
-    x = jnp.array([[1, 2, 3, 4, 5, 6, 7, 8]], dtype=jnp.int32)
-    batch = (x, x)
-    _, _, _, loss, aux = step_fn(
-        params, opt_state, ema_state, batch, 1e-3,
-        jax.random.PRNGKey(2), step=0)
-    assert jnp.isfinite(loss)
-    stage3 = aux['stage3']
-    for key in ('vq_codebook', 'vq_commitment', 'vq_route_codebook',
-                'vq_route_commitment'):
-        assert key in stage3, f"missing {key} from joint=False step"
-    assert float(stage3['vq_codebook']) >= 0.0
-    assert float(stage3['vq_commitment']) > 0.0
+    params, z, aux = built
+    comps = compute_vq_loss(params, aux, z, CFG)
+    C_route = params['route']['C_route']
+    expected = CFG.beta_vq * jnp.mean(
+        (jax.lax.stop_gradient(safe_unit(z))
+         - C_route[aux['route_idx']]) ** 2)
+    assert jnp.allclose(comps['route'], expected, atol=1e-6)

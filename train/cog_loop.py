@@ -178,10 +178,10 @@ def cog_loop_scan(z, params, cfg, max_steps=None, rng=None,
         stats: only when return_stats=True — dict with per-step ``z_in``,
             ``route_idx``, ``hrq_idx``, ``sparse_idx``, ``man_idx``, ``hrq_vq``
             (R18 continuous/quantised pairs), ``lowrank_aux``,
-            ``contrast_aux``, ``binding_residuals`` and ``binding_indices``
-            (each stacked along axis 0). These are exactly the inputs the R18
-            losses and the EMA pass consume, so neither needs a second forward
-            pass.
+            ``contrast_aux``, ``binding_residuals``, ``binding_indices`` and
+            ``binding_b_q`` (each stacked along axis 0). These are exactly the
+            inputs the R18 losses and the EMA pass consume, so neither needs a
+            second forward pass.
     """
     from jax import lax
 
@@ -193,29 +193,45 @@ def cog_loop_scan(z, params, cfg, max_steps=None, rng=None,
         rng = jax.random.PRNGKey(0)
     keys = jax.random.split(rng, max_steps)
 
-    def macro_step(z_cur, key):
+    def _step(z_cur, key):
         z_next, aux = six_lattice_step(
             z_cur, params, cfg, training=True, rng=key)
         diff = jnp.sqrt(jnp.sum((z_next - z_cur) ** 2, axis=-1))
-        stats = {
-            # The state the lattices received, not the fused output: EMA
-            # accumulates the vector each codebook actually quantised.
-            'z_in': z_cur,
-            'route_idx': aux['route_idx'],
-            'hrq_idx': aux['hrq_idx'],
-            'sparse_idx': aux['sparse_idx'],
-            'man_idx': aux['man_idx'],
-            # R18 loss targets: per-layer continuous/quantised pairs and
-            # residual/selected-row inputs from the same forward pass.
-            'hrq_vq': aux['hrq_vq'],
-            'lowrank_aux': aux['lowrank_aux'],
-            'contrast_aux': aux['contrast_aux'],
-            'binding_residuals': aux['binding_residuals'],
-            'binding_indices': aux['binding_indices'],
-        }
-        return z_next, (z_next, diff, aux['entropy'], stats)
+        return z_next, diff, aux
 
-    _, (z_qs, diffs, entropies, stats) = lax.scan(macro_step, z, keys)
     if return_stats:
+        def macro_step(z_cur, key):
+            z_next, diff, aux = _step(z_cur, key)
+            stats = {
+                # The state the lattices received, not the fused output: EMA
+                # accumulates the vector each codebook actually quantised.
+                'z_in': z_cur,
+                'route_idx': aux['route_idx'],
+                'hrq_idx': aux['hrq_idx'],
+                'sparse_idx': aux['sparse_idx'],
+                'man_idx': aux['man_idx'],
+                # R18 loss targets: per-layer continuous/quantised pairs and
+                # residual/selected-row inputs from the same forward pass.
+                'hrq_vq': aux['hrq_vq'],
+                'lowrank_aux': aux['lowrank_aux'],
+                'contrast_aux': aux['contrast_aux'],
+                'binding_residuals': aux['binding_residuals'],
+                'binding_indices': aux['binding_indices'],
+                # R20 (Task 6): the quantised bound representation, needed for
+                # the unbind/output stage and its commitment term.
+                'binding_b_q': aux['binding_b_q'],
+            }
+            return z_next, (z_next, diff, aux['entropy'], stats)
+
+        _, (z_qs, diffs, entropies, stats) = lax.scan(macro_step, z, keys)
         return z_qs, diffs, entropies, stats
+
+    # Default path: build no stats and let the scan carry only the historical
+    # three outputs. The step still computes aux (z_next depends on it), but
+    # the per-layer loss/EMA arrays are not stacked and kept.
+    def macro_step(z_cur, key):
+        z_next, diff, aux = _step(z_cur, key)
+        return z_next, (z_next, diff, aux['entropy'])
+
+    _, (z_qs, diffs, entropies) = lax.scan(macro_step, z, keys)
     return z_qs, diffs, entropies

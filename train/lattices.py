@@ -233,26 +233,29 @@ def hrq_forward(params, z, tau_fallback=0.1, value_scalars=None, alpha_val=0.0):
 
     # Möbius residual through the fine layers, shared by both routing branches
     # (they were duplicated verbatim; a fix to one silently missed the other).
-    # Also returns the per-layer log_map-space query/prototype pairs R18 needs.
-    def fine_residual(r, fine_params):
+    # Also returns the per-layer output-space pairs R18 needs. The loss is in
+    # the Euclidean space *after* log_map(c_top ⊕ ·), not the tangent residual:
+    # the continuous pointer and the selected code both get c_top added before
+    # log_map (design R18, b.md §4.1).
+    def fine_residual(r, fine_params, top):
         cont, quant = [], []
         for fb in fine_params:
             C_fb_P = exp_map(fb['A'] @ fb['W'])
             vr_sims = poincare_similarity(r[:, None, :], C_fb_P[None, :, :]).squeeze(-1)
             c_fb = C_fb_P[vr_sims.argmin(axis=-1)]
-            cont.append(log_map(r))
-            quant.append(log_map(c_fb))
+            cont.append(log_map(mobius_add(top, r)))
+            quant.append(log_map(mobius_add(top, c_fb)))
             r = mobius_add(r, -c_fb)
         return r, cont, quant
 
     # Hard branch: routed prototype, residual from z_P ⊖ c_top.
     r_hard, cont_hard, quant_hard = fine_residual(
-        mobius_add(z_P, -c_top), params['fine'])
+        mobius_add(z_P, -c_top), params['fine'], c_top)
     # Fallback branch: softmax-weighted prototype blend.
     weights = jax.nn.softmax(-sims, axis=-1)  # (B, M_top)
     c_top_w = jnp.einsum('bm,md->bd', weights, C_top_P)  # weighted
     r_soft, cont_soft, quant_soft = fine_residual(
-        mobius_add(z_P, -c_top_w), params['fine'])
+        mobius_add(z_P, -c_top_w), params['fine'], c_top_w)
 
     o_hard = log_map(mobius_add(c_top, r_hard))
     o_soft = log_map(mobius_add(c_top_w, r_soft))
@@ -263,15 +266,17 @@ def hrq_forward(params, z, tau_fallback=0.1, value_scalars=None, alpha_val=0.0):
     if top_scores is not None:
         o_hrq = o_hrq + ste_relax(top_scores, C_top_P)
 
-    # The top term always targets the routed top-1 prototype: the fallback
-    # blend is not a codebook row and has no codebook target. Fine-layer pairs
-    # follow whichever branch actually ran, selected elementwise.
+    # Top term follows the branch that actually ran: the hard target is the
+    # routed prototype, the fallback target is the softmax blend. Fine-layer
+    # pairs are selected elementwise the same way.
     def _pick(hard, soft):
         return jnp.where(use_fallback[:, None], soft, hard)
 
+    top_quant = jnp.where(use_fallback[:, None],
+                          log_map(c_top_w), log_map(c_top))
     vq_pairs = {
         'cont': [z] + [_pick(a, b) for a, b in zip(cont_hard, cont_soft)],
-        'quant': [log_map(c_top)] + [
+        'quant': [top_quant] + [
             _pick(a, b) for a, b in zip(quant_hard, quant_soft)],
     }
     return o_hrq, top_idx, top_sim, vq_pairs

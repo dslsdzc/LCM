@@ -20,6 +20,7 @@ from train.lattices import (
     contrast_value_biased_nce_loss,
 )
 from train.config import LCMConfig
+from train.param_groups import EMA_PATHS
 
 
 def compute_lm_loss(logits, targets, vocab_size):
@@ -138,17 +139,18 @@ def commitment_loss(r, C, idx, beta=0.25):
 def hrq_vq_loss(params, z, aux, cfg: LCMConfig):
     """Per-layer HRQ codebook/commitment losses in post-``log_map`` space.
 
-    R18: HRQ's loss lives in the Euclidean space after ``log_map``, not in the
-    tangent-space residual ``r``. ``hrq_forward`` already returns one
-    continuous/quantised pair per layer (top-1 plus each fine layer) in that
-    space, so this consumes the forward pass instead of re-running it.
+    R18: HRQ's loss lives in the Euclidean space after
+    ``log_map(c_top ⊕ c_fine)``, not in the tangent-space residual ``r``.
+    ``hrq_forward`` already returns one continuous/quantised pair per layer
+    (top-1 plus each fine layer) in that space, so this consumes the forward
+    pass instead of re-running it.
 
     Args:
-        params: HRQ params (used only to document the layer source; the pairs
-            are already materialised in ``aux``).
-        z: (B, d) tangent-space input to the lattice (unused; kept for the
-            interface fixed by the task).
+        params: HRQ params. Used to validate that the pair count matches the
+            codebook structure (top + ``len(params['fine'])``).
+        z: (B, d) tangent-space input to the lattice; the continuous top term.
         aux: the step/loop aux dict carrying ``hrq_vq`` — or that dict itself.
+            Required keys: ``cont`` and ``quant``, each a list of pairs.
         cfg: LCMConfig; ``cfg.beta_vq`` is the weight.
 
     Returns:
@@ -156,7 +158,20 @@ def hrq_vq_loss(params, z, aux, cfg: LCMConfig):
         scalars. The top-level prototype is the first entry.
     """
     pairs = aux['hrq_vq'] if isinstance(aux, dict) and 'hrq_vq' in aux else aux
-    cont, quant = pairs['cont'], pairs['quant']
+    if not isinstance(pairs, dict) or 'cont' not in pairs or 'quant' not in pairs:
+        raise KeyError(
+            "hrq_vq_loss requires aux['hrq_vq'] with 'cont'/'quant' lists "
+            "(produced by hrq_forward)")
+    # The top continuous term is the lattice input, by definition; the stored
+    # copy is the same array, but using `z` keeps the argument meaningful and
+    # matches the fallback branch's shared input.
+    cont = [z] + list(pairs['cont'][1:])
+    quant = list(pairs['quant'])
+    n_fine = len(params['fine'])
+    if len(cont) != 1 + n_fine or len(quant) != 1 + n_fine:
+        raise ValueError(
+            f"HRQ loss pair count {len(cont)}/{len(quant)} does not match "
+            f"top + {n_fine} fine layers")
     beta = cfg.beta_vq
     codebook = jnp.stack([_codebook_term(c, q, beta)
                           for c, q in zip(cont, quant)])
@@ -165,13 +180,34 @@ def hrq_vq_loss(params, z, aux, cfg: LCMConfig):
     return codebook, commitment
 
 
-def cognitive_vq_losses(params, stats, cfg: LCMConfig):
+def _ema_owns(ema_paths, *candidates):
+    """True when any candidate codebook path is claimed by ``ema_paths``.
+
+    Prefix matching in both directions lets ``('lowrank',)`` claim every
+    codebook below it and lets the leaf ``('sparse','C')`` claim exactly that
+    codebook. The skip decision is therefore derived from the parameter groups,
+    not a second hardcoded list that can drift.
+    """
+    for candidate in candidates:
+        for ema_path in ema_paths:
+            n = min(len(candidate), len(ema_path))
+            if candidate[:n] == ema_path[:n]:
+                return True
+    return False
+
+
+def cognitive_vq_losses(params, stats, cfg: LCMConfig, ema_paths=EMA_PATHS):
     """Compose the whole R18 loss from one forward pass's stats.
 
     ``stats`` is the last step of ``cog_loop_scan(..., return_stats=True)`` or
     the aux returned by ``six_lattice_step``: it carries the per-layer
     continuous/quantised vectors, residual inputs and selection indices the
     losses need, so nothing is recomputed with a second full forward pass.
+
+    ``ema_paths`` is the set of EMA-owned codebook paths (defaults to
+    ``train.param_groups.EMA_PATHS``). A codebook in that set gets no codebook
+    term because its gradient is discarded by the parameter grouping; every
+    codebook still gets the commitment term, which trains ``r``.
 
     Returns:
         (total, parts): ``total`` is the scalar added to the training loss
@@ -182,17 +218,29 @@ def cognitive_vq_losses(params, stats, cfg: LCMConfig):
     beta = cfg.beta_vq
     parts = {}
 
-    # HRQ — pure gradient: top + every fine layer, both terms.
+    # HRQ — pure gradient unless a group decision says otherwise: top + every
+    # fine layer, both terms per layer.
     hrq_cb, hrq_cm = hrq_vq_loss(params['hrq'], z, stats, cfg)
-    parts['hrq_codebook'] = jnp.sum(hrq_cb)
+    hrq_cb_total = jnp.array(0.0)
+    if not _ema_owns(ema_paths, ('hrq', 'top')):
+        hrq_cb_total = hrq_cb_total + hrq_cb[0]
+    if not _ema_owns(ema_paths, ('hrq', 'fine')):
+        hrq_cb_total = hrq_cb_total + jnp.sum(hrq_cb[1:])
+    parts['hrq_codebook'] = hrq_cb_total
     parts['hrq_commitment'] = jnp.sum(hrq_cm)
 
-    # Sparse — EMA codebook: skip codebook, keep commitment.
-    parts['sparse_codebook'] = jnp.array(0.0)
+    # Sparse — EMA codebook (currently): skip codebook, keep commitment.
+    if _ema_owns(ema_paths, ('sparse', 'C')):
+        parts['sparse_codebook'] = jnp.array(0.0)
+    else:
+        parts['sparse_codebook'] = codebook_loss(
+            z, params['sparse']['C'], stats['sparse_idx'], beta)
     parts['sparse_commitment'] = commitment_loss(
         z, params['sparse']['C'], stats['sparse_idx'], beta)
 
-    # LowRank — pure gradient: every rank layer.
+    # LowRank — pure gradient unless U/V are EMA: every rank layer.
+    lowrank_ema = _ema_owns(
+        ema_paths, ('lowrank', 'U'), ('lowrank', 'A_V'), ('lowrank', 'W_V'))
     lowrank_cb = jnp.array(0.0)
     lowrank_cm = jnp.array(0.0)
     V = params['lowrank']['A_V'] @ params['lowrank']['W_V']
@@ -201,39 +249,54 @@ def cognitive_vq_losses(params, stats, cfg: LCMConfig):
             params['lowrank']['U'], cfg.ranks,
             lr_aux['residuals'], lr_aux['indices']):
         C_k = u_k @ V[:, :rank].T
-        lowrank_cb = lowrank_cb + codebook_loss(residual, C_k, idx, beta)
+        if not lowrank_ema:
+            lowrank_cb = lowrank_cb + codebook_loss(residual, C_k, idx, beta)
         lowrank_cm = lowrank_cm + commitment_loss(residual, C_k, idx, beta)
     parts['lowrank_codebook'] = lowrank_cb
     parts['lowrank_commitment'] = lowrank_cm
 
     # Manifold — EMA codebook: skip codebook; commitment in log_map space.
     C_man = log_map(exp_map(params['manifold']['C']))
-    parts['manifold_codebook'] = jnp.array(0.0)
+    if _ema_owns(ema_paths, ('manifold', 'C')):
+        parts['manifold_codebook'] = jnp.array(0.0)
+    else:
+        parts['manifold_codebook'] = codebook_loss(
+            z, C_man, stats['man_idx'], beta)
     parts['manifold_commitment'] = commitment_loss(
         z, C_man, stats['man_idx'], beta)
 
-    # Binding — three EMA sub-codebook families, each layer's own residual.
+    # Binding — three sub-codebook families, each layer's own residual.
+    binding_cb = jnp.array(0.0)
     binding_cm = jnp.array(0.0)
     for family in ('key', 'val', 'bind'):
+        family_ema = _ema_owns(ema_paths, ('binding', f'{family}_cb'))
         for cb, residual, idx in zip(
                 params['binding'][f'{family}_cb'],
                 stats['binding_residuals'][family],
                 stats['binding_indices'][family]):
+            C_k = cb['A'] @ cb['W']
+            if not family_ema:
+                binding_cb = binding_cb + codebook_loss(
+                    residual, C_k, idx, beta)
             binding_cm = binding_cm + commitment_loss(
-                residual, cb['A'] @ cb['W'], idx, beta)
-    parts['binding_codebook'] = jnp.array(0.0)
+                residual, C_k, idx, beta)
+    parts['binding_codebook'] = binding_cb
     parts['binding_commitment'] = binding_cm
 
-    # Contrast — pure gradient: C_a and C_b, every layer, both terms.
+    # Contrast — pure gradient unless a family is EMA: C_a and C_b, every
+    # layer, both terms.
     contrast_cb = jnp.array(0.0)
     contrast_cm = jnp.array(0.0)
     for family in ('a', 'b'):
+        family_ema = _ema_owns(ema_paths, ('contrast', f'C_{family}'))
         fam_aux = stats['contrast_aux'][family]
         for cb, residual, idx in zip(
                 params['contrast'][f'C_{family}'],
                 fam_aux['residuals'], fam_aux['indices']):
             C_k = cb['A'] @ cb['W']
-            contrast_cb = contrast_cb + codebook_loss(residual, C_k, idx, beta)
+            if not family_ema:
+                contrast_cb = contrast_cb + codebook_loss(
+                    residual, C_k, idx, beta)
             contrast_cm = contrast_cm + commitment_loss(
                 residual, C_k, idx, beta)
     parts['contrast_codebook'] = contrast_cb
@@ -244,8 +307,11 @@ def cognitive_vq_losses(params, stats, cfg: LCMConfig):
     # output); commitment_loss supplies the encoder-side pull.
     C_route = params['route']['C_route']
     route_idx = stats['route_idx']
-    parts['route_codebook'] = route_commit_loss(
-        z, C_route[route_idx], beta)
+    if _ema_owns(ema_paths, ('route', 'C_route')):
+        parts['route_codebook'] = jnp.array(0.0)
+    else:
+        parts['route_codebook'] = route_commit_loss(
+            z, C_route[route_idx], beta)
     parts['route_commitment'] = commitment_loss(z, C_route, route_idx, beta)
 
     codebook = sum(v for k, v in parts.items() if k.endswith('_codebook'))

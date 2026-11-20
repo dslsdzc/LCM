@@ -415,44 +415,48 @@ def _simvq_codebook(simvq):
 
 
 def pack_codebooks_for_c(p):
-    """Extract all codebook (K_i, d) matrices into a flat list for export."""
-    flat = []
+    """Pack per-lattice codebook matrices for threshold computation.
 
+    Routing is returned **separately**: ``C_route`` is a codebook but
+    ``W_route`` is a gate matrix, and neither belongs in the flat
+    ``(K_i, d)`` list handed to ``avg_codebook_distances``. The actual
+    ``.bin`` export (including route) lives in ``train/checkpoint.py``.
+    """
+    packed = {}
     # HRQ: top + fine per layer
-    flat.append(_simvq_codebook(p['hrq']['top']))
-    for fb in p['hrq']['fine']:
-        flat.append(_simvq_codebook(fb))
+    packed['hrq'] = [_simvq_codebook(p['hrq']['top'])]
+    packed['hrq'] += [_simvq_codebook(fb) for fb in p['hrq']['fine']]
 
     # Sparse
-    flat.append(p['sparse']['C'])
+    packed['sparse'] = [p['sparse']['C']]
 
     # LowRank: one per rank
     V = p['lowrank']['A_V'] @ p['lowrank']['W_V']
-    for l, u_k in enumerate(p['lowrank']['U']):
-        r_k = p['lowrank']['U'][l].shape[-1]
-        flat.append(u_k @ V[:, :r_k].T)
+    packed['lowrank'] = [
+        u_k @ V[:, :u_k.shape[-1]].T for u_k in p['lowrank']['U']]
 
     # Manifold
-    flat.append(p['manifold']['C'])
+    packed['manifold'] = [p['manifold']['C']]
 
-    # Binding: key, value, bind per layer
+    # Binding: key, value, bind per layer (family order kept for thresholds)
+    packed['binding'] = []
     for i in range(len(p['binding']['key_cb'])):
-        flat.append(_simvq_codebook(p['binding']['key_cb'][i]))
-        flat.append(_simvq_codebook(p['binding']['val_cb'][i]))
-        flat.append(_simvq_codebook(p['binding']['bind_cb'][i]))
+        packed['binding'].append(_simvq_codebook(p['binding']['key_cb'][i]))
+        packed['binding'].append(_simvq_codebook(p['binding']['val_cb'][i]))
+        packed['binding'].append(_simvq_codebook(p['binding']['bind_cb'][i]))
 
     # Contrast: C_a, C_b per layer
+    packed['contrast'] = []
     for i in range(len(p['contrast']['C_a'])):
-        flat.append(_simvq_codebook(p['contrast']['C_a'][i]))
-        flat.append(_simvq_codebook(p['contrast']['C_b'][i]))
+        packed['contrast'].append(_simvq_codebook(p['contrast']['C_a'][i]))
+        packed['contrast'].append(_simvq_codebook(p['contrast']['C_b'][i]))
 
-    # Routing (R19): C_route is a real codebook and W_route the gate matrix.
-    # Neither participates in the six-lattice fusion, but dropping them here
-    # left exports without routing data.
-    flat.append(p['route']['C_route'])
-    flat.append(p['route']['W_route'])
-
-    return flat
+    # Routing data (R19): kept out of the threshold codebook list on purpose.
+    packed['route'] = {
+        'C_route': p['route']['C_route'],
+        'W_route': p['route']['W_route'],
+    }
+    return packed
 
 
 def avg_codebook_distances(codebooks):
@@ -921,7 +925,11 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
                              B=batch_size, N=seq_len)
     train_step = make_train_step(cfg, optimizer, joint=joint)
 
-    codebooks_flat = pack_codebooks_for_c(params)
+    packed_codebooks = pack_codebooks_for_c(params)
+    codebooks_flat = [
+        cb for name in ('hrq', 'sparse', 'lowrank', 'manifold',
+                        'binding', 'contrast')
+        for cb in packed_codebooks[name]]
     avg_dists = avg_codebook_distances(codebooks_flat)
     thresholds = [d * 0.15 for d in avg_dists]
     print(f"[COG] Codebook thresholds: {[f'{t:.3f}' for t in thresholds[:6]]}")
@@ -942,8 +950,9 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     # a run whose token space cannot be verified has no interpretable metric.
     print(f"[COG] Self-lattice: {cfg.n_self_codes} modes")
     print(f"[COG] Steps: {steps}, B={batch_size}, N={seq_len}, lr={lr}")
+    print("[COG] Layered codebook/commitment losses: always on (R18)")
     if joint:
-        print(f"[COG] Joint mode: + Stage 3 losses (VQ + contrastive + orth)")
+        print(f"[COG] Joint mode: + Stage 3 losses (contrastive + orth)")
     print()
 
     import numpy as _np_np
