@@ -35,108 +35,277 @@
   ensures  \valid(out + (0 .. LCM_D-1));
   assigns  out[0 .. LCM_D-1], *dist, *idx;
  */
-/* ─── HRQ: hierarchical residual quantization on the Poincaré ball ─────────
+/* ─── HRQ: hierarchical residual quantization on the Poincaré ball (R1) ────
  *
- * Mirrors train/lattices.py::hrq_forward in the configuration the parity
- * harness runs: value_scalars are all zero (their init is jnp.zeros), so
- * `value_biased_retrieve`'s score reduces to `-dist2` and the top-level
- * selection is a *Euclidean* argmin over the tangent-space codebook, retrieving
- * the ball prototype. When alpha_val > 0 the score is genuinely value-biased
- * and that branch would need value_scalars plumbed in here too.
+ * R1 two-stage routing (mirrors train/lattices.py::hrq_forward):
+ *   1. geometric top-k by poincare_similarity(z_P, C_top_P);
+ *   2. score_j = sim_j - alpha_val·tanh(v_j)·scale inside that top-k, with
+ *      scale = mean over all prototypes; argmin picks the hard top-1.
+ * The fallback decision is the *relative* gap of the two nearest prototypes
+ * and blends only the top-k with softmax(-score).
  *
- * Note the two different metrics, which is deliberate and easy to get wrong:
- *   - top-level SELECTION is Euclidean (over top_C)
- *   - the fallback DECISION and the fine-layer selection are Poincaré
- *     (poincare_similarity, distance-monotone: nearest = argmin)
+ * The R6 domain is exp_map(safe_unit(z)) for the query; codebooks are mapped
+ * raw (exp_map(C)) exactly like JAX. HRQ's output telescopes through the fine
+ * chain, so the routed top prototype is observable through the fine-layer
+ * selection — that is what the fallback test exercises.
  *
- * `top_C` is (M_top, D) raw; `fine_C` is (n_fine * M_fine, D) raw. Both are
- * mapped into the ball internally, layer by layer, rather than materialised up
- * front — a (512, 256) ball copy is 512 KB and does not belong on the stack.
- *
- * Returns 0 on success, -1 on bad arguments.
+ * Index insertion keeps equal similarities in first-occurrence order, matching
+ * jnp.argsort / jnp.argmin tie-breaking.
  */
+static void hrq_topk_insert(int* idx, float* sim, int k, int* n, int m, float s) {
+    int p;
+    if (*n < k) {
+        p = *n;
+        while (p > 0 && sim[p - 1] > s) {
+            sim[p] = sim[p - 1];
+            idx[p] = idx[p - 1];
+            p--;
+        }
+        sim[p] = s;
+        idx[p] = m;
+        (*n)++;
+    } else if (s < sim[k - 1]) {
+        p = k - 1;
+        while (p > 0 && sim[p - 1] > s) {
+            sim[p] = sim[p - 1];
+            idx[p] = idx[p - 1];
+            p--;
+        }
+        sim[p] = s;
+        idx[p] = m;
+    }
+}
+
+/* One fine layer: nearest exp_map(C_fine[l][j]) to r, value-rescored when
+ * value_fine is present and alpha_val > 0 (R22: the vector is shared by all
+ * fine layers). Writes the selected ball prototype to c_p. */
+static void hrq_fine_pick(const hrq_mem_t* m, int l, const float* r,
+                          float alpha_val, float* c_p) {
+    const float* layer = m->C_fine + (size_t)l * (size_t)m->M_fine * LCM_D;
+    int use_value = (m->value_fine != NULL && alpha_val > 0.0f);
+    float scale = 0.0f;
+
+    if (use_value) {
+        float sum = 0.0f;
+        for (int j = 0; j < m->M_fine; j++) {
+            exp_map_c(layer + (size_t)j * LCM_D, c_p, LCM_D, 1.0f);
+            sum += poincare_similarity_c(r, c_p, LCM_D, 1.0f);
+        }
+        scale = sum / (float)m->M_fine + 1e-6f;
+    }
+
+    float best = 1e20f;
+    int best_j = 0;
+    for (int j = 0; j < m->M_fine; j++) {
+        exp_map_c(layer + (size_t)j * LCM_D, c_p, LCM_D, 1.0f);
+        float s = poincare_similarity_c(r, c_p, LCM_D, 1.0f);
+        float score = s;
+        if (use_value)
+            score = s - alpha_val * tanhf(m->value_fine[j]) * scale;
+        if (score < best) { best = score; best_j = j; }
+    }
+    exp_map_c(layer + (size_t)best_j * LCM_D, c_p, LCM_D, 1.0f);
+}
+
+/* out = log_map(top ⊕ r) where r starts at z_P ⊕ (-top) and each fine layer
+ * subtracts its selected prototype (Möbius residual chain, b.md §4.1). */
+static void hrq_fine_chain(const hrq_mem_t* m, const float* z_P,
+                           const float* top, float alpha_val, float* out) {
+    vec_t r, t2, c_p, neg;
+
+    for (int i = 0; i < LCM_D; i++) neg[i] = -top[i];
+    mobius_add_c(z_P, neg, r, LCM_D, 1.0f);
+
+    for (int l = 0; l < m->n_fine; l++) {
+        hrq_fine_pick(m, l, r, alpha_val, c_p);
+        for (int i = 0; i < LCM_D; i++) neg[i] = -c_p[i];
+        mobius_add_c(r, neg, t2, LCM_D, 1.0f);
+        memcpy(r, t2, sizeof(vec_t));
+    }
+
+    mobius_add_c(top, r, t2, LCM_D, 1.0f);
+    log_map_c(t2, out, LCM_D, 1.0f);
+}
+
+int hrq_forward_v31(const float* z, const hrq_mem_t* m, float alpha_val,
+                    int value_topk, float tau_fallback,
+                    float* out, int* idx, float* top_sim) {
+    if (!z || !m || !out || !m->C_top || m->M_top <= 0) return -1;
+    if (m->n_fine > 0 && (!m->C_fine || m->M_fine <= 0)) return -1;
+    if (value_topk <= 0) return -1;
+
+    int k = value_topk < m->M_top ? value_topk : m->M_top;
+    if (k > LCM_HRQ_MAX_TOPK) return -1;
+
+    vec_t z_u, z_P, c_p, c_top, c_top_w, acc;
+    safe_unit_c(z, z_u, LCM_D, 1e-8f);
+    exp_map_c(z_u, z_P, LCM_D, 1.0f);
+
+    /* Stage 1: geometric top-k, the two smallest sims for the relative gap,
+     * and the mean similarity used as the value term's scale. */
+    int k_idx[LCM_HRQ_MAX_TOPK];
+    float k_sim[LCM_HRQ_MAX_TOPK];
+    float k_score[LCM_HRQ_MAX_TOPK];
+    int n_top = 0;
+    float min1 = 1e20f, min2 = 1e20f, sum_sim = 0.0f;
+
+    for (int j = 0; j < m->M_top; j++) {
+        exp_map_c(m->C_top + (size_t)j * LCM_D, c_p, LCM_D, 1.0f);
+        float s = poincare_similarity_c(z_P, c_p, LCM_D, 1.0f);
+        sum_sim += s;
+        if (s < min1) { min2 = min1; min1 = s; }
+        else if (s < min2) { min2 = s; }
+        hrq_topk_insert(k_idx, k_sim, k, &n_top, j, s);
+    }
+    if (n_top != k) return -1;
+
+    /* Stage 2: value rescoring inside the top-k only. */
+    float scale = sum_sim / (float)m->M_top + 1e-6f;
+    int best = 0;
+    for (int i = 0; i < k; i++) {
+        float v = m->value_top ? m->value_top[k_idx[i]] : 0.0f;
+        k_score[i] = k_sim[i] - alpha_val * tanhf(v) * scale;
+        if (k_score[i] < k_score[best]) best = i;
+    }
+    int top_i = k_idx[best];
+    float top_s = k_sim[best];
+    exp_map_c(m->C_top + (size_t)top_i * LCM_D, c_top, LCM_D, 1.0f);
+
+    /* R1.4 relative fallback: scale-free, so initialisation-scale codebooks
+     * do not make the hard route unreachable. */
+    float gap = (m->M_top > 1) ? (min2 - min1) / (min1 + 1e-8f) : 0.0f;
+    int use_fallback = gap < tau_fallback;
+
+    if (use_fallback) {
+        float min_score = k_score[0];
+        for (int i = 1; i < k; i++)
+            if (k_score[i] < min_score) min_score = k_score[i];
+
+        float den = 0.0f;
+        memset(acc, 0, sizeof(vec_t));
+        for (int i = 0; i < k; i++) {
+            float e = expf(min_score - k_score[i]);   /* softmax(-score) */
+            exp_map_c(m->C_top + (size_t)k_idx[i] * LCM_D, c_p, LCM_D, 1.0f);
+            den += e;
+            for (int d = 0; d < LCM_D; d++) acc[d] += e * c_p[d];
+        }
+        if (!(den > 0.0f)) return -1;
+        for (int d = 0; d < LCM_D; d++) c_top_w[d] = acc[d] / den;
+        hrq_fine_chain(m, z_P, c_top_w, alpha_val, out);
+    } else {
+        hrq_fine_chain(m, z_P, c_top, alpha_val, out);
+    }
+
+    if (idx) *idx = top_i;
+    if (top_sim) *top_sim = top_s;
+    return 0;
+}
+
+/* Thin wrapper for the v2 bridge: v = 0, k = config default 4. */
 int hrq_forward_c(const float* z, int D,
                   const float* top_C, int M_top,
                   const float* fine_C, int M_fine, int n_fine,
                   float tau_fallback, float* out) {
-    if (!z || !top_C || !out || D <= 0 || M_top <= 0) return -1;
-    if (n_fine > 0 && (!fine_C || M_fine <= 0)) return -1;
+    if (D != LCM_D) return -1;
+    hrq_mem_t m;
+    memset(&m, 0, sizeof(m));
+    m.C_top = top_C;
+    m.M_top = M_top;
+    m.C_fine = fine_C;
+    m.M_fine = M_fine;
+    m.n_fine = n_fine;
+    int k = M_top < 4 ? M_top : 4;
+    return hrq_forward_v31(z, &m, 0.0f, k, tau_fallback, out, NULL, NULL);
+}
 
-    const float c = 1.0f;
-    vec_t z_P, c_p, r, t1, t2, t3, acc, neg;
+/* ─── Sparse: training/inference split + LFQ (R2) ────────────────────────── */
 
-    exp_map_c(z, z_P, D, c);
+int sparse_forward_c(const float* z, const sparse_mem_t* m, float lambda_lfq,
+                     float d_top, int training, float* out, int* idx) {
+    if (!z || !m || !m->C || m->M <= 0 || !out) return -1;
+    if (!training && !m->zero_vec) return -1;
 
-    /* Pass 1: the two smallest similarities (ascending; closest first), the
-     * Poincaré argmin, and separately the Euclidean argmin over top_C. */
-    float min1 = 1e20f, min2 = 1e20f;
-    int euclid_idx = 0;
-    float euclid_best = 1e20f;
-
-    for (int m = 0; m < M_top; m++) {
-        const float* row = top_C + (size_t)m * D;
-        exp_map_c(row, c_p, D, c);
-        float s = poincare_similarity_c(z_P, c_p, D, c);
-        if (s < min1) { min2 = min1; min1 = s; }
-        else if (s < min2) { min2 = s; }
-
+    /* Euclidean retrieval (b.md §4.2). Inference prepends zero_vec, so its
+     * index space is 0 = zero_vec, j+1 = C[j]; training is C-only. */
+    int n_search = training ? m->M : m->M + 1;
+    int offset = training ? 0 : 1;
+    int best = 0;
+    float best_d2 = 1e20f;
+    for (int j = 0; j < n_search; j++) {
+        const float* row = (j == 0 && offset == 1)
+                               ? m->zero_vec
+                               : m->C + (size_t)(j - offset) * LCM_D;
         float d2 = 0.0f;
-        for (int i = 0; i < D; i++) {
+        for (int i = 0; i < LCM_D; i++) {
             float diff = z[i] - row[i];
             d2 += diff * diff;
         }
-        if (d2 < euclid_best) { euclid_best = d2; euclid_idx = m; }
+        if (d2 < best_d2) { best_d2 = d2; best = j; }
     }
 
-    /* Top prototype in the ball: the Euclidean winner, mapped. */
-    exp_map_c(top_C + (size_t)euclid_idx * D, c_p, D, c);
-    memcpy(t3, c_p, sizeof(float) * (size_t)D);   /* c_top */
+    /* LFQ (inference only, R2/C-5). d_top <= 0 means HRQ did not activate,
+     * so the threshold has no reference and binarisation is disabled. */
+    if (!training && d_top > 0.0f) {
+        vec_t z_u, z_P, c_p, c_clamped;
+        safe_unit_c(z, z_u, LCM_D, 1e-8f);
+        exp_map_c(z_u, z_P, LCM_D, 1.0f);
 
-    /* Fallback when the top-1 / top-2 similarity gap is small. */
-    int use_fallback = (min2 - min1) < tau_fallback;
-
-    if (use_fallback) {
-        /* c_top_w = sum_m softmax(-sims)_m * C_top_P[m], computed in one pass
-         * (numerator vector and denominator accumulated together) so the
-         * ball-mapped rows need not be stored. */
-        float den = 0.0f;
-        memset(acc, 0, sizeof(vec_t));
-        for (int m = 0; m < M_top; m++) {
-            exp_map_c(top_C + (size_t)m * D, c_p, D, c);
-            float s = poincare_similarity_c(z_P, c_p, D, c);
-            float e = expf(-s + min1);          /* max(-sims) == -min1 */
-            den += e;
-            for (int i = 0; i < D; i++) acc[i] += e * c_p[i];
+        float d_min = 1e20f;
+        for (int j = 0; j < m->M; j++) {
+            const float* row = m->C + (size_t)j * LCM_D;
+            float norm2 = 0.0f;
+            for (int i = 0; i < LCM_D; i++) norm2 += row[i] * row[i];
+            float norm = sqrtf(norm2);
+            float scale = 1.0f;
+            if (norm > 0.99f) scale = 0.99f / norm;
+            for (int i = 0; i < LCM_D; i++) c_clamped[i] = row[i] * scale;
+            exp_map_c(c_clamped, c_p, LCM_D, 1.0f);
+            float s = poincare_similarity_c(z_P, c_p, LCM_D, 1.0f);
+            if (s < d_min) d_min = s;
         }
-        if (den <= 0.0f) return -1;
-        for (int i = 0; i < D; i++) t3[i] = acc[i] / den;   /* c_top_w */
+
+        if (d_min > lambda_lfq * d_top) best = 0;
     }
 
-    /* t1 = z_P (-) c_top. mobius_add takes v directly, so pass -c_top. */
-    for (int i = 0; i < D; i++) neg[i] = -t3[i];
-    mobius_add_c(z_P, neg, t1, D, c);
-
-    /* fine_residual: r = t1; per layer r = r (+) (-C_fb_P[argmin sim]) */
-    memcpy(r, t1, sizeof(float) * (size_t)D);
-    for (int l = 0; l < n_fine; l++) {
-        const float* layer = fine_C + (size_t)l * M_fine * D;
-        float best = 1e20f;
-        int best_m = 0;
-        for (int m = 0; m < M_fine; m++) {
-            exp_map_c(layer + (size_t)m * D, c_p, D, c);
-            float s = poincare_similarity_c(r, c_p, D, c);
-            if (s < best) { best = s; best_m = m; }
-        }
-        exp_map_c(layer + (size_t)best_m * D, c_p, D, c);
-        for (int i = 0; i < D; i++) neg[i] = -c_p[i];
-        mobius_add_c(r, neg, t2, D, c);
-        memcpy(r, t2, sizeof(float) * (size_t)D);
-    }
-
-    /* out = log_map( c_top (+) fine_residual ) */
-    mobius_add_c(t3, r, t2, D, c);
-    log_map_c(t2, out, D, c);
+    if (best == 0 && offset == 1)
+        memcpy(out, m->zero_vec, sizeof(vec_t));
+    else
+        memcpy(out, m->C + (size_t)(best - offset) * LCM_D, sizeof(vec_t));
+    if (idx) *idx = best;
     return 0;
+}
+
+/* ─── Routing gate: deterministic one-hot argmax (R19) ───────────────────── */
+
+void routing_gate_c(const float* z, const float* C_route, const float* W_route,
+                    int n_lattices, float* soft_mask) {
+    if (!z || !C_route || !W_route || !soft_mask || n_lattices <= 0) return;
+
+    int best_c = 0;
+    float best_d2 = 1e20f;
+    for (int j = 0; j < n_lattices; j++) {
+        const float* row = C_route + (size_t)j * LCM_D;
+        float d2 = 0.0f;
+        for (int i = 0; i < LCM_D; i++) {
+            float diff = z[i] - row[i];
+            d2 += diff * diff;
+        }
+        if (d2 < best_d2) { best_d2 = d2; best_c = j; }
+    }
+
+    /* logits = W_route^T z_route, W_route is [D][n_lattices]. */
+    const float* z_route = C_route + (size_t)best_c * LCM_D;
+    int best_l = 0;
+    float best_logit = -1e20f;
+    for (int l = 0; l < n_lattices; l++) {
+        float logit = 0.0f;
+        for (int i = 0; i < LCM_D; i++)
+            logit += z_route[i] * W_route[(size_t)i * n_lattices + l];
+        if (logit > best_logit) { best_logit = logit; best_l = l; }
+    }
+
+    memset(soft_mask, 0, (size_t)n_lattices * sizeof(float));
+    soft_mask[best_l] = 1.0f;
 }
 
 void retrieve_single(const float* z, const lattice_memory_t* mem,

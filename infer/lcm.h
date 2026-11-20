@@ -47,6 +47,9 @@ extern "C" {
 #ifndef LCM_MAX_RETRIEVALS
 #define LCM_MAX_RETRIEVALS 12    /* Max retrievals per step */
 #endif
+#ifndef LCM_HRQ_MAX_TOPK
+#define LCM_HRQ_MAX_TOPK   32    /* Stack cap for R1's value-rescoring top-k */
+#endif
 
 /* Derived constants */
 #define LCM_CONSISTENCY_THRESHOLD 0.3f
@@ -432,6 +435,52 @@ int hrq_forward_c(const float* z, int D,
                   const float* top_C, int M_top,
                   const float* fine_C, int M_fine, int n_fine,
                   float tau_fallback, float* out);
+
+/* HRQ v3.1 — R1 conformant forward (Poincaré top-k + value rescoring).
+ *
+ *   1. z_P = exp_map(safe_unit(z)); C_top_P = exp_map(C_top).
+ *   2. sims = poincare_similarity(z_P, C_top_P); keep the k smallest.
+ *   3. score_j = sim_j - alpha_val·tanh(v_j)·mean(sims); argmin over top-k
+ *      selects the hard top-1. v comes from m->value_top (NULL ⇒ v = 0).
+ *   4. Relative fallback: gap = (sim_2 - sim_1)/(sim_1 + 1e-8) over all
+ *      prototypes; gap < tau_fallback blends the top-k with softmax(-score).
+ *   5. Fine layers: r = z_P ⊕ -c_top, per layer r ⊕= -argmin sim (rescaled by
+ *      m->value_fine when alpha_val > 0, shared across layers); the output is
+ *      log_map(c_top ⊕ r), with c_top replaced by the blend on fallback.
+ *
+ * k = min(value_topk, M_top) must be ≤ LCM_HRQ_MAX_TOPK. idx/top_sim are
+ * optional. Returns 0 on success, -1 on bad arguments. No allocation.
+ */
+int hrq_forward_v31(const float* z, const hrq_mem_t* m, float alpha_val,
+                    int value_topk, float tau_fallback,
+                    float* out, int* idx, float* top_sim);
+
+/* Sparse v3.1 — R2 conformant forward (training/inference split + LFQ).
+ *
+ * Training searches C only (idx is a C row). Inference searches
+ * [zero_vec, C] in Euclidean space (idx 0 = zero_vec, j+1 = C[j]).
+ * LFQ fires only when !training && d_top > 0 (the > 0 guard is the
+ * "HRQ did not activate" signal, since C has no c_top pointer) and
+ * d_sparse_min > lambda_lfq·d_top, where d_sparse_min is measured over the
+ * non-zero codebook in the R2 domain:
+ *   min_j poincare_similarity(z_P, exp_map(clamp_norm(C[j], 0.99))).
+ * zero_vec's own similarity would be poincare_similarity(z_P, 0) =
+ * 2‖z_P‖²/(1-‖z_P‖²); it is documented only, never compared. When LFQ fires
+ * the output is a copy of m->zero_vec and idx = 0. No allocation.
+ */
+int sparse_forward_c(const float* z, const sparse_mem_t* m, float lambda_lfq,
+                     float d_top, int training, float* out, int* idx);
+
+/* Routing gate — R19 inference path.
+ *
+ * idx = argmin_j ‖z - C_route[j]‖²; z_route = C_route[idx];
+ * logits = W_route^T z_route with W_route stored [D][n_lattices];
+ * soft_mask = one_hot(argmax(logits)) with no Gumbel noise (deterministic).
+ * soft_mask has n_lattices entries. Invalid arguments are ignored (the
+ * output buffer is left untouched).
+ */
+void routing_gate_c(const float* z, const float* C_route, const float* W_route,
+                    int n_lattices, float* soft_mask);
 
 /* Lattice retrieval operations */
 void retrieve_single(const float* z, const lattice_memory_t* mem,
