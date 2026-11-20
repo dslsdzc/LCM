@@ -187,11 +187,13 @@ def test_retrieval_gradient_reaches_only_hrq_by_design(built):
     ``d/dz`` is the identity so z stays differentiable, and ``d/dparams`` is
     exactly zero because the codebook is detached on purpose.
 
-    R20's binding output ``v_out = NN(C_val, unbind(k_q, b_q))`` is also a hard
-    lookup. It is deliberately not an STE path: ``normalize_fft`` divides by
-    the spectrum magnitude, whose derivative is unbounded at initialization
-    scale. Binding's trainable projections get their gradient from R18's
-    commitment terms instead.
+    R20's binding output ``v_out = NN(C_val, unbind(k_q, b_q))`` is a hard
+    lookup: the selected codebook row is stop-gradient and there is no
+    differentiable path through the phase-only ``normalize_fft`` query (its
+    derivative is unbounded at initialization scale). Ruling 16 adds
+    output-level STE, so ``∂o_bind/∂z`` is the identity, but no binding
+    *parameter* receives gradient through this path. Binding's trainable
+    projections get their gradient from R18's commitment terms instead.
 
     The compensating path for the detached codebooks is EMA plus the explicit
     R18/R21 losses in cog_train.

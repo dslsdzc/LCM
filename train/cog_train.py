@@ -287,13 +287,11 @@ def load_cog_buffers(resume, params, cfg):
     """Load EMA state, feature bank and the saved step for a resume.
 
     These are buffers, not parameters: a resume that cannot restore them would
-    silently restart the EMA statistics from zero, so the v2 checkpoint is
-    required to carry the EMA state and sparse feature bank
-    (``load_cog_state(require_buffers=True)``). The contrast bank and its
-    ``last_used`` clock are additive R21 buffers; a pre-R21 checkpoint gets
-    fresh ones. The saved step is returned because restored ``last_used``
-    values are absolute step indices from the old run; the loop must continue
-    from that origin, not from 0.
+    silently restart the EMA statistics/feature banks from zero, so the v2
+    checkpoint is required to carry all four
+    (``load_cog_state(require_buffers=True)``). The saved step is returned
+    because restored ``last_used`` values are absolute step indices from the
+    old run; the loop must continue from that origin, not from 0.
 
     Returns:
         ``(ema_state, feature_bank, contrast_bank, contrast_last_used, step)``.
@@ -307,16 +305,8 @@ def load_cog_buffers(resume, params, cfg):
         ckpt = load_cog_state(resume, require_buffers=True)
         ema_state = jax.tree_util.tree_map(
             lambda x: jnp.asarray(x), ckpt['ema_state'])
-        contrast_last_used = ckpt.get('contrast_last_used')
-        if contrast_last_used is None:
-            # Additive R21 buffer: pre-R21 v2 checkpoints did not carry it.
-            contrast_last_used = init_contrast_last_used(
-                cfg.n_contrast_layers, cfg.M_contrast)
-        contrast_bank = ckpt.get('contrast_bank')
-        if contrast_bank is None:
-            contrast_bank = FeatureBank(cfg.bank_capacity, cfg.d_model)
-        return (ema_state, ckpt['feature_bank'], contrast_bank,
-                contrast_last_used, int(ckpt.get('step', 0)))
+        return (ema_state, ckpt['feature_bank'], ckpt['contrast_bank'],
+                ckpt['contrast_last_used'], int(ckpt.get('step', 0)))
 
     return (init_ema_state(params, cfg),
             FeatureBank(cfg.bank_capacity, cfg.d_model),
@@ -780,80 +770,111 @@ def make_train_step(cfg, optimizer, joint=False):
 
 # ─── Training loop ──────────────────────────────────────────────────────────
 
-def _host_bank_update(params, ema_state, feature_bank, contrast_bank,
-                      contrast_last_used, loop_stats, step, cfg):
-    """Replace dead sparse/contrast rows from their feature banks (host numpy).
+def _host_sparse_bank_update(params, ema_state, feature_bank, step, cfg):
+    """Replace dead sparse rows with random bank vectors (host numpy).
 
     Runs outside jit: the number of dead rows is dynamic and must not become a
-    traced shape.
-
-    * Sparse: random bank vectors, rows cold-started (N/m zeroed) by
-      ``FeatureBank``.
-    * Contrast (R21): a dedicated bank and farthest-point replacement.
-      Contrast's codebooks are gradient-owned, so only a ``last_used`` clock is
-      maintained (one per layer and family, not one shared clock). A replaced
-      row is stored as ``A = new vector, W = I``: the effective codebook row is
-      exactly the selected bank vector, and the downstream gradient reaches
-      ``A``.
-
-    The banks are separate so sparse's random replacement policy cannot consume
-    contrast's farthest-point candidates, and each keeps its own capacity.
+    traced shape. The replaced rows are cold-started (N/m zeroed) by
+    ``FeatureBank``.
     """
+    if (len(feature_bank) == 0 or 'sparse' not in ema_state
+            or 'sparse' not in params):
+        return params, ema_state
+    state = ema_state['sparse']
+    dead = feature_bank.dead_indices(
+        state['last_used'], step, cfg.bank_dead_threshold)
+    if dead.size == 0:
+        return params, ema_state
+
+    C_new, state_new = feature_bank.replace_dead_sparse(
+        params['sparse']['C'], state, step, cfg.bank_dead_threshold)
+    new_params = dict(params)
+    new_params['sparse'] = dict(params['sparse'], C=jnp.asarray(C_new))
+    new_ema = dict(ema_state)
+    new_ema['sparse'] = jax.tree_util.tree_map(jnp.asarray, state_new)
+    print(f"[COG] feature bank: replaced {len(dead)} dead sparse rows "
+          f"at step {step}")
+    return new_params, new_ema
+
+
+def _record_contrast_usage(contrast_last_used, loop_stats, step):
+    """Update contrast's per-layer ``last_used`` every training step (R17).
+
+    Only the last macro step's indices are available from ``loop_stats``; that
+    is the documented approximation. The clock is host-side and uses the
+    absolute step, so a code selected between two bank checks stays live.
+    """
+    if loop_stats is None or 'contrast_indices' not in loop_stats:
+        return contrast_last_used
+    indices = loop_stats['contrast_indices']
+    new_clock = {family: list(contrast_last_used[family])
+                 for family in ('a', 'b')}
+    for family in ('a', 'b'):
+        for layer in range(len(new_clock[family])):
+            last = np.array(new_clock[family][layer], copy=True)
+            selected = np.asarray(indices[family][layer]).reshape(-1)
+            last[selected] = step
+            new_clock[family][layer] = last
+    return new_clock
+
+
+def _replace_dead_contrast(params, contrast_bank, contrast_last_used, step, cfg):
+    """Replace only dead contrast rows, preserving every live row (R18).
+
+    ``C = A @ W``. For each dead row we solve ``a @ W = c_new`` (``W`` is
+    square, ``a = solve(W.T, c_new)``) and write only that row of ``A``; ``W``
+    and all non-dead rows are left untouched, so their effective vectors are
+    bit-identical. Adam moments for the replaced rows are *not* reset; the next
+    gradient steps adapt them.
+    """
+    if len(contrast_bank) == 0 or 'contrast' not in params:
+        return params, contrast_last_used
+
     new_params = params
-    new_ema = ema_state
+    new_clock = {family: list(contrast_last_used[family])
+                 for family in ('a', 'b')}
+    n_replaced = 0
+    for family in ('a', 'b'):
+        for layer in range(len(params['contrast'][f'C_{family}'])):
+            last = np.array(new_clock[family][layer], copy=True)
+            dead = contrast_bank.dead_indices(
+                last, step, cfg.bank_dead_threshold)
+            if dead.size:
+                cb = params['contrast'][f'C_{family}'][layer]
+                A = np.asarray(cb['A'])
+                W = np.asarray(cb['W'])
+                C_new, last = contrast_bank.replace_dead_contrast(
+                    A @ W, last, step, cfg.bank_dead_threshold)
+                # Only the dead rows change: a = solve(W.T, c_new).
+                replacements = np.linalg.solve(W.T, C_new[dead].T).T
+                A_new = np.array(A, copy=True)
+                A_new[dead] = replacements
+                new_cb = {'A': jnp.asarray(A_new), 'W': cb['W']}
+                rows = list(new_params['contrast'][f'C_{family}'])
+                rows[layer] = new_cb
+                new_params = dict(new_params)
+                new_params['contrast'] = dict(
+                    new_params['contrast'], **{f'C_{family}': rows})
+                n_replaced += len(dead)
+            new_clock[family][layer] = last
+    if n_replaced:
+        print(f"[COG] feature bank: replaced {n_replaced} dead contrast rows "
+              f"at step {step}")
+    return new_params, new_clock
 
-    # ── Sparse ────────────────────────────────────────────────────────────
-    if len(feature_bank) and 'sparse' in ema_state and 'sparse' in params:
-        state = ema_state['sparse']
-        dead = feature_bank.dead_indices(
-            state['last_used'], step, cfg.bank_dead_threshold)
-        if dead.size:
-            C_new, state_new = feature_bank.replace_dead_sparse(
-                params['sparse']['C'], state, step, cfg.bank_dead_threshold)
-            new_params = dict(new_params)
-            new_params['sparse'] = dict(params['sparse'], C=jnp.asarray(C_new))
-            new_ema = dict(new_ema)
-            new_ema['sparse'] = jax.tree_util.tree_map(jnp.asarray, state_new)
-            print(f"[COG] feature bank: replaced {len(dead)} dead sparse rows "
-                  f"at step {step}")
 
-    # ── Contrast (R21) ────────────────────────────────────────────────────
-    if (len(contrast_bank) and loop_stats is not None
-            and 'contrast_aux' in loop_stats and 'contrast' in params):
-        contrast_aux = loop_stats['contrast_aux']
-        new_clock = {family: list(contrast_last_used[family])
-                     for family in ('a', 'b')}
-        n_replaced = 0
-        for family in ('a', 'b'):
-            for layer in range(len(params['contrast'][f'C_{family}'])):
-                last = np.array(new_clock[family][layer], copy=True)
-                selected = np.asarray(
-                    contrast_aux[family][layer]).reshape(-1)
-                last[selected] = step
-                dead = contrast_bank.dead_indices(
-                    last, step, cfg.bank_dead_threshold)
-                if dead.size:
-                    cb = params['contrast'][f'C_{family}'][layer]
-                    C = np.asarray(cb['A'] @ cb['W'])
-                    C_new, last = contrast_bank.replace_dead_contrast(
-                        C, last, step, cfg.bank_dead_threshold)
-                    new_cb = {
-                        'A': jnp.asarray(C_new),
-                        'W': jnp.eye(C_new.shape[-1], dtype=C_new.dtype),
-                    }
-                    rows = list(new_params['contrast'][f'C_{family}'])
-                    rows[layer] = new_cb
-                    new_params = dict(new_params)
-                    new_params['contrast'] = dict(
-                        new_params['contrast'], **{f'C_{family}': rows})
-                    n_replaced += len(dead)
-                new_clock[family][layer] = last
-        contrast_last_used = new_clock
-        if n_replaced:
-            print(f"[COG] feature bank: replaced {n_replaced} dead contrast "
-                  f"rows at step {step}")
+def _contrast_bank_step(params, contrast_bank, contrast_last_used, loop_stats,
+                        step, do_replace, cfg):
+    """The contrast path ``train_cog`` runs every step (R17/R18).
 
-    return new_params, new_ema, contrast_last_used
+    The usage clock is updated on every step; dead detection and replacement
+    run only when ``do_replace`` (the ``bank_check_interval`` guard).
+    """
+    clock = _record_contrast_usage(contrast_last_used, loop_stats, step)
+    if do_replace:
+        params, clock = _replace_dead_contrast(
+            params, contrast_bank, clock, step, cfg)
+    return params, clock
 
 
 def _lr_decay_steps(start_step, steps):
@@ -1092,19 +1113,21 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
             pbar.update(1)
             continue
 
-        # Feature bank: collect at the check interval (loop-relative guard);
-        # dead detection uses the absolute state clock.
+        # Feature bank: contrast's usage clock is updated EVERY step (R17);
+        # dead detection/replacement and bank collection only at the interval.
+        loop_stats = aux_out.get('loop_stats')
+        if item['bank'] and loop_stats is not None and 'z_in' in loop_stats:
+            # Host conversion happens only at the interval, not every step
+            # (a per-step np.asarray of z forces a device sync).
+            z_host = np.asarray(loop_stats['z_in'])
+            feature_bank.add(z_host)
+            contrast_bank.add(z_host)
+        params, contrast_last_used = _contrast_bank_step(
+            params, contrast_bank, contrast_last_used, loop_stats, abs_step,
+            item['bank'], cfg)
         if item['bank']:
-            loop_stats = aux_out.get('loop_stats')
-            if loop_stats is not None and 'z_in' in loop_stats:
-                # Host conversion happens only at the interval, not every step
-                # (a per-step np.asarray forces a device sync).
-                z_host = np.asarray(loop_stats['z_in'])
-                feature_bank.add(z_host)
-                contrast_bank.add(z_host)
-            params, ema_state, contrast_last_used = _host_bank_update(
-                params, ema_state, feature_bank, contrast_bank,
-                contrast_last_used, loop_stats, abs_step, cfg)
+            params, ema_state = _host_sparse_bank_update(
+                params, ema_state, feature_bank, abs_step, cfg)
 
         # Save checkpoint (only with a clean step — never on poisoned params).
         # The guard is loop-relative so resuming at step 5 with save_every=2
@@ -1275,12 +1298,15 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
             f"model_vocab_size={_meta['model_vocab_size']}")
     os.makedirs(output_dir, exist_ok=True)
 
-    buffers_present = ema_state is not None and feature_bank is not None
+    buffers_present = (
+        ema_state is not None and feature_bank is not None
+        and contrast_bank is not None and contrast_last_used is not None)
     if not buffers_present and not allow_missing_buffers:
         raise ValueError(
-            "save_cog_checkpoint requires ema_state and feature_bank for a "
-            "resumable checkpoint; pass allow_missing_buffers=True only for "
-            "export/test checkpoints that must not be resumed")
+            "save_cog_checkpoint requires ema_state, feature_bank, "
+            "contrast_bank and contrast_last_used for a resumable checkpoint; "
+            "pass allow_missing_buffers=True only for export/test checkpoints "
+            "that must not be resumed")
 
     # Exclude the frozen Qwen weights from the pickle (≈2GB): they are
     # reloaded from the .npz on demand (see _load_qwen_checkpoint). The

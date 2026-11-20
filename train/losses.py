@@ -289,8 +289,8 @@ def cognitive_vq_losses(params, stats, cfg: LCMConfig, ema_paths=EMA_PATHS):
     contrast_cm = jnp.array(0.0)
     for family in ('a', 'b'):
         family_ema = _ema_owns(ema_paths, ('contrast', f'C_{family}'))
-        fam_residuals = stats['contrast_aux']['residuals'][family]
-        fam_indices = stats['contrast_aux'][family]
+        fam_residuals = stats['contrast_residuals'][family]
+        fam_indices = stats['contrast_indices'][family]
         for cb, residual, idx in zip(
                 params['contrast'][f'C_{family}'],
                 fam_residuals, fam_indices):

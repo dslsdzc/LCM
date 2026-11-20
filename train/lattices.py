@@ -694,12 +694,12 @@ def _residual_vq_chain(codebooks, r, value_scalars, alpha_val):
     return quantised, inputs, indices, relax
 
 
-def _binding_family_values(value_scalars, family, M):
-    """Select one family's value vector from the R22 binding structure.
+def _family_value_vector(value_scalars, family, M, lattice):
+    """Select one family's value vector from an R22 sub-codebook structure.
 
-    ``value_scalars`` is normally ``{'key': (M,), 'val': (M,), 'bind': (M,)}``.
-    A bare 1-D array is accepted as the legacy shared vector so direct callers
-    and older tests keep working.
+    ``value_scalars`` is normally ``{'key': (M,), ...}`` (binding) or
+    ``{'a': (M,), ...}`` (contrast). A bare 1-D array is accepted as the legacy
+    shared vector so direct callers and older tests keep working.
     """
     if value_scalars is None:
         return None
@@ -711,7 +711,7 @@ def _binding_family_values(value_scalars, family, M):
         shape = jnp.shape(v)
         if len(shape) != 1 or int(shape[0]) != int(M):
             raise ValueError(
-                f"binding {family} value_scalars must be ({M},), got {shape}")
+                f"{lattice} {family} value_scalars must be ({M},), got {shape}")
     return v
 
 
@@ -737,20 +737,20 @@ def binding_forward(params, z, V, value_scalars=None, alpha_val=0.0):
     accepted as the legacy shared vector.
 
     Returns:
-        (v_out, residuals, indices, b_q, k_q): residuals maps
+        (v_out, residuals, indices, b_q, k_q, val_out_idx): residuals maps
         'key'/'val'/'bind' to the list of per-layer query vectors, so the EMA
         pass can update each binding codebook in the space it actually
         quantises. indices maps the same families to the rows selected by
         *this* forward (value-biased when the family's value vector is active);
         EMA must use them rather than recomputing a plain Euclidean argmin.
-        ``b_q`` is the quantised bound representation and ``k_q`` the summed
-        key representation; both are exposed for R20's unbind output and the
-        binding losses.
+        ``b_q`` is the quantised bound representation, ``k_q`` the summed key
+        representation, and ``val_out_idx`` the row selected in the
+        concatenated ``C_val`` (the observable unbind result).
     """
     M_bind = int(params['key_cb'][0]['A'].shape[0])
-    v_key = _binding_family_values(value_scalars, 'key', M_bind)
-    v_val = _binding_family_values(value_scalars, 'val', M_bind)
-    v_bind = _binding_family_values(value_scalars, 'bind', M_bind)
+    v_key = _family_value_vector(value_scalars, 'key', M_bind, 'binding')
+    v_val = _family_value_vector(value_scalars, 'val', M_bind, 'binding')
+    v_bind = _family_value_vector(value_scalars, 'bind', M_bind, 'binding')
 
     # Key/value projections: W_k = V @ A_k, z_k = z @ W_k.T
     # (d, r_max) @ (r_max, d) = (d, d); (B, d) @ (d, d) = (B, d)
@@ -788,22 +788,21 @@ def binding_forward(params, z, V, value_scalars=None, alpha_val=0.0):
         jnp.conj(normalize_fft(k_q)) * normalize_fft(b_q), n=z.shape[-1])
     dist = jnp.sum((recovered[:, None, :] - C_val[None, :, :]) ** 2, axis=-1)
     val_out_idx = dist.argmin(axis=-1)  # (B,) into the concatenated C_val
-    # The readout is a hard codebook row. Deliberately no STE through
-    # `recovered`: `normalize_fft` divides by the spectrum magnitude, and near
-    # the (small) initialisation scale that derivative is O(1/|X|) and can
-    # explode. Binding's trainable projections A_k/A_v and the shared V get
-    # their gradient from R18's commitment terms, which run on the residual
-    # inputs (`residuals`) and do not go through this phase-only path.
+    # The readout is a hard codebook row (no gradient through the phase-only
+    # `recovered` query; that derivative is O(1/|X|) at init scale).
     v_out = lax.stop_gradient(C_val[val_out_idx])
 
-    o_bind = v_out
+    # Ruling 16: output-level STE. The forward value is exactly v_out
+    # (`z - sg(z)` is exactly zero), while the backward pass is the identity
+    # w.r.t. z — matching b.md §4's uniform STE rule for every lattice.
+    o_bind = v_out + (z - lax.stop_gradient(z))
     for step in (relax_k, relax_v, relax_b):
         if step is not None:
             o_bind = o_bind + step  # value-scalar gradient (forward ≡ 0)
 
     residuals = {'key': key_inputs, 'val': val_inputs, 'bind': bind_inputs}
     indices = {'key': key_idx, 'val': val_idx, 'bind': bind_idx}
-    return o_bind, residuals, indices, b_q, k_q
+    return o_bind, residuals, indices, b_q, k_q, val_out_idx
 
 
 # ── 4.6 Contrast Lattice (Λ_contrast) ───────────────────────────────────────
@@ -818,26 +817,6 @@ def init_contrast_params(rng, d, M_contrast, n_layers):
     }
 
 
-def _contrast_family_values(value_scalars, family, M):
-    """Pick one contrast family's value vector (R22).
-
-    ``value_scalars`` is normally ``{'a': (M,), 'b': (M,)}``. A bare 1-D array
-    is the legacy shared vector.
-    """
-    if value_scalars is None:
-        return None
-    if isinstance(value_scalars, dict):
-        v = value_scalars.get(family)
-    else:
-        v = value_scalars
-    if v is not None:
-        shape = jnp.shape(v)
-        if len(shape) != 1 or int(shape[0]) != int(M):
-            raise ValueError(
-                f"contrast {family} value_scalars must be ({M},), got {shape}")
-    return v
-
-
 def contrast_forward(params, z, value_scalars=None, alpha_val=0.0):
     """Dual codebook contrast lattice.
 
@@ -846,16 +825,15 @@ def contrast_forward(params, z, value_scalars=None, alpha_val=0.0):
     legacy shared vector.
 
     Returns:
-        (o_contrast, indices). ``indices`` maps ``'a'``/``'b'`` to the list of
-        per-layer selected rows (R21) and also carries
-        ``indices['residuals'][family]`` — the per-layer residual inputs R18's
-        codebook/commitment terms consume. Keeping the indices at the top level
-        is what R21's interface specifies; the residuals ride along in the same
-        aux dict so no second forward pass is needed.
+        (o_contrast, indices, residuals). ``indices`` maps ``'a'``/``'b'`` to
+        the per-layer selected rows (R21). ``residuals`` maps the same families
+        to the per-layer residual inputs R18's codebook/commitment terms
+        consume. The two are separate return values so ``indices`` stays exactly
+        the R21 interface.
     """
     M = int(params['C_a'][0]['A'].shape[0])
-    v_a = _contrast_family_values(value_scalars, 'a', M)
-    v_b = _contrast_family_values(value_scalars, 'b', M)
+    v_a = _family_value_vector(value_scalars, 'a', M, 'contrast')
+    v_b = _family_value_vector(value_scalars, 'b', M, 'contrast')
 
     a_q_list, a_inputs, a_idx, relax_a = _residual_vq_chain(
         params['C_a'], z, v_a, alpha_val)
@@ -869,11 +847,8 @@ def contrast_forward(params, z, value_scalars=None, alpha_val=0.0):
         if step is not None:
             o_contrast = o_contrast + step / 2.0  # value-scalar gradient
 
-    return o_contrast, {
-        'a': a_idx,
-        'b': b_idx,
-        'residuals': {'a': a_inputs, 'b': b_inputs},
-    }
+    return o_contrast, {'a': a_idx, 'b': b_idx}, {
+        'a': a_inputs, 'b': b_inputs}
 
 
 def contrast_info_nce_loss(params, z, tau=0.1):
@@ -945,11 +920,12 @@ def contrast_value_biased_nce_loss(params, z, v_harm, tau=0.1, tau_val=0.05):
         d_a_pos = jnp.take_along_axis(d_a, idx_a[:, None], axis=-1).squeeze(-1)
         d_b_pos = jnp.take_along_axis(d_b, idx_b[:, None], axis=-1).squeeze(-1)
 
-        # R21: squared harm distance, not the norm.
-        harm_d_a = jnp.sum((C_a - v_harm[None, :]) ** 2, axis=-1)  # (M,)
-        harm_d_b = jnp.sum((C_b - v_harm[None, :]) ** 2, axis=-1)
-        w_a = jnp.exp(-harm_d_a / tau_val)
-        w_b = jnp.exp(-harm_d_b / tau_val)
+        # R21: squared harm distance, not the norm. Keep the harm exponent in
+        # log space: at init scale (C ~ 1e-4, tau_val=0.05) the weights
+        # underflow to exactly 0, and taking log(exp(...)) would produce
+        # inf/NaN gradients.
+        log_w_a = -jnp.sum((C_a - v_harm[None, :]) ** 2, axis=-1) / tau_val
+        log_w_b = -jnp.sum((C_b - v_harm[None, :]) ** 2, axis=-1) / tau_val
 
         # Stable form:
         #   -log(exp(-p/τ) / (exp(-p/τ) + Σ_{j≠pos} w_j·exp(-d_j/τ)))
@@ -957,14 +933,14 @@ def contrast_value_biased_nce_loss(params, z, v_harm, tau=0.1, tau_val=0.05):
         #   = softplus(logsumexp(log w_j - (d_j - d_pos)/τ))
         # The last form never forms exp(positive), and softplus handles the
         # large-logit regime without overflow.
-        def _weighted_term(pos, d_neg, w_neg, idx):
-            excluded = jax.nn.one_hot(idx, w_neg.shape[0], dtype=bool)
-            log_w = jnp.log(w_neg)[None, :] - (d_neg - pos[:, None]) / tau
-            log_w = jnp.where(excluded, -jnp.inf, log_w)
-            return jax.nn.softplus(jax.nn.logsumexp(log_w, axis=-1))
+        def _weighted_term(pos, d_neg, log_w, idx):
+            excluded = jax.nn.one_hot(idx, log_w.shape[0], dtype=bool)
+            logits = log_w[None, :] - (d_neg - pos[:, None]) / tau
+            logits = jnp.where(excluded, -jnp.inf, logits)
+            return jax.nn.softplus(jax.nn.logsumexp(logits, axis=-1))
 
-        loss_a = _weighted_term(d_a_pos, d_b, w_b, idx_b)
-        loss_b = _weighted_term(d_b_pos, d_a, w_a, idx_a)
+        loss_a = _weighted_term(d_a_pos, d_b, log_w_b, idx_b)
+        loss_b = _weighted_term(d_b_pos, d_a, log_w_a, idx_a)
         loss = loss + jnp.mean(loss_a) + jnp.mean(loss_b)
 
     return loss

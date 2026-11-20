@@ -56,8 +56,9 @@ def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
         aux: dict with 'soft_mask', 'weights' (normalised fusion weights),
             'entropy' (per-sample, nats), 'lattice_outputs', and the
             per-lattice selection indices the canonical forward exposes.
-            R18 adds 'z_in', 'hrq_vq', 'lowrank_aux' and 'contrast_aux': the
-            per-layer loss targets from this same forward pass.
+            R18 adds 'z_in', 'hrq_vq', 'lowrank_aux', 'contrast_indices' and
+            'contrast_residuals': the per-layer loss targets from this same
+            forward pass.
     """
     if rng is None:
         rng = jax.random.PRNGKey(0)
@@ -111,10 +112,10 @@ def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
     # from lowrank's own factors rather than stored separately.
     V = params['lowrank']['A_V'] @ params['lowrank']['W_V']
     (o_binding, binding_residuals, binding_indices, binding_b_q,
-     binding_k_q) = binding_forward(
+     binding_k_q, binding_val_out_idx) = binding_forward(
         params['binding'], z, V,
         value_scalars=vs.get('binding'), alpha_val=alpha_val)
-    o_contrast, contrast_aux = contrast_forward(
+    o_contrast, contrast_indices, contrast_residuals = contrast_forward(
         params['contrast'], z,
         value_scalars=vs.get('contrast'), alpha_val=alpha_val)
 
@@ -154,11 +155,13 @@ def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
         # Rows selected by this forward. Under value bias these differ from a
         # plain Euclidean argmin, so EMA must not recompute them.
         'binding_indices': binding_indices,
-        # R20: quantised bound representation and summed key, exposed for the
-        # unbind output/losses and parity.
+        # R20: quantised bound representation, summed key, and the observable
+        # unbind row selected in the concatenated C_val.
         'binding_b_q': binding_b_q,
         'binding_k_q': binding_k_q,
-        # R18/R21: C_a/C_b per-layer residual inputs and selected rows.
-        'contrast_aux': contrast_aux,
+        'binding_val_out_idx': binding_val_out_idx,
+        # R18/R21: C_a/C_b per-layer selected rows and residual inputs.
+        'contrast_indices': contrast_indices,
+        'contrast_residuals': contrast_residuals,
     }
     return z_next, aux

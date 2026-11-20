@@ -25,7 +25,7 @@ Directory layout:
   ├── contrast_codebook.bin # header + C_a/C_b per layer
   ├── gvalue_codebook.bin   # header + C_pos + C_neg + SHA256
   ├── fusion.bin            # alpha + ln_scale + ln_bias
-  ├── value_scalars.bin     # header + per-lattice local value scalars
+  ├── value_scalars.bin     # header + per-codebook local value scalars (R22)
   ├── self_lattice.bin      # core + modes + tau_self + bias_self
   ├── binding_proj.bin      # HRR projections A_k / A_v
   ├── opt_state.bin         # optimizer state (Python, not C-readable)
@@ -289,7 +289,8 @@ def save_cog_state(output_dir, *, params, step, self_state=None,
         'feature_bank': feature_bank,
         # R21: contrast keeps its own bank (farthest-point policy) and
         # dead-code clock. Contrast is gradient-owned, so the clock lives
-        # outside ema_state. Additive buffers; old v2 pickles may omit them.
+        # outside ema_state. Training resume requires both (Ruling 11: old
+        # checkpoints are rejected, not silently upgraded).
         'contrast_bank': contrast_bank,
         'contrast_last_used': contrast_last_used,
     }
@@ -329,8 +330,9 @@ def load_cog_state(output_dir, require_buffers=False):
                 f"{path} was written without EMA/feature-bank buffers "
                 f"(buffers_present={ckpt.get('buffers_present')!r}); it is not "
                 f"resumable — re-export from a training run")
-        missing = [key for key in ('ema_state', 'feature_bank')
-                   if ckpt.get(key) is None]
+        missing = [key for key in (
+            'ema_state', 'feature_bank', 'contrast_bank',
+            'contrast_last_used') if ckpt.get(key) is None]
         if missing:
             raise ValueError(
                 f"{path} claims buffers_present but is missing {missing}; "
@@ -472,23 +474,6 @@ def _value_scalar_specs(cfg):
     ]
 
 
-def _legacy_value_scalar_specs(cfg):
-    """Pre-R22 layout: one vector per lattice."""
-    return [
-        ('hrq', None, cfg.M_top), ('sparse', None, cfg.M_sparse),
-        ('lowrank', None, cfg.M_lr), ('manifold', None, cfg.M_man),
-        ('binding', None, cfg.M_bind), ('contrast', None, cfg.M_contrast),
-    ]
-
-
-def _vs_leaf(value_scalars, name, family):
-    value = value_scalars.get(name)
-    if value is None or family is None:
-        return value
-    # A legacy per-lattice vector seeds every family of that lattice.
-    return value.get(family) if isinstance(value, dict) else value
-
-
 def _save_value_scalars(params, path, cfg):
     """value_scalars: R22 per-codebook vectors, in fixed order.
 
@@ -500,13 +485,14 @@ def _save_value_scalars(params, path, cfg):
     vs = params.get('value_scalars', {})
     parts = []
     for name, family, M in specs:
-        value = _vs_leaf(vs, name, family)
+        value = vs.get(name)
+        if family is not None:
+            value = None if value is None else value[family]
         arr = np.asarray(value if value is not None else np.zeros(M)).ravel()
         if arr.size != M:
-            # Legacy hrq's (M_top,) vector seeds (M_fine,) too; pad/truncate so
-            # the saved layout always matches the configured shape.
-            arr = (np.pad(arr, (0, M - arr.size)) if arr.size < M
-                   else arr[:M])
+            raise ValueError(
+                f"value_scalars[{name!r}][{family!r}] has {arr.size} floats, "
+                f"expected {M} (R22 nested layout)")
         parts.append(arr)
     flat = np.concatenate(parts).astype(np.float32)
     hdr = _pack_header(len(specs), cfg.d_model, 1, CB_EUCLIDEAN, 1.0)
@@ -550,53 +536,32 @@ def _load_fusion(path, cfg):
 def _load_value_scalars(path, cfg):
     """Load R22's nested value-scalar structure.
 
-    A pre-R22 file (one vector per lattice) is still readable: its hrq vector
-    seeds both top/fine, its binding vector seeds all three families and its
-    contrast vector seeds both codebooks. New files always use R22's layout.
+    Ruling 11: there is no legacy flat-file migration. A pre-R22
+    ``value_scalars.bin`` has the wrong length and is rejected explicitly.
     """
     _, data, _ = _read_bin(path)
     flat = np.asarray(data).ravel()
     specs = _value_scalar_specs(cfg)
-    legacy = _legacy_value_scalar_specs(cfg)
     total = sum(M for _, _, M in specs)
-    legacy_total = sum(M for _, _, M in legacy)
-
-    if flat.size == total:
-        raw, pos = {}, 0
-        for name, family, M in specs:
-            raw[(name, family)] = jnp.array(flat[pos:pos + M])
-            pos += M
-        return {
-            'hrq': {'top': raw[('hrq', 'top')],
-                    'fine': raw[('hrq', 'fine')]},
-            'sparse': raw[('sparse', None)],
-            'lowrank': raw[('lowrank', None)],
-            'manifold': raw[('manifold', None)],
-            'binding': {family: raw[('binding', family)]
-                        for family in ('key', 'val', 'bind')},
-            'contrast': {family: raw[('contrast', family)]
-                         for family in ('a', 'b')},
-        }
-
-    if flat.size == legacy_total:
-        raw, pos = {}, 0
-        for name, _, M in legacy:
-            raw[name] = jnp.array(flat[pos:pos + M])
-            pos += M
-        return {
-            'hrq': {'top': raw['hrq'], 'fine': raw['hrq']},
-            'sparse': raw['sparse'],
-            'lowrank': raw['lowrank'],
-            'manifold': raw['manifold'],
-            'binding': {family: raw['binding']
-                        for family in ('key', 'val', 'bind')},
-            'contrast': {family: raw['contrast']
-                         for family in ('a', 'b')},
-        }
-
-    raise ValueError(
-        f"value_scalars.bin has {flat.size} floats; expected {total} (R22) "
-        f"or {legacy_total} (legacy)")
+    if flat.size != total:
+        raise ValueError(
+            f"value_scalars.bin has {flat.size} floats; expected {total} "
+            f"(R22 nested layout); old flat checkpoints are not migrated")
+    raw, pos = {}, 0
+    for name, family, M in specs:
+        raw[(name, family)] = jnp.array(flat[pos:pos + M])
+        pos += M
+    return {
+        'hrq': {'top': raw[('hrq', 'top')],
+                'fine': raw[('hrq', 'fine')]},
+        'sparse': raw[('sparse', None)],
+        'lowrank': raw[('lowrank', None)],
+        'manifold': raw[('manifold', None)],
+        'binding': {family: raw[('binding', family)]
+                    for family in ('key', 'val', 'bind')},
+        'contrast': {family: raw[('contrast', family)]
+                     for family in ('a', 'b')},
+    }
 
 
 def _load_self(path, cfg):

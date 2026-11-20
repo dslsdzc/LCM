@@ -203,7 +203,7 @@ def test_binding_ema_uses_value_biased_forward_indices():
     z = jnp.array([[0.1, 0.0]])
     # Row 1 has value 1; alpha=20 makes the value term dominate the distance.
     v = jnp.array([0.0, 1.0])
-    _, residuals, indices, _, _ = binding_forward(
+    _, residuals, indices, _, _, _ = binding_forward(
         params, z, V, value_scalars=v, alpha_val=20.0)
 
     key_residual = residuals['key'][0]
@@ -418,9 +418,9 @@ def test_train_step_separates_ema_from_adamw_and_updates_ema():
         np.eye(cfg.d_model), atol=1e-6)
 
 
-def test_host_bank_update_replaces_dead_rows_only():
+def test_host_sparse_bank_update_replaces_dead_rows_only():
     """The host path zeroes N/m and updates last_used for dead rows only."""
-    from train.cog_train import _host_bank_update
+    from train.cog_train import _host_sparse_bank_update
 
     cfg = _tiny_cfg(bank_dead_threshold=2)
     params, _ = _tiny_params(cfg)
@@ -432,14 +432,9 @@ def test_host_bank_update_replaces_dead_rows_only():
     ema['sparse']['m'] = ema['sparse']['m'].at[0].set(jnp.ones(cfg.d_model))
     C_before = jnp.asarray(params['sparse']['C'])
 
-    from train.feature_bank import init_contrast_last_used
-    clock = init_contrast_last_used(cfg.n_contrast_layers, cfg.M_contrast)
-    contrast_bank = FeatureBank(4, cfg.d_model)
-
     # Empty bank: the dead row cannot be replenished, so nothing changes.
     empty = FeatureBank(4, cfg.d_model)
-    params_noop, ema_noop, _ = _host_bank_update(
-        params, ema, empty, contrast_bank, clock, None, 5, cfg)
+    params_noop, ema_noop = _host_sparse_bank_update(params, ema, empty, 5, cfg)
     np.testing.assert_array_equal(np.asarray(params_noop['sparse']['C']),
                                   np.asarray(C_before))
     assert float(ema_noop['sparse']['N'][0]) == 5.0
@@ -447,8 +442,7 @@ def test_host_bank_update_replaces_dead_rows_only():
 
     bank = FeatureBank(4, cfg.d_model)
     bank.add(jnp.full((1, cfg.d_model), 7.0))
-    params_new, ema_new, _ = _host_bank_update(
-        params, ema, bank, contrast_bank, clock, None, 5, cfg)
+    params_new, ema_new = _host_sparse_bank_update(params, ema, bank, 5, cfg)
     np.testing.assert_allclose(np.asarray(params_new['sparse']['C'][0]),
                                np.full(cfg.d_model, 7.0), atol=1e-6)
     np.testing.assert_array_equal(np.asarray(params_new['sparse']['C'][1:]),
@@ -529,11 +523,20 @@ def test_cog_checkpoint_roundtrips_ema_and_feature_bank(tmp_path):
     bank.add(np.arange(cfg.d_model, dtype=np.float32))
     bank.add(np.ones(cfg.d_model, dtype=np.float32) * 3)
 
+    from train.feature_bank import init_contrast_last_used
+    contrast_bank = FeatureBank(8, cfg.d_model)
+    contrast_bank.add(np.ones(cfg.d_model, dtype=np.float32) * 5)
+    contrast_bank.add(-np.ones(cfg.d_model, dtype=np.float32) * 7)
+    clock = init_contrast_last_used(cfg.n_contrast_layers, cfg.M_contrast)
+    clock['a'][0][min(3, cfg.M_contrast - 1)] = 7
+    clock['b'][0][min(2, cfg.M_contrast - 1)] = 9
+
     out = str(tmp_path / "ckpt")
     save_cog_checkpoint(
         params, out, 5, run_identity=_fake_identity(tmp_path, cfg.vocab_size),
         train_cfg=cfg, self_state=self_state, ema_state=ema,
-        feature_bank=bank)
+        feature_bank=bank, contrast_bank=contrast_bank,
+        contrast_last_used=clock)
 
     with open(f"{out}/cog_params.pkl", "rb") as f:
         ckpt = pickle.load(f)
@@ -555,9 +558,16 @@ def test_cog_checkpoint_roundtrips_ema_and_feature_bank(tmp_path):
                                   np.asarray(ema['sparse']['last_used']))
     assert isinstance(bank2, FeatureBank)
     assert isinstance(contrast_bank2, FeatureBank)
+    assert len(contrast_bank2) == 2
+    np.testing.assert_allclose(np.asarray(contrast_bank2.vectors),
+                               np.asarray(contrast_bank.vectors))
     assert set(contrast_last_used2) == {'a', 'b'}
     assert len(contrast_last_used2['a']) == cfg.n_contrast_layers
     assert np.asarray(contrast_last_used2['a'][0]).shape == (cfg.M_contrast,)
+    np.testing.assert_array_equal(np.asarray(contrast_last_used2['a'][0]),
+                                  np.asarray(clock['a'][0]))
+    np.testing.assert_array_equal(np.asarray(contrast_last_used2['b'][0]),
+                                  np.asarray(clock['b'][0]))
     assert len(bank2) == 2
     np.testing.assert_allclose(np.asarray(bank2.vectors),
                                np.asarray(bank.vectors))

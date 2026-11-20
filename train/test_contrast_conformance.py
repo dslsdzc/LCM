@@ -151,20 +151,37 @@ def test_value_biased_loss_uses_squared_harm_distance():
     assert sig.parameters['tau_val'].default == 0.05
 
 
+def test_value_biased_loss_is_finite_at_init_scale_with_tau_val_005():
+    """tau_val=0.05 must not yield inf/NaN when harm weights underflow."""
+    p = init_contrast_params(jax.random.PRNGKey(10), 8, 16, 2)
+    z = jax.random.normal(jax.random.PRNGKey(11), (2, 8))
+    v_harm = jax.random.normal(jax.random.PRNGKey(12), (8,))
+    loss = contrast_value_biased_nce_loss(p, z, v_harm, tau_val=0.05)
+    assert jnp.isfinite(loss)
+
+    grads = jax.grad(
+        lambda pp: contrast_value_biased_nce_loss(
+            pp, z, v_harm, tau_val=0.05))(p)
+    leaves = jax.tree_util.tree_leaves(grads)
+    assert leaves
+    for g in leaves:
+        assert jnp.all(jnp.isfinite(g))
+
+
 def test_contrast_forward_returns_per_layer_indices():
     d, M, n, B = 8, 16, 3, 2
     p = init_contrast_params(jax.random.PRNGKey(5), d, M, n)
     z = jax.random.normal(jax.random.PRNGKey(6), (B, d))
 
-    o, aux = contrast_forward(p, z)
+    o, indices, residuals = contrast_forward(p, z)
 
     assert o.shape == (B, d)
     for family in ('a', 'b'):
-        assert len(aux[family]) == n
-        assert len(aux['residuals'][family]) == n
-        for idx in aux[family]:
+        assert len(indices[family]) == n
+        assert len(residuals[family]) == n
+        for idx in indices[family]:
             assert idx.shape == (B,)
-        assert aux['residuals'][family][0].shape == (B, d)
+        assert residuals[family][0].shape == (B, d)
 
 
 def test_contrast_value_scalars_are_per_codebook():
@@ -184,59 +201,77 @@ def test_contrast_value_scalars_are_per_codebook():
     vs = {'a': jnp.array([0.0, 0.0, 1.0, 0.0]),
           'b': jnp.array([0.0, 0.0, 0.0, 0.0])}
 
-    _, aux0 = contrast_forward(p, z, value_scalars=vs, alpha_val=50.0)
+    _, idx0, _ = contrast_forward(p, z, value_scalars=vs, alpha_val=50.0)
     vs2 = dict(vs, a=jnp.array([0.0, 1.0, 0.0, 0.0]))
-    _, aux1 = contrast_forward(p, z, value_scalars=vs2, alpha_val=50.0)
+    _, idx1, _ = contrast_forward(p, z, value_scalars=vs2, alpha_val=50.0)
 
-    assert int(aux0['a'][0][0]) == 2
-    assert int(aux1['a'][0][0]) == 1
-    assert int(aux0['b'][0][0]) == int(aux1['b'][0][0]) == 0
+    assert int(idx0['a'][0][0]) == 2
+    assert int(idx1['a'][0][0]) == 1
+    assert int(idx0['b'][0][0]) == int(idx1['b'][0][0]) == 0
 
 
-def test_contrast_feature_bank_replaces_dead_rows_by_farthest_point():
-    """R21: the training loop calls ``replace_dead_contrast`` every interval."""
-    from train.cog_train import _host_bank_update
+def test_contrast_interval_path_uses_usage_between_checks_and_preserves_live_rows():
+    """R17/R18: per-step clock, interval-only replacement, only dead rows."""
+    from train.cog_train import _contrast_bank_step
     from train.feature_bank import FeatureBank, init_contrast_last_used
 
     d, M = 2, 3
     C = jnp.array([[5.0, 0.0], [0.25, 0.25], [6.0, 0.0]])
+    W = jnp.eye(d) * 2.0  # non-identity W exercises the dead-row solve
     params = {
         'contrast': {
-            'C_a': [{'A': C, 'W': jnp.eye(d)}],
-            'C_b': [{'A': C, 'W': jnp.eye(d)}],
+            'C_a': [{'A': C / 2.0, 'W': W}],
+            'C_b': [{'A': C / 2.0, 'W': W}],
         },
     }
+    A_a_before = np.asarray(params['contrast']['C_a'][0]['A'])
+    A_b_before = np.asarray(params['contrast']['C_b'][0]['A'])
+    W_before = np.asarray(W)
+
     contrast_bank = FeatureBank(capacity=4, dim=d)
     for v in ([1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]):
         contrast_bank.add(jnp.asarray([v]))
 
     clock = init_contrast_last_used(n_layers=1, M_contrast=M)
-    loop_stats = {
-        'contrast_aux': {
-            'a': [jnp.array([1])],
-            'b': [jnp.array([0])],
-            'residuals': {'a': [], 'b': []},
-        },
-    }
     cfg = LCMConfig(d_model=d, M_contrast=M, n_contrast_layers=1)
-    new_params, _, new_clock = _host_bank_update(
-        params, {}, FeatureBank(capacity=4, dim=d), contrast_bank, clock,
-        loop_stats, step=1001, cfg=cfg)
 
-    C_a = new_params['contrast']['C_a'][0]
-    C_b = new_params['contrast']['C_b'][0]
-    # Dead rows are replaced by the farthest bank vector ([-1, 0]).
-    assert float((C_a['A'] @ C_a['W'])[0, 0]) < 0.0
-    assert float((C_a['A'] @ C_a['W'])[2, 0]) < 0.0
-    # A live row is untouched: b selected row 0, so it is not dead.
-    np.testing.assert_allclose(np.asarray((C_b['A'] @ C_b['W'])[0]),
-                               [5.0, 0.0])
-    # The replacement is stored as A=vector, W=I so the effective row is exact.
-    np.testing.assert_allclose(np.asarray(C_a['W']), np.eye(d), atol=0)
-    # The clock records both the live selection and the replaced rows.
-    assert int(new_clock['a'][0][0]) == 1001
-    assert int(new_clock['a'][0][1]) == 1001
-    assert int(new_clock['b'][0][0]) == 1001
+    # Step 500 is between checks: update the clock, do not replace.
+    stats_500 = {'contrast_indices': {
+        'a': [jnp.array([2])], 'b': [jnp.array([0])]}}
+    params, clock = _contrast_bank_step(
+        params, contrast_bank, clock, stats_500, step=500,
+        do_replace=False, cfg=cfg)
+    assert int(clock['a'][0][2]) == 500
+    assert int(clock['a'][0][0]) == 0
+
+    # Step 1001 is a check: code 2 was used 501 steps ago, so it is live.
+    stats_1001 = {'contrast_indices': {
+        'a': [jnp.array([1])], 'b': [jnp.array([0])]}}
+    params, clock = _contrast_bank_step(
+        params, contrast_bank, clock, stats_1001, step=1001,
+        do_replace=True, cfg=cfg)
+
+    C_a = params['contrast']['C_a'][0]
+    C_b = params['contrast']['C_b'][0]
+    A_a = np.asarray(C_a['A'])
+    A_b = np.asarray(C_b['A'])
+
+    # Non-dead rows are bit-identical (A rows and W untouched).
+    np.testing.assert_array_equal(A_a[1:], A_a_before[1:])
+    np.testing.assert_array_equal(A_b[0], A_b_before[0])
+    np.testing.assert_array_equal(np.asarray(C_a['W']), W_before)
+    np.testing.assert_array_equal(np.asarray(C_b['W']), W_before)
+
+    # Dead rows become the requested farthest-point vectors: C row == [-1, 0].
+    np.testing.assert_allclose(np.asarray(A_a[0] @ C_a['W']), [-1.0, 0.0])
+    np.testing.assert_allclose(np.asarray(A_b[1] @ C_b['W']), [-1.0, 0.0])
+    np.testing.assert_allclose(np.asarray(A_b[2] @ C_b['W']), [-1.0, 0.0])
+
+    # a row 2 (selected at step 500) was not replaced; b row 0 stayed live.
+    np.testing.assert_array_equal(A_a[2], A_a_before[2])
+    np.testing.assert_array_equal(A_b[0], A_b_before[0])
+    assert int(clock['a'][0][1]) == 1001
+    assert int(clock['a'][0][0]) == 1001  # replaced rows are stamped at check
 
 
 def test_value_scalar_structure_has_distinct_family_shapes():
