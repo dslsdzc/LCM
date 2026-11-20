@@ -26,7 +26,6 @@ Usage:
     narr.export_json("narrative.json")
 """
 import random
-import time
 import json
 import numpy as np
 from collections import defaultdict, deque
@@ -206,6 +205,7 @@ class NarrativeRecord:
     # e.md §3: narrative metadata
     context: Dict[str, Any] = field(default_factory=dict)  # before/after window
     access_count: int = 0       # subsequent reads; forgetting score factor
+    last_access_step: Optional[int] = None  # used by the stale-record rule
 
     # Original data (same fields as StepRecord)
     soft_mask: Optional[np.ndarray] = None
@@ -236,7 +236,8 @@ class NarrativeRecord:
     def from_step_record(cls, record, importance_score=0.0,
                          importance_rule="", user_flagged=False,
                          promoted=False, pinned=False,
-                         context=None, access_count=0) -> "NarrativeRecord":
+                         context=None, access_count=0,
+                         last_access_step=None) -> "NarrativeRecord":
         """Promote a StepRecord to NarrativeRecord."""
         return cls(
             step=record.step,
@@ -248,6 +249,7 @@ class NarrativeRecord:
             pinned=pinned,
             context=dict(context or {}),
             access_count=int(access_count),
+            last_access_step=last_access_step,
             soft_mask=getattr(record, 'soft_mask', None),
             route_idx=getattr(record, 'route_idx', None),
             hrq_top_sim=getattr(record, 'hrq_top_sim', None),
@@ -299,6 +301,7 @@ class NarrativeMemory:
                  prediction_sigma: float = 2.0,
                  convergence_sigma: float = 2.0,
                  routing_kl_threshold: float = 0.5,
+                 routing_novelty_cooldown: int = 20,
                  history_window: int = 1000,
                  random_fn: Optional[Callable[[], float]] = None,
                  random_seed: Optional[int] = None):
@@ -322,6 +325,7 @@ class NarrativeMemory:
         self.prediction_sigma = float(prediction_sigma)
         self.convergence_sigma = float(convergence_sigma)
         self.routing_kl_threshold = float(routing_kl_threshold)
+        self.routing_novelty_cooldown = max(0, int(routing_novelty_cooldown))
         self.random_fn = random_fn or random.Random(random_seed).random
 
         self._narrative: List[NarrativeRecord] = []
@@ -335,6 +339,7 @@ class NarrativeMemory:
         self._convergence_history: deque = deque(maxlen=max(10, int(history_window)))
         self._routing_mean: Optional[np.ndarray] = None
         self._routing_count = 0
+        self._last_routing_novelty_step = -(10 ** 9)
 
         # context: raw before/after window and the open records that can still
         # accept "after" entries.
@@ -360,6 +365,9 @@ class NarrativeMemory:
 
         self._total_evaluated += 1
         step_num = step if step is not None else getattr(record, 'step', 0)
+        # The read timestamp is the current trajectory step, even when this
+        # particular feed is not important enough to store.
+        self._last_step = step_num
 
         # e.md §3's five triggers, in priority order. The legacy evaluator is
         # kept for old callers but is no longer the narrative filter.
@@ -388,7 +396,6 @@ class NarrativeMemory:
             user_flagged=flagged, context=context)
         self._narrative.append(nrec)
         self._total_stored += 1
-        self._last_step = step_num
 
         self._open_context.append(nrec)
         self._remember_raw(record)
@@ -422,12 +429,11 @@ class NarrativeMemory:
             p = np.asarray(mask, dtype=np.float64).ravel()
             if p.size and np.all(np.isfinite(p)) and p.sum() > 0:
                 p = p / p.sum()
-                if self._routing_mean is not None and self._routing_count >= 10:
-                    q = self._routing_mean
-                    kl = float(np.sum(p * np.log(
-                        (p + 1e-12) / (q + 1e-12))))
-                    if kl > self.routing_kl_threshold:
-                        return 0.6, 'routing_novelty'
+                had_history = (self._routing_mean is not None
+                               and self._routing_count >= 10)
+                # Update the baseline BEFORE the threshold check. A sustained
+                # novel distribution then becomes ordinary instead of firing
+                # every single step (the old late-update order).
                 self._routing_count += 1
                 if self._routing_mean is None:
                     self._routing_mean = p.copy()
@@ -435,6 +441,15 @@ class NarrativeMemory:
                     self._routing_mean = (
                         self._routing_mean * (self._routing_count - 1) + p
                     ) / self._routing_count
+                if (had_history
+                        and step_num - self._last_routing_novelty_step
+                        >= self.routing_novelty_cooldown):
+                    q = self._routing_mean
+                    kl = float(np.sum(p * np.log(
+                        (p + 1e-12) / (q + 1e-12))))
+                    if kl > self.routing_kl_threshold:
+                        self._last_routing_novelty_step = step_num
+                        return 0.6, 'routing_novelty'
 
         # 4. Convergence anomaly: value > running mean + 2σ.
         conv = getattr(record, 'convergence_diff', None)
@@ -461,9 +476,18 @@ class NarrativeMemory:
         """e.md §3: importance × access frequency (unpinned only)."""
         return float(record.importance_score) * (1.0 + float(record.access_count))
 
+    def _touch(self, records, current_step: Optional[int] = None,
+               count: int = 1) -> None:
+        """Record a real read: increments access frequency and last access."""
+        step = self._last_step if current_step is None else int(current_step)
+        for rec in records:
+            rec.access_count += int(count)
+            rec.last_access_step = step
+
     def access(self, step: Optional[int] = None, index: Optional[int] = None,
-               count: int = 1) -> Optional[NarrativeRecord]:
-        """Record a subsequent access, used by forgetting."""
+               count: int = 1,
+               access_step: Optional[int] = None) -> Optional[NarrativeRecord]:
+        """Record an explicit subsequent access, used by forgetting."""
         target = None
         if index is not None:
             target = self._narrative[index]
@@ -476,7 +500,18 @@ class NarrativeMemory:
             target = self._narrative[-1]
         if target is not None:
             target.access_count += int(count)
+            target.last_access_step = (
+                self._last_step if access_step is None else int(access_step))
         return target
+
+    def get_step(self, step: int,
+                 touch: bool = True) -> Optional[NarrativeRecord]:
+        for rec in reversed(self._narrative):
+            if rec.step == step:
+                if touch:
+                    self._touch([rec], current_step=self._last_step)
+                return rec
+        return None
 
     # Alias used by some call sites.
     touch = access
@@ -562,7 +597,8 @@ class NarrativeMemory:
                 return True
         return False
 
-    def consolidate(self, scorer_fn=None, keep_threshold: float = 0.05):
+    def consolidate(self, scorer_fn=None, keep_threshold: float = 0.05,
+                    current_step: Optional[int] = None):
         """Model-driven forgetting — score each unpinned entry, drop below threshold.
 
         Args:
@@ -578,13 +614,17 @@ class NarrativeMemory:
         if not self._narrative:
             return 0
 
-        current_step = max(r.step for r in self._narrative)
+        if current_step is None:
+            current_step = max(r.step for r in self._narrative)
         before = len(self._narrative)
 
+        def _last_access(r):
+            return r.step if r.last_access_step is None else r.last_access_step
+
         if scorer_fn is None:
-            # Default: importance × access frequency, decayed by age.
+            # Default: importance × access frequency, decayed since last read.
             def _default_scorer(r):
-                age = current_step - r.step
+                age = current_step - _last_access(r)
                 decay = np.exp(-0.01 * max(age, 0))
                 return self.forgetting_score(r) * decay
             scorer_fn = _default_scorer
@@ -593,10 +633,11 @@ class NarrativeMemory:
         for r in self._narrative:
             if r.pinned:
                 kept.append(r)
-            elif (current_step - r.step > 5000 and r.access_count == 0
+            elif (current_step - _last_access(r) > 5000
                   and r.importance_score < 0.2):
-                # e.md §3: stale, never-accessed, low-importance records are
-                # demoted/deleted without waiting for capacity pressure.
+                # e.md §3: stale, low-importance records are demoted/deleted
+                # without waiting for capacity pressure. "Stale" is measured
+                # from the last read, not from creation.
                 continue
             else:
                 score = scorer_fn(r)
@@ -648,25 +689,45 @@ class NarrativeMemory:
     def __getitem__(self, idx):
         return self._narrative[idx]
 
-    def get_all(self) -> List[NarrativeRecord]:
-        return list(self._narrative)
+    def get_all(self, touch: bool = True,
+                current_step: Optional[int] = None) -> List[NarrativeRecord]:
+        records = list(self._narrative)
+        if touch:
+            self._touch(records, current_step=current_step)
+        return records
 
-    def get_recent(self, n: int = 10) -> List[NarrativeRecord]:
-        return self._narrative[-n:]
+    def get_recent(self, n: int = 10, touch: bool = True) -> List[NarrativeRecord]:
+        records = self._narrative[-n:]
+        if touch:
+            self._touch(records, current_step=self._last_step)
+        return records
 
-    def get_by_rule(self, rule_name: str) -> List[NarrativeRecord]:
-        return [r for r in self._narrative if r.importance_rule == rule_name]
+    def get_by_rule(self, rule_name: str,
+                    touch: bool = True) -> List[NarrativeRecord]:
+        records = [r for r in self._narrative
+                   if r.importance_rule == rule_name]
+        if touch:
+            self._touch(records, current_step=self._last_step)
+        return records
 
-    def get_by_range(self, start_step: int,
-                     end_step: int) -> List[NarrativeRecord]:
-        return [r for r in self._narrative
-                if start_step <= r.step <= end_step]
+    def get_by_range(self, start_step: int, end_step: int,
+                     touch: bool = True) -> List[NarrativeRecord]:
+        records = [r for r in self._narrative
+                   if start_step <= r.step <= end_step]
+        if touch:
+            self._touch(records, current_step=self._last_step)
+        return records
 
-    def get_unsafe(self) -> List[NarrativeRecord]:
-        return [r for r in self._narrative if not r.is_safe]
+    def get_unsafe(self, touch: bool = True) -> List[NarrativeRecord]:
+        records = [r for r in self._narrative if not r.is_safe]
+        if touch:
+            self._touch(records, current_step=self._last_step)
+        return records
 
-    def get_timeline(self) -> List[Dict[str, Any]]:
+    def get_timeline(self, touch: bool = True) -> List[Dict[str, Any]]:
         """Timeline view (for reflection / visualization)."""
+        if touch:
+            self._touch(self._narrative, current_step=self._last_step)
         return [{
             'step': r.step,
             'rule': r.importance_rule,
@@ -676,6 +737,8 @@ class NarrativeMemory:
             'safe': r.is_safe,
             'flagged': r.user_flagged,
             'pinned': r.pinned,
+            'access_count': r.access_count,
+            'last_access_step': r.last_access_step,
         } for r in self._narrative]
 
     def print_narrative(self, n: int = 10) -> None:
@@ -768,6 +831,7 @@ class NarrativeMemory:
         self._convergence_history.clear()
         self._routing_mean = None
         self._routing_count = 0
+        self._last_routing_novelty_step = -(10 ** 9)
         self._raw_history.clear()
         self._open_context.clear()
 

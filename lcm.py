@@ -53,6 +53,9 @@ _ALERT_CB = ctypes.CFUNCTYPE(None, ctypes.POINTER(_AlertT))
 import numpy as np
 from tqdm import tqdm
 
+from train.external_verifier import LOCK as VERIFIER_LOCK
+from train.predictive_cache import pack_trace_sig
+
 # JAX-free schema-v2 loader: reads manifest.json and returns every layer the
 # C engine binds. Kept importable without JAX (the C inference path).
 from train.c_load import load_lattice_memories
@@ -67,6 +70,31 @@ except ImportError:
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
+def _trace_convergence_diff(traces, z_q, z_cur):
+    """Convergence signal recorded in the black box for one generation step.
+
+    With at least two macro steps, use the adjacent ``z_next`` difference
+    (the last two trace states). A single-step trace has no adjacent pair, so
+    fall back to ``||z_q - z_cur||``. Returns ``None`` only when neither
+    source exposes a usable vector.
+    """
+    try:
+        if traces and len(traces) >= 2:
+            prev_z = traces[-2].get('z_next')
+            cur_z = traces[-1].get('z_next')
+            if prev_z is not None and cur_z is not None:
+                return float(np.linalg.norm(
+                    np.asarray(cur_z, dtype=np.float32)
+                    - np.asarray(prev_z, dtype=np.float32)))
+        if z_q is not None and z_cur is not None:
+            return float(np.linalg.norm(
+                np.asarray(z_q, dtype=np.float32)
+                - np.asarray(z_cur, dtype=np.float32)))
+    except Exception:
+        return None
+    return None
+
 
 def _require_jax():
     if not _HAS_JAX:
@@ -613,7 +641,6 @@ def interact(args):
 
             traces = engine.get_trace()
             if traces:
-                from train.predictive_cache import pack_trace_sig
                 last_t = traces[-1]
                 engine._last_sig = pack_trace_sig(
                     last_t.get('weights', np.zeros(7)),
@@ -2008,6 +2035,7 @@ class LCMInferEngine:
         from train.external_verifier import VerifierProcess
         from train.observability import VerifierPoller
 
+        self.close_verifier()
         self.verifier = VerifierProcess(
             dim=int(dim or self.d),
             threshold_low=threshold_low,
@@ -2021,6 +2049,27 @@ class LCMInferEngine:
         self.verifier.start()
         self.verifier_poller = VerifierPoller(self.verifier)
         print(f"[VERIFIER] polling every step (mode={self.verifier.mode})")
+
+    def close_verifier(self):
+        """Stop the external verifier process and drop its poller."""
+        poller = getattr(self, 'verifier_poller', None)
+        if poller is not None:
+            try:
+                poller.close()
+            except Exception:
+                pass
+        self.verifier_poller = None
+        self.verifier = None
+
+    def close(self):
+        """Release long-lived inference resources."""
+        self.close_verifier()
+
+    def __del__(self):
+        try:
+            self.close_verifier()
+        except Exception:
+            pass
 
     def _on_verifier_state(self, alert):
         state = alert.get('state') or alert.get('type')
@@ -2162,7 +2211,6 @@ class LCMInferEngine:
             traces = self.get_trace()
             if traces:
                 last_t = traces[-1]
-                from train.predictive_cache import pack_trace_sig
                 sig = pack_trace_sig(
                     last_t.get('weights', np.zeros(7)),
                     last_t.get('confidences', np.zeros(7)),
@@ -2209,18 +2257,24 @@ class LCMInferEngine:
                 # R16 StepRecord fields. The C trace exposes weights,
                 # confidences and z_next; it does not expose sparse_idx or a
                 # gvalue margin, so those stay None (no invented values).
-                z_next = last_t.get('z_next')
-                conv_diff = None
-                if z_next is not None:
-                    conv_diff = float(np.linalg.norm(
-                        np.asarray(z_next, dtype=np.float32)
-                        - np.asarray(z_q, dtype=np.float32)))
+                # The C fusion trace has 7 weights (6 routed + self); the
+                # recorded soft_mask is the routed six-lattice mask.
+                routing_weights = (weights[:6]
+                                   if weights is not None and len(weights) > 6
+                                   else weights)
+                # Ruling 39-style one-step residual: use adjacent trace states
+                # when the loop produced at least two; a single-step trace
+                # falls back to the fused-state delta.
+                conv_diff = _trace_convergence_diff(traces, z_q, z_cur)
                 world_dev = None
                 try:
                     world_dev = float(np.linalg.norm(
                         np.asarray(z_cur, dtype=np.float32) - self.self_C[0]))
                 except Exception:
                     world_dev = None
+                # Training uses the one-step residual; inference has no future
+                # target at record time, so this is the cache prediction error
+                # only when the cache actually produced a prediction.
                 pred_err = None
                 if z_pred is not None:
                     pred_err = float(np.sum(
@@ -2230,9 +2284,9 @@ class LCMInferEngine:
                     step=gen_step,
                     source=source,
                     step_time_ms=step_ms,
-                    soft_mask=weights,
-                    route_idx=np.argmax(weights).item()
-                        if weights is not None else None,
+                    soft_mask=routing_weights,
+                    route_idx=np.argmax(routing_weights).item()
+                        if routing_weights is not None else None,
                     is_safe=not last_t.get('has_conflict', False),
                     convergence_diff=conv_diff,
                     prediction_error=pred_err,
@@ -2267,8 +2321,7 @@ class LCMInferEngine:
             # callbacks on the next step; the local form has no polling thread.
             verifier_poller = getattr(self, 'verifier_poller', None)
             if verifier_poller is not None:
-                from train.external_verifier import LOCK
-                if verifier_poller.poll(gen_step) == LOCK:
+                if verifier_poller.poll(gen_step) == VERIFIER_LOCK:
                     print("[SAFETY] external verifier LOCK; generation halted",
                           file=sys.stderr)
                     return

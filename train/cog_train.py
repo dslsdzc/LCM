@@ -43,6 +43,8 @@ from train.self_lattice import (
     init_self_params, init_self_state, self_lattice_reg_loss,
     update_self_state,
 )
+from train.behavior_explorer import compute_tension_from_aux
+from train.external_verifier import LOCK as VERIFIER_LOCK
 from train.cog_loop import cog_loop_scan
 from train.ema_state import (
     ema_update_binding, ema_update_manifold, ema_update_self,
@@ -888,6 +890,9 @@ def make_train_step(cfg, optimizer, joint=False):
                        'route_idx': loop_stats.get(
                            'route_idx', jnp.zeros((B,), dtype=jnp.int32)),
                        'convergence_diff': jnp.mean(diffs[:, -1]),
+                       # Stage 2 has no safety oracle (no danger snapshot or
+                       # gvalue decision). This is hardcoded True by design;
+                       # real safety state lives on the C inference path.
                        'is_safe': jnp.array(True)}
             return loss, aux_out
 
@@ -1026,14 +1031,28 @@ def _contrast_bank_step(params, contrast_bank, contrast_last_used, loop_stats,
 
 
 def _self_observe_step(obs, narr, reflection, explorer, verifier_poller,
-                       abs_step, step_time_ms, aux_out, loss_f, cfg):
+                       abs_step, step_time_ms, aux_out, loss_f, cfg,
+                       causal_subject=None):
     """Record one training step into the R16 self-observation stack.
 
     Every sub-call is fault-isolated: a broken narrative/reflection/verifier
     must never change the training trajectory (e.md §1 core constraint).
+
+    ``prediction_error`` is the Ruling-39 one-step residual
+    ``||z_next - z_cur||²`` (or the model's prediction loss when present).
+    ``T_conf`` has no value oracle in Stage 2, so behavior tension is the
+    documented entropy + residual proxy (``T_conf == 0``), not full U.
+
+    The training ``dag_nodes`` entry is a one-step summary, not the C-engine
+    per-macro-step DAG trace. ``soft_mask`` is the routed six-lattice mask;
+    the C inference trace's seventh self element is sliced off by ``lcm.py``.
+
     Returns the safety flag used by the next step's danger priority.
     """
-    from train.behavior_explorer import compute_tension_from_aux
+    def _fail(category, exc):
+        note = getattr(obs, 'note_error', None)
+        if note is not None:
+            note(category, exc)
 
     try:
         soft_mask = np.asarray(jax.device_get(aux_out['soft_mask']))[0]
@@ -1044,56 +1063,97 @@ def _self_observe_step(obs, narr, reflection, explorer, verifier_poller,
         conv = float(np.asarray(
             jax.device_get(aux_out['convergence_diff'])))
         is_safe = bool(np.asarray(jax.device_get(aux_out['is_safe'])))
-    except Exception:
+        value_signals = aux_out.get('value_signals')
+        if value_signals is not None:
+            value_signals = np.asarray(jax.device_get(value_signals)).ravel()
+    except Exception as exc:
+        _fail('extract', exc)
         soft_mask, route_idx, z_cur, z_next = None, None, None, None
-        conv, is_safe = None, True
+        conv, is_safe, value_signals = None, True, None
     is_safe = bool(is_safe and np.isfinite(loss_f))
 
-    dag_nodes = None
+    # Ruling 39: one-step residual. Prefer an explicit prediction loss if a
+    # future training path exposes one; otherwise the residual is the error.
+    pred_error = aux_out.get('prediction_loss')
+    if pred_error is not None:
+        try:
+            pred_error = float(np.asarray(jax.device_get(pred_error)))
+        except Exception:
+            pred_error = None
+    if pred_error is None and z_cur is not None and z_next is not None:
+        pred_error = float(np.sum((z_next - z_cur) ** 2))
+
+    dag_summary = None
     if soft_mask is not None:
-        dag_nodes = [{
+        dag_summary = [{
             'step': abs_step,
             'route_idx': route_idx,
             'soft_mask': np.asarray(soft_mask).tolist(),
+            'summary': True,
         }]
     record = obs.record_step(
         step=abs_step, source=0, step_time_ms=step_time_ms,
         soft_mask=soft_mask, route_idx=route_idx, is_safe=is_safe,
-        convergence_diff=conv, dag_nodes=dag_nodes,
+        convergence_diff=conv, prediction_error=pred_error,
+        dag_nodes=dag_summary,
         z_cur=z_cur, z_next=z_next)
 
     if record is not None:
         try:
             narr.feed(record)
-        except Exception:
-            pass
+        except Exception as exc:
+            _fail('narrative', exc)
         try:
-            reflection.observe(abs_step, record, cache_hit=None)
-        except Exception:
-            pass
+            # Stage-2 training has no PredictiveSystem; the cache-hit trend
+            # analysis is inference-only (tested against real cache counters).
+            reflection.observe(abs_step, record, cache_hit=None,
+                               is_safe=is_safe)
+        except Exception as exc:
+            _fail('reflection_observe', exc)
+        if causal_subject is not None:
+            try:
+                causal_subject.step(
+                    record, pred_cache=None,
+                    action_desc=f"train_step_{abs_step}")
+            except Exception as exc:
+                _fail('causal', exc)
 
     try:
         tension = compute_tension_from_aux(
-            {'soft_mask': soft_mask}, z_cur, z_next,
-            pred_error=None, d_model=cfg.d_model)
+            {'soft_mask': soft_mask, 'value_signals': value_signals},
+            z_cur, z_next, pred_error=pred_error, d_model=cfg.d_model)
         explorer.observe_tension(abs_step, tension,
                                  safety_breach=not is_safe)
-    except Exception:
-        pass
+    except Exception as exc:
+        _fail('behavior_tension', exc)
 
     try:
         reflection.maybe_reflect(abs_step, narrative=narr)
-        for suggestion in reflection.drain_suggestions():
-            reflection.apply_suggestion(suggestion, explorer,
-                                        danger=not is_safe)
-    except Exception:
-        pass
+        # Cap application: one highest-severity suggestion per step, with
+        # the loop's own per-target cooldown. Low-severity noise never
+        # directly moves Level 1.
+        suggestions = sorted(reflection.drain_suggestions(),
+                             key=lambda s: s.severity, reverse=True)
+        applied = 0
+        for suggestion in suggestions:
+            if applied >= 1:
+                break
+            if suggestion.severity < 0.5:
+                continue
+            if reflection.apply_suggestion(
+                    suggestion, explorer, danger=not is_safe):
+                applied += 1
+    except Exception as exc:
+        _fail('reflection_apply', exc)
 
     if verifier_poller is not None:
         try:
-            verifier_poller.poll(abs_step)
-        except Exception:
-            pass
+            state = verifier_poller.poll(abs_step)
+            if state == VERIFIER_LOCK:
+                _fail('verifier_lock',
+                      RuntimeError("external verifier LOCK while training"))
+        except Exception as exc:
+            _fail('verifier_poll', exc)
 
     return is_safe
 
@@ -1146,7 +1206,8 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
               data_path=None, shape_path=None, spans_path=None,
               qwen_ckpt=None, resume=None, joint=False, auto_mode=False,
               full_verify=True, allow_missing_self=False,
-              self_awareness=True, verifier=None):
+              self_awareness=True, verifier=None,
+              causal_subject=None):
     """Run dual-channel cognitive training (Stage 2).
 
     Dual channels from cognitive state z_q:
@@ -1175,7 +1236,13 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
             snapshot to submit, and a verifier process per training run is
             heavier than the 5% observation budget. The inference engine
             (``lcm.py``) owns the production wiring; this hook exists for
-            callers that already have a verifier.
+            callers that already have a verifier. Training only *observes*
+            LOCK/OBSERVE callbacks; it does not halt on LOCK because Stage 2
+            has no safety oracle. The C inference path halts.
+        causal_subject: optional :class:`train.causal_subject.CausalSubject`.
+            Per Ruling 43 it is wired only when supplied; the default omission
+            is the accepted causal deviation (``causal_subject.py`` itself is
+            not modified).
     """
     from train.data import WikiDataIter
     from tqdm import tqdm
@@ -1382,6 +1449,10 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
                 self_state=self_state, step=abs_step,
                 routing_bias=step_bias)
         step_time_ms = (time.perf_counter() - step_t0) * 1000.0
+        if item['offset'] == 0:
+            # First executed step includes JIT tracing/compilation. Exclude it
+            # from black-box timing; it is not inference time.
+            step_time_ms = 0.0
 
         # Update self state from forward pass
         if self_state is not None and aux_out.get('self_state') is not None:
@@ -1396,7 +1467,8 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
             try:
                 last_is_safe = _self_observe_step(
                     obs, narr, reflection, explorer, verifier_poller,
-                    abs_step, step_time_ms, aux_out, loss_f, cfg)
+                    abs_step, step_time_ms, aux_out, loss_f, cfg,
+                    causal_subject=causal_subject)
             except Exception as exc:
                 if not obs_error_logged:
                     obs_error_logged = True
@@ -1469,6 +1541,11 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     pbar.refresh()
     if reflection is not None:
         reflection.wait(timeout=30.0)
+    # Task 15 (100-step smoke) reads the recorded trajectory after training.
+    train_cog.last_observability = obs
+    train_cog.last_narrative = narr
+    train_cog.last_reflection = reflection
+    train_cog.last_explorer = explorer
     final_step = start_step + steps
     final_dir = os.path.join(output_dir, f"step_{final_step:06d}")
     save_cog_checkpoint(params, final_dir, final_step, self_state=self_state,

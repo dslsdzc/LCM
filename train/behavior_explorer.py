@@ -8,7 +8,6 @@
 
 设计详见 e.md §六。
 """
-import time
 import numpy as np
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -171,7 +170,13 @@ class BehaviorExplorer:
             self.finalize_evaluation(step)
         if self.current_bias is not None:
             return self.current_bias.copy()
-        if self.should_update(step, interval) and self.should_explore(step):
+        # Ruling 46: never select a bias before a tension baseline exists.
+        # Checked *after* finalization, so the buffer cleared by an
+        # unevaluable bias cannot immediately produce another unbaselined
+        # selection on the same boundary.
+        if (self.should_update(step, interval)
+                and self.should_explore(step)
+                and len(self._eval_buffer) >= 3):
             return self.select_bias(step)
         return self.get_best_bias()
 
@@ -224,7 +229,12 @@ class BehaviorExplorer:
                       and np.array_equal(e['bias'], self.current_bias)]
 
         if len(baseline) < 3 or len(evaluation) < 3:
-            return  # 数据不足
+            # Ruling 46: an unevaluable bias must not stay installed forever.
+            # Clear it and the stale buffer; the next selection starts a new
+            # baseline instead of freezing `current_bias` at an old choice.
+            self.current_bias = None
+            self._eval_buffer.clear()
+            return
 
         # 平均张力
         U_before = float(np.mean([e['tension'] for e in baseline]))
@@ -309,10 +319,13 @@ def compute_tension_from_aux(aux: dict, z_cur: np.ndarray,
     T_conf = 0.0
     T_res = 0.0
 
-    # T_pred: 预测误差
+    # T_pred: 预测误差。Ruling 39 uses the nonnegative one-step residual
+    # ||z_next - z_cur||² in training; legacy callers pass a negative
+    # euclidean distance. Normalise both to a nonnegative error scale.
     if pred_error is not None:
-        # pred_error 是负欧氏距离，归一化
-        T_pred = float(np.clip(np.tanh(-pred_error / d_model), 0.0, 1.0))
+        err = -float(pred_error) if pred_error < 0 else float(np.sqrt(
+            max(float(pred_error), 0.0)))
+        T_pred = float(np.clip(np.tanh(err / d_model), 0.0, 1.0))
 
     # T_conf: 价值冲突
     value_signals = aux.get('value_signals')
@@ -356,7 +369,9 @@ def compute_tension_from_trace(trace_step: dict,
     T_res = 0.0
 
     if pred_error is not None:
-        T_pred = float(np.clip(np.tanh(-pred_error / d_model), 0.0, 1.0))
+        err = -float(pred_error) if pred_error < 0 else float(np.sqrt(
+            max(float(pred_error), 0.0)))
+        T_pred = float(np.clip(np.tanh(err / d_model), 0.0, 1.0))
 
     confs = trace_step.get('confidences')
     if confs is not None:

@@ -14,6 +14,7 @@ Usage:
     trace = obs.get_trace(42)
     obs.print_summary()
 """
+import sys
 import time
 import json
 import numpy as np
@@ -38,7 +39,8 @@ class StepRecord:
     step_time_ms: float = 0.0
     source: int = 0  # 0=external, 1=internal (因果主体源标签)
 
-    # Routing
+    # Routing. Training/black-box `soft_mask` is the routed six-lattice mask;
+    # the C trace's seventh (self) weight is sliced off before recording.
     soft_mask: Optional[np.ndarray] = None   # (n_lattices,)
     route_idx: Optional[int] = None
 
@@ -66,7 +68,8 @@ class StepRecord:
     # Prediction / narrative signal (e.md §3 rule 1)
     prediction_error: Optional[float] = None
 
-    # C engine DAG trace
+    # C engine DAG trace. Training records a one-entry summary with
+    # ``summary=True``; the C path records the full per-macro-step trace.
     dag_nodes: Optional[List[Dict[str, Any]]] = None
     conflict_source: Optional[str] = None
     conflict_detail: Optional[str] = None
@@ -180,7 +183,18 @@ class ObservabilityRecorder:
         self.anomaly_convergence_diff = float(anomaly_convergence_diff)
         self._last_step = -1
         self._long_term_counter = 0
+        self._seen_routes = set()
+        self.errors = defaultdict(int)
+        self._logged_error_categories = set()
         self._start_time = time.time()
+
+    def note_error(self, category: str, exc: BaseException) -> None:
+        """Count and log the first fault in each self-observation category."""
+        self.errors[str(category)] += 1
+        if category not in self._logged_error_categories:
+            self._logged_error_categories.add(category)
+            print(f"[OBS] {category} error (first occurrence): {exc}",
+                  file=sys.stderr)
 
     def should_record(self, step: int) -> bool:
         return step % self.record_every_n == 0
@@ -237,6 +251,13 @@ class ObservabilityRecorder:
                 and float(record.convergence_diff)
                 > self.anomaly_convergence_diff):
             return True
+        # e.md §2: novel routing patterns are anomaly events too.
+        if record.route_idx is not None:
+            route = int(record.route_idx)
+            if self._seen_routes and route not in self._seen_routes:
+                self._seen_routes.add(route)
+                return True
+            self._seen_routes.add(route)
         return False
 
     def _store_long_term(self, record: StepRecord) -> None:
@@ -246,6 +267,8 @@ class ObservabilityRecorder:
         conflict may be the last thing a run ever records.
         """
         if self._is_anomaly(record):
+            # Weighted oversampling by duplicate slots (the ring is exactly
+            # the 10000-entry reservoir; duplicates are intentional weights).
             for _ in range(self.anomaly_oversample):
                 self.long_term.append(record)
             self._long_term_counter = 0
@@ -334,6 +357,9 @@ class ObservabilityRecorder:
         self.ring.clear()
         self.long_term.clear()
         self._long_term_counter = 0
+        self._seen_routes.clear()
+        self.errors.clear()
+        self._logged_error_categories.clear()
         self._last_step = -1
 
 

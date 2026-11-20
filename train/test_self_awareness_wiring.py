@@ -18,7 +18,7 @@ import numpy as np
 import optax
 import pytest
 
-from train.behavior_explorer import BehaviorExplorer
+from train.behavior_explorer import BehaviorExplorer, TensionSignals
 from train.narrative_memory import NarrativeMemory
 from train.observability import (
     ObservabilityRecorder, StepRecord, VerifierPoller, measure_overhead,
@@ -92,36 +92,115 @@ def test_black_box_long_term_uniform_plus_anomaly_oversampling():
     assert len(obs2.long_term) == 3
     assert all(not r.is_safe for r in obs2.long_term)
 
+    obs3 = ObservabilityRecorder(long_term_every=1000, anomaly_oversample=3)
+    obs3.record_step(step=0, route_idx=0, is_safe=True)
+    assert len(obs3.long_term) == 0
+    obs3.record_step(step=1, route_idx=1, is_safe=True)
+    # A novel routing pattern is also an oversampled anomaly (e.md §2).
+    assert len(obs3.long_term) == 3
 
-def test_measure_overhead_below_five_percent():
-    # The brief's baseline case: two no-ops. The timer floor keeps nanosecond
-    # noise from turning into a fake ratio.
+
+def test_measure_overhead_timer_floor_smoke():
+    # Smoke test for the timer floor only. This is NOT the 5% evidence: the
+    # real _self_observe_step path is measured below.
     assert measure_overhead(lambda: None, lambda: None) < 0.05
 
+
+def test_self_observation_overhead_under_five_percent():
+    """Real obs+narrative+reflection+behavior path vs a no-op observation."""
+    from train.cog_train import _self_observe_step
+
+    cfg = _tiny_cfg()
     obs = ObservabilityRecorder(raw_capacity=100)
     narr = NarrativeMemory(random_fn=lambda: 1.0)
+    reflection = ReflectionLoop(log_path=None)
+    explorer = BehaviorExplorer(explore_prob=0.0)
+    aux = {
+        'soft_mask': jnp.full((1, 6), 1.0 / 6.0),
+        'route_idx': jnp.array([0], dtype=jnp.int32),
+        'z_cur': jnp.zeros((1, cfg.d_model)),
+        'z_next': jnp.ones((1, cfg.d_model)),
+        'convergence_diff': jnp.array(0.1),
+        'is_safe': jnp.array(True),
+    }
 
     def inference_like():
-        # ~2 ms of "inference"; one training step is far larger, so this is
-        # a deliberately conservative denominator for the 5% assertion.
+        # ~10 ms of "inference"; Task 15 does the end-to-end measurement.
         x = 0.0
-        for _ in range(100000):
+        for _ in range(500000):
             x += 1.0
         return x
 
     def inference_plus_observation():
         value = inference_like()
-        rec = obs.record_step(
-            step=0, step_time_ms=1.0, soft_mask=np.full(6, 1 / 6),
-            route_idx=0, is_safe=True, convergence_diff=0.1,
-            z_cur=np.zeros(8, dtype=np.float32),
-            z_next=np.ones(8, dtype=np.float32))
-        narr.feed(rec)
+        _self_observe_step(
+            obs, narr, reflection, explorer, None, 1, 1.0, aux, 1.0, cfg)
         return value
 
     ratio = measure_overhead(inference_plus_observation, inference_like,
                              runs=20)
     assert ratio < 0.05, f"self-observation overhead {ratio:.1%} >= 5%"
+
+
+def test_self_observe_records_residual_and_labels_tension_as_proxy():
+    """Training tension is entropy+residual only (T_conf=0), not full U."""
+    from train.cog_train import _self_observe_step
+
+    cfg = _tiny_cfg()
+    obs = ObservabilityRecorder(raw_capacity=10, record_vectors=True)
+    narr = NarrativeMemory(random_fn=lambda: 1.0)
+    reflection = ReflectionLoop(log_path=None)
+    explorer = BehaviorExplorer(explore_prob=0.0)
+
+    class FakeCausal:
+        def __init__(self):
+            self.calls = []
+
+        def step(self, record, pred_cache=None, action_desc=None):
+            self.calls.append((record, pred_cache, action_desc))
+            return {}
+
+    causal = FakeCausal()
+    aux = {
+        'soft_mask': jnp.full((1, 6), 1.0 / 6.0),
+        'route_idx': jnp.array([0], dtype=jnp.int32),
+        'z_cur': jnp.zeros((1, cfg.d_model)),
+        'z_next': jnp.ones((1, cfg.d_model)),
+        'convergence_diff': jnp.array(0.1),
+        'is_safe': jnp.array(True),
+    }
+    safe = _self_observe_step(
+        obs, narr, reflection, explorer, None, 7, 1.0, aux, 1.0, cfg,
+        causal_subject=causal)
+
+    assert safe is True
+    record = obs.ring[len(obs.ring) - 1]
+    # One-step residual ||z_next - z_cur||², not a negated distance.
+    assert record.prediction_error == pytest.approx(cfg.d_model)
+    assert causal.calls, "an injected causal subject must receive the step"
+    assert causal.calls[0][0].step == 7
+    assert causal.calls[0][1] is None
+
+    tension = explorer._eval_buffer[-1]
+    assert tension['T_conf'] == 0.0, "no value oracle in Stage 2"
+    assert tension['T_pred'] > 0.0
+    assert tension['T_res'] > 0.0
+
+
+def test_inference_convergence_diff_adjacent_and_single_step():
+    from lcm import _trace_convergence_diff
+
+    z0 = np.zeros(4, dtype=np.float32)
+    z1 = np.ones(4, dtype=np.float32)
+    adjacent = _trace_convergence_diff(
+        [{'z_next': z0}, {'z_next': z1}], z_q=None, z_cur=None)
+    assert adjacent == pytest.approx(float(np.linalg.norm(z1 - z0)))
+    assert adjacent > 0.0
+
+    single = _trace_convergence_diff(
+        [{'z_next': z0}], z_q=z1, z_cur=z0)
+    assert single == pytest.approx(float(np.linalg.norm(z1 - z0)))
+    assert single > 0.0
 
 
 # ─── Narrative memory ───────────────────────────────────────────────────────
@@ -165,26 +244,88 @@ def test_narrative_five_triggers_each_fire():
     assert rec is not None and rec.importance_rule == 'random_sample'
 
 
+def test_narrative_sustained_novel_routing_triggers_finitely():
+    m = NarrativeMemory(random_fn=lambda: 1.0,
+                        routing_novelty_cooldown=5)
+    for i in range(10):
+        m.feed(_record(step=i, soft_mask=np.full(6, 1 / 6),
+                       convergence_diff=None))
+    novel = np.zeros(6, dtype=np.float32)
+    novel[0] = 1.0
+    for i in range(10, 110):
+        m.feed(_record(step=i, soft_mask=novel, convergence_diff=None))
+    hits = len(m.get_by_rule('routing_novelty', touch=False))
+    assert 0 < hits < 20, (
+        f"sustained novelty must not fire every step (got {hits})")
+
+
 def test_narrative_context_and_access_count():
     m = NarrativeMemory(max_records=100, random_fn=lambda: 1.0,
                         context_window=5)
     for i in range(12):
         m.feed(_record(step=i, is_safe=False))
+    # get_all is a real read path: it increments access frequency and marks
+    # the last access step.
     records = m.get_all()
     assert len(records) == 12
     for rec in records:
         assert 'before' in rec.context and 'after' in rec.context
         assert rec.context['window'] == 5
-        assert rec.access_count == 0
+        assert rec.access_count == 1
+        assert rec.last_access_step == m._last_step
     # A middle record sees the full 5-step context on both sides.
     middle = next(r for r in records if r.step == 6)
     assert len(middle.context['before']) == 5
     assert len(middle.context['after']) == 5
 
-    m.access(step=6)
-    assert middle.access_count == 1
-    m.access(step=6)
+    m.access(step=6, access_step=12)
     assert middle.access_count == 2
+    assert middle.last_access_step == 12
+    m.access(step=6, access_step=13)
+    assert middle.access_count == 3
+
+    # An unstored feed still advances the clock used for access timestamps.
+    assert m.feed(_record(step=20, is_safe=True, soft_mask=None,
+                          convergence_diff=None)) is None
+    m.get_all()
+    assert middle.last_access_step == 20
+
+
+def test_narrative_by_rule_read_marks_access_without_manual_access():
+    # A real read path must count as access; no m.access() call here.
+    m = NarrativeMemory(max_records=2, random_fn=lambda: 0.0)
+    r0 = m.feed(_record(step=0, is_safe=False))
+    r1 = m.feed(_record(step=1, is_safe=True, soft_mask=None,
+                        convergence_diff=None))
+    assert r0.importance_rule == 'safety_conflict'
+    assert r1.importance_rule == 'random_sample'
+    m.get_by_rule('safety_conflict')
+    assert r0.access_count == 1
+    assert r0.last_access_step == m._last_step
+    assert r1.access_count == 0
+
+    m.feed(_record(step=2, is_safe=True, soft_mask=None,
+                   convergence_diff=None))
+    kept = {r.step for r in m.get_all(touch=False)}
+    assert 0 in kept, "the record read via get_by_rule wins the retention score"
+    assert 2 in kept
+    assert 1 not in kept, "the never-read low-importance record is forgotten"
+
+
+def test_consolidate_staleness_uses_last_access():
+    m = NarrativeMemory(random_fn=lambda: 0.0)
+    accessed = m.feed(_record(step=0, is_safe=True, soft_mask=None,
+                              convergence_diff=None))
+    never_read = m.feed(_record(step=1, is_safe=True, soft_mask=None,
+                                convergence_diff=None))
+    assert accessed.importance_rule == 'random_sample'
+    m.access(step=0, access_step=4000)
+
+    dropped = m.consolidate(current_step=5200, keep_threshold=0.0)
+    kept = {r.step for r in m.get_all(touch=False)}
+    assert dropped == 1
+    assert 0 in kept, "age is measured from last access, not creation"
+    assert 1 not in kept, "never-read low-importance record is stale"
 
 
 def test_narrative_forgets_by_importance_times_access():
@@ -221,6 +362,31 @@ def test_reflection_runs_every_interval_async_and_logs(tmp_path):
     assert payload['interval'] == REFLECT_INTERVAL
 
 
+def test_reflection_pending_request_retried_after_busy_thread(tmp_path):
+    r = ReflectionLoop(log_path=tmp_path / "reflection.log")
+    for step in range(1, 202):
+        r.observe(step, soft_mask=np.full(6, 1 / 6),
+                  convergence_diff=0.1, cache_hit=0.5)
+
+    class BusyThread:
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            return None
+
+    r._thread = BusyThread()
+    assert not r.maybe_reflect(200)
+    assert r.pending_reflection_step == 200
+    r._thread = None
+    # The pending boundary is retried on the next call, even though 201 is
+    # not itself an interval boundary.
+    assert r.maybe_reflect(201)
+    r.wait(timeout=5.0)
+    assert r.n_analyses == 1
+    assert r.last_report['step'] == 200
+
+
 def test_reflection_detects_abandoned_lattice_and_queues_suggestion(tmp_path):
     r = ReflectionLoop(log_path=tmp_path / "reflection.log",
                        abandoned_steps=1000)
@@ -250,6 +416,33 @@ def test_reflection_entropy_variance_and_cache_trend(tmp_path):
     assert report['cache_declining'] is True
     assert any(s.action_type == 'explore_rate_reduce'
                for s in r.drain_suggestions())
+
+
+def test_cache_hit_rate_counters_and_reflection_uses_hit_rate():
+    from train.predictive_cache import PredictiveSystem
+
+    ps = PredictiveSystem(d_model=8, cache_capacity=8)
+    for i in range(3):
+        ps.cache.append(sig=1, z_cur=np.zeros(8, dtype=np.float32),
+                        z_next=np.ones(8, dtype=np.float32), step=i)
+    ps.matcher.epsilon = 0.0  # deterministic: Q all zero -> first arm M0
+    z_hit, op, _ = ps.matcher.predict(np.zeros(8, dtype=np.float32), 1)
+    assert op == 'M0' and z_hit is not None
+    z_miss, _, _ = ps.matcher.predict(np.zeros(8, dtype=np.float32), 2)
+    assert z_miss is None
+
+    stats = ps.get_stats()
+    assert stats['n_lookups'] == 2
+    assert stats['hits'] == 1 and stats['misses'] == 1
+    assert stats['hit_rate'] == pytest.approx(0.5)
+
+    # The cache trend is driven by hit rate, never by capacity utilization.
+    r = ReflectionLoop(log_path=None)
+    current, declining = r._cache_trend([], {'cache_util': 0.99})
+    assert current is None and declining is False
+    current, declining = r._cache_trend(
+        [], {'cache_util': 0.99, 'hit_rate': 0.42})
+    assert current == pytest.approx(0.42) and declining is False
 
 
 def test_reflection_three_sigma_against_narrative_history(tmp_path):
@@ -308,6 +501,58 @@ def test_safety_filter_blocks_unsafe_level2_suggestion():
     assert explorer.bias_override[0] == pytest.approx(0.1)
 
 
+def test_suggestion_born_under_danger_stays_constrained_after_recovery():
+    class FakeExplorer:
+        explore_prob = 0.2
+        bias_override = np.zeros(6, dtype=np.float32)
+
+        def apply_bias_delta(self, dim, delta):
+            self.bias_override[dim] += delta
+
+    loop = ReflectionLoop(log_path=None)
+    explorer = FakeExplorer()
+
+    # Generated while unsafe, applied after the system recovered. The
+    # apply-time danger flag is False; generation-time danger must still win.
+    born_danger = Suggestion(
+        step=10, action_type='bias_delta',
+        params={'dim': 0, 'delta': 0.1}, reason='explore more',
+        severity=0.8, danger_at_generation=True,
+        is_safe_at_generation=False)
+    assert not loop.apply_suggestion(born_danger, explorer, danger=False)
+    assert explorer.bias_override[0] == pytest.approx(0.0)
+
+    # A reducing action from the same dangerous generation is permitted.
+    reducing = Suggestion(
+        step=10, action_type='bias_delta',
+        params={'dim': 0, 'delta': -0.1}, reason='reduce tension',
+        severity=0.8, danger_at_generation=True,
+        is_safe_at_generation=False)
+    assert loop.apply_suggestion(reducing, explorer, danger=False)
+    assert explorer.bias_override[0] == pytest.approx(-0.1)
+    # Per-target cooldown blocks a second mutation in the same interval.
+    again = Suggestion(
+        step=11, action_type='bias_delta',
+        params={'dim': 0, 'delta': -0.1}, reason='repeat',
+        severity=0.8, danger_at_generation=True,
+        is_safe_at_generation=False)
+    assert not loop.apply_suggestion(again, explorer, danger=False)
+
+    # The analysis path stamps suggestions with the observation's safety state.
+    r = ReflectionLoop(log_path=None)
+    uniform = np.full(6, 1 / 6)
+    onehot = np.zeros(6)
+    onehot[0] = 1.0
+    for step in range(5):
+        r.observe(step, soft_mask=(uniform if step % 2 else onehot),
+                  convergence_diff=0.1, is_safe=False)
+    r.reflect_now(step=5)
+    suggestions = r.drain_suggestions()
+    assert suggestions
+    assert all(s.danger_at_generation for s in suggestions)
+    assert all(not s.is_safe_at_generation for s in suggestions)
+
+
 # ─── Behavior explorer + train step routing_bias ────────────────────────────
 
 
@@ -321,6 +566,34 @@ def test_behavior_explorer_every_ten_steps_and_danger_priority():
     assert not explorer.should_update(11)
     danger = explorer.plan_step(10, danger=True, interval=10)
     np.testing.assert_allclose(danger, np.zeros(6, dtype=np.float32))
+
+
+def test_behavior_finalize_clears_unevaluable_bias():
+    explorer = BehaviorExplorer(explore_prob=0.0)
+    signal = TensionSignals(T_pred=0.5, T_conf=0.0, T_res=0.5)
+    explorer.current_bias = np.full(6, 0.2, dtype=np.float32)
+    explorer._bias_start_step = 100
+    # All samples predate the selected bias: no evaluation window exists.
+    for step in range(3):
+        explorer.observe_tension(step, signal)
+    explorer.finalize_evaluation(3)
+    assert explorer.current_bias is None
+    assert len(explorer._eval_buffer) == 0
+
+
+def test_behavior_plan_zero_regression_updates_by_thirty():
+    # Regression: a plan_step(0) call with an empty baseline must not freeze
+    # the selected bias forever. With exploration forced on, the first
+    # selection happens once >=3 tension samples exist, and at least one
+    # reward update must have landed by step 30.
+    explorer = BehaviorExplorer(explore_prob=1.0)
+    signal = TensionSignals(T_pred=0.5, T_conf=0.0, T_res=0.5)
+    for step in range(31):
+        bias = explorer.plan_step(step, danger=False, interval=10)
+        assert bias.shape == (explorer.n_dim,)
+        assert np.all(np.isfinite(bias))
+        explorer.observe_tension(step, signal)
+    assert explorer.n_updates > 0, "bias evaluation never finalized"
 
 
 def _tiny_cfg(**overrides):
@@ -380,6 +653,27 @@ def test_behavior_bias_reaches_routing_bias_in_two_train_steps():
 
 
 # ─── Verifier polling ───────────────────────────────────────────────────────
+
+
+def test_inference_close_verifier_stops_and_clears_poller():
+    from lcm import LCMInferEngine
+
+    class FakePoller:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    eng = object.__new__(LCMInferEngine)
+    poller = FakePoller()
+    eng.verifier_poller = poller
+    eng.verifier = object()
+    eng.close_verifier()
+    assert poller.closed
+    assert eng.verifier_poller is None
+    assert eng.verifier is None
+    assert eng.close_verifier() is None  # idempotent
 
 
 def test_verifier_polling_fires_lock_callback(tmp_path):

@@ -140,6 +140,24 @@ class PredictionCache:
         self._sig_buf = np.zeros(capacity, dtype=np.int64)
         self._valid = np.zeros(capacity, dtype=np.uint8)
 
+        # Real hit/miss counters for the reflection cache-trend analysis.
+        # A lookup is a prediction attempt; a hit is a non-None z_pred.
+        self.hits = 0
+        self.misses = 0
+        self.n_lookups = 0
+
+    def record_lookup(self, hit: bool) -> None:
+        self.n_lookups += 1
+        if hit:
+            self.hits += 1
+        else:
+            self.misses += 1
+
+    def hit_rate(self) -> Optional[float]:
+        if self.n_lookups == 0:
+            return None
+        return self.hits / self.n_lookups
+
     def append(self, sig: int, z_cur: np.ndarray, z_next: np.ndarray,
                step: int):
         entry = PredictEntry(
@@ -324,6 +342,7 @@ class MABMatcher:
             (z_pred or None, op_name, param_dict or None)。
         """
         if len(self.cache) < 3:
+            self.cache.record_lookup(False)
             return None, '', None  # 缓存太冷，不预测
 
         # ε-greedy 选择操作
@@ -356,17 +375,17 @@ class MABMatcher:
         # 执行匹配
         if op == 'M0':
             entry = self.cache.match_exact(z_cur, sig)
-            return (entry.z_next.copy() if entry is not None else None, op, param)
+            z_pred = entry.z_next.copy() if entry is not None else None
         elif op == 'M1':
             z_pred = self.cache.match_hamming(z_cur, sig,
-                                               max_dist=param['max_dist'],
-                                               K=param['K'])
-            return (z_pred, op, param)
+                                              max_dist=param['max_dist'],
+                                              K=param['K'])
         elif op == 'M2':
             z_pred = self.cache.match_euclidean(z_cur, K=param['K'])
-            return (z_pred, op, param)
-
-        return None, '', None
+        else:
+            z_pred = None
+        self.cache.record_lookup(z_pred is not None)
+        return z_pred, op, param
 
     def update(self, z_pred: np.ndarray, z_actual: np.ndarray,
                task_outcome: Optional[float] = None):
@@ -643,6 +662,10 @@ class PredictiveSystem:
         return {
             'cache_util': self.cache.utilization(),
             'n_cache': len(self.cache),
+            'hit_rate': self.cache.hit_rate(),
+            'hits': self.cache.hits,
+            'misses': self.cache.misses,
+            'n_lookups': self.cache.n_lookups,
             'matcher': self.matcher.get_stats(),
             'motivation': {
                 'n_logged': self.motivation.n_logged,

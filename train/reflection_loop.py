@@ -6,6 +6,7 @@
 设计详见 e.md §七（原计划外，补充规格）。
 """
 import json
+import numbers
 import queue
 import threading
 import time
@@ -664,10 +665,14 @@ class Suggestion:
     params: Dict[str, Any]
     reason: str
     severity: float = 0.5
+    # The safety state at generation, not at application. A suggestion born
+    # under danger remains danger-constrained even after recovery.
+    danger_at_generation: bool = False
+    is_safe_at_generation: bool = True
 
 
 def safety_filter(suggestion: Suggestion, *,
-                  danger: bool = False,
+                  danger: Optional[bool] = None,
                   current_explore: float = 0.2,
                   n_dim: int = 6) -> bool:
     """Validate a Level-2 suggestion against Level-1 safety bounds.
@@ -675,16 +680,24 @@ def safety_filter(suggestion: Suggestion, *,
     Rules (d.md / e.md §8): Level 2 cannot directly manipulate Level 0.
     Accepted actions are bounded bias deltas and bounded explore-rate changes.
     Under danger, only zero-or-reducing changes are allowed.
+
+    The danger constraint is the one recorded at *generation* time
+    (``danger_at_generation``). Apply-time danger can only make the filter
+    stricter; it can never relax a suggestion born under danger.
     """
     if not isinstance(suggestion, Suggestion):
         return False
+    effective_danger = bool(suggestion.danger_at_generation)
+    if danger is not None:
+        effective_danger = effective_danger or bool(danger)
     action = suggestion.action_type
     params = suggestion.params or {}
 
     if action == 'bias_delta':
         dim = params.get('dim')
         delta = params.get('delta')
-        if not isinstance(dim, int) or not (0 <= dim < n_dim):
+        if (not isinstance(dim, numbers.Integral)
+                or not (0 <= int(dim) < n_dim)):
             return False
         try:
             delta = float(delta)
@@ -692,7 +705,7 @@ def safety_filter(suggestion: Suggestion, *,
             return False
         if not np.isfinite(delta) or abs(delta) > MAX_BIAS_DELTA:
             return False
-        if danger and delta > 0.0:
+        if effective_danger and delta > 0.0:
             return False
         return True
 
@@ -706,7 +719,7 @@ def safety_filter(suggestion: Suggestion, *,
         target = max(EXPLORE_MIN, float(current_explore) * factor)
         if target < EXPLORE_MIN or target > EXPLORE_MAX:
             return False
-        if danger and target > current_explore:
+        if effective_danger and target > current_explore:
             return False
         return True
 
@@ -717,7 +730,7 @@ def safety_filter(suggestion: Suggestion, *,
             return False
         if not np.isfinite(target) or not (EXPLORE_MIN <= target <= EXPLORE_MAX):
             return False
-        if danger and target > current_explore:
+        if effective_danger and target > current_explore:
             return False
         return True
 
@@ -781,6 +794,9 @@ class ReflectionLoop:
         self._analysis_lock = threading.Lock()
         self.n_analyses = 0
         self.last_report: Optional[dict] = None
+        self.pending_reflection_step: Optional[int] = None
+        self.apply_cooldown = 50
+        self._last_applied: Dict[Tuple[str, Any], int] = {}
 
     # ── 输入 ──
 
@@ -828,7 +844,8 @@ class ReflectionLoop:
 
     def observe(self, step: int, record=None,
                 soft_mask=None, convergence_diff=None,
-                cache_hit: Optional[float] = None) -> None:
+                cache_hit: Optional[float] = None,
+                is_safe: Optional[bool] = None) -> None:
         """Feed one trajectory sample into the slow-analysis history.
 
         This is O(1) append; no analysis runs here. ``record`` may be a
@@ -839,6 +856,8 @@ class ReflectionLoop:
                 soft_mask = getattr(record, 'soft_mask', None)
             if convergence_diff is None:
                 convergence_diff = getattr(record, 'convergence_diff', None)
+            if is_safe is None:
+                is_safe = getattr(record, 'is_safe', None)
         weights = None
         entropy = None
         if soft_mask is not None:
@@ -853,22 +872,35 @@ class ReflectionLoop:
             'convergence_diff': (None if convergence_diff is None
                                  else float(convergence_diff)),
             'cache_hit': (None if cache_hit is None else float(cache_hit)),
+            'is_safe': (None if is_safe is None else bool(is_safe)),
         })
 
     def maybe_reflect(self, step: int, narrative=None,
                       cache_stats=None) -> bool:
-        """Launch one background analysis at each interval boundary."""
-        if step <= 0 or step % self.interval != 0:
-            return False
+        """Launch one background analysis at each interval boundary.
+
+        If the previous analysis is still running at a boundary, the request
+        is remembered and retried at the next call instead of being dropped.
+        """
         if self._thread is not None and self._thread.is_alive():
+            if step > 0 and step % self.interval == 0:
+                self.pending_reflection_step = int(step)
             return False
+
+        target_step = self.pending_reflection_step
+        self.pending_reflection_step = None
+        if target_step is None:
+            if step <= 0 or step % self.interval != 0:
+                return False
+            target_step = int(step)
+
         # Snapshot before the thread starts: `observe` keeps appending while
         # the analysis runs, and iterating a mutating deque is a race.
         snapshot = list(self._observations)
         self._thread = threading.Thread(
             target=self._analysis_worker,
-            args=(int(step), narrative, cache_stats, snapshot),
-            name=f"reflection-{step}", daemon=True)
+            args=(target_step, narrative, cache_stats, snapshot),
+            name=f"reflection-{target_step}", daemon=True)
         self._thread.start()
         return True
 
@@ -908,8 +940,19 @@ class ReflectionLoop:
         if step is None:
             step = observations[-1]['step'] if observations else self._last_step
 
+        is_safe_at_generation = True
+        for obs in reversed(observations):
+            if obs.get('is_safe') is not None:
+                is_safe_at_generation = bool(obs['is_safe'])
+                break
+        generation = {
+            'danger_at_generation': not is_safe_at_generation,
+            'is_safe_at_generation': is_safe_at_generation,
+        }
+
         abandoned = self._abandoned_lattices(step, observations)
-        entropy_variance = self._entropy_variance(observations)
+        entropy_variance = self._entropy_variance(observations,
+                                                  window=self.interval)
         anomaly = self._three_sigma(step, observations, narrative)
         cache_hit, cache_declining = self._cache_trend(observations,
                                                        cache_stats)
@@ -922,28 +965,28 @@ class ReflectionLoop:
                 reason=f"lattice {dim} average weight < "
                        f"{self.abandoned_weight} for >{self.abandoned_steps} "
                        f"steps",
-                severity=0.6))
+                severity=0.6, **generation))
         if entropy_variance > self.entropy_variance_threshold:
             found.append(Suggestion(
                 step=step, action_type='explore_rate_reduce',
                 params={'factor': 0.8},
                 reason=f"routing entropy variance {entropy_variance:.4f} "
                        f"> {self.entropy_variance_threshold}",
-                severity=0.4))
+                severity=0.4, **generation))
         if anomaly is not None:
             found.append(Suggestion(
                 step=step, action_type='explore_rate_reduce',
                 params={'factor': 0.5},
                 reason=f"3σ anomaly at step {anomaly['step']} "
                        f"(value={anomaly['value']:.3f})",
-                severity=0.8))
+                severity=0.8, **generation))
         if cache_declining:
             found.append(Suggestion(
                 step=step, action_type='explore_rate_reduce',
                 params={'factor': 0.9},
                 reason=f"prediction cache hit rate declining "
                        f"({cache_hit:.3f})",
-                severity=0.5))
+                severity=0.5, **generation))
 
         report = {
             'event': 'reflection',
@@ -966,7 +1009,9 @@ class ReflectionLoop:
             record = dict(report)
             record['suggestions'] = [
                 {'action_type': s.action_type, 'params': s.params,
-                 'reason': s.reason, 'severity': s.severity}
+                 'reason': s.reason, 'severity': s.severity,
+                 'danger_at_generation': s.danger_at_generation,
+                 'is_safe_at_generation': s.is_safe_at_generation}
                 for s in found]
             append_json_line(self.log_path, record)
         return report
@@ -985,8 +1030,9 @@ class ReflectionLoop:
                 if mean < self.abandoned_weight]
 
     @staticmethod
-    def _entropy_variance(observations: list) -> float:
-        values = [o['entropy'] for o in observations
+    def _entropy_variance(observations: list, window: int = 200) -> float:
+        """Variance over the rolling window, not all retained history."""
+        values = [o['entropy'] for o in observations[-max(2, int(window)):]
                   if o['entropy'] is not None]
         if len(values) < 2:
             return 0.0
@@ -995,21 +1041,30 @@ class ReflectionLoop:
     def _three_sigma(self, step: int, observations: list,
                      narrative) -> Optional[dict]:
         recent = [o['convergence_diff'] for o in observations
-                  if o['convergence_diff'] is not None]
-        if not recent:
+                  if o['step'] < step and o['convergence_diff'] is not None]
+        current_values = [o['convergence_diff'] for o in observations
+                          if o['step'] == step
+                          and o['convergence_diff'] is not None]
+        if not current_values:
             return None
-        current = recent[-1]
+        current = current_values[-1]
         historical: List[float] = []
         if narrative is not None:
             try:
+                try:
+                    records = narrative.get_all(touch=True, current_step=step)
+                except TypeError:
+                    records = narrative.get_all()
                 historical = [
-                    float(r.convergence_diff) for r in narrative.get_all()
-                    if getattr(r, 'convergence_diff', None) is not None]
+                    float(r.convergence_diff) for r in records
+                    if getattr(r, 'convergence_diff', None) is not None
+                    and getattr(r, 'step', step - 1) < step]
             except Exception:
                 historical = []
         if len(historical) < 10:
-            # Fall back to the loop's own history, excluding the current point.
-            historical = recent[-101:-1]
+            # Fall back to the loop's own history; `recent` already excludes
+            # every observation at the analysis step (including the candidate).
+            historical = recent[-100:]
         if len(historical) < 10:
             return None
         mean = float(np.mean(historical))
@@ -1030,8 +1085,6 @@ class ReflectionLoop:
                 hit = cache_stats.get('hit_rate')
                 if hit is None:
                     hit = cache_stats.get('cache_hit')
-                if hit is None:
-                    hit = cache_stats.get('cache_util')
                 if hit is not None:
                     values = values + [float(hit)]
                     current = float(hit)
@@ -1058,11 +1111,25 @@ class ReflectionLoop:
                 return out
 
     def apply_suggestion(self, suggestion: Suggestion, explorer,
-                         *, danger: bool = False) -> bool:
-        """Safety-filter a Level-2 suggestion, then change Level 1."""
+                         *, danger: Optional[bool] = None) -> bool:
+        """Safety-filter a Level-2 suggestion, then change Level 1.
+
+        The filter uses the safety state recorded when the suggestion was
+        generated. A per-target cooldown keeps a burst of correlated
+        suggestions from all landing on the same Level-1 parameter.
+        """
         current_explore = float(getattr(explorer, 'explore_prob', 0.2))
         if not safety_filter(suggestion, danger=danger,
                              current_explore=current_explore):
+            return False
+        target = None
+        if suggestion.action_type == 'bias_delta':
+            target = suggestion.params.get('dim')
+        elif suggestion.action_type.startswith('explore_rate'):
+            target = 'explore'
+        key = (suggestion.action_type, target)
+        last = self._last_applied.get(key)
+        if last is not None and suggestion.step - last < self.apply_cooldown:
             return False
         if suggestion.action_type == 'bias_delta':
             apply = getattr(explorer, 'apply_bias_delta', None)
@@ -1070,14 +1137,17 @@ class ReflectionLoop:
                 return False
             apply(int(suggestion.params['dim']),
                   float(suggestion.params['delta']))
+            self._last_applied[key] = suggestion.step
             return True
         if suggestion.action_type == 'explore_rate_reduce':
             explorer.explore_prob = max(
                 EXPLORE_MIN,
                 current_explore * float(suggestion.params['factor']))
+            self._last_applied[key] = suggestion.step
             return True
         if suggestion.action_type == 'explore_rate_set':
             explorer.explore_prob = float(suggestion.params['value'])
+            self._last_applied[key] = suggestion.step
             return True
         return False
 
