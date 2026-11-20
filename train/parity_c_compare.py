@@ -39,7 +39,7 @@ import jax.numpy as jnp
 
 from train.cog_loop import dag_fuse
 from train.fusion import fuse_lattices_with_aux
-from train.hyp import safe_unit
+from train.hyp import exp_map, poincare_similarity, safe_unit
 from train.lattices import (
     binding_forward, contrast_forward, hrq_forward, init_binding_params,
     init_contrast_params, init_hrq_params, init_lowrank_params,
@@ -67,6 +67,8 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PARITY_D = 32
 PARITY_LATTICES = ("hrq", "sparse", "lowrank", "manifold", "binding",
                    "contrast", "routing")
+# lcm.h's LCM_MAX_LATTICES; distance_weighted_fusion always iterates this many.
+C_MAX_LATTICES = 7
 
 _FP = ctypes.POINTER(ctypes.c_float)
 _IP = ctypes.POINTER(ctypes.c_int)
@@ -150,10 +152,14 @@ def ensure_parity_lib(d=PARITY_D, build=True):
     """Return a parity .so built for ``LCM_D == d``.
 
     ``LCM_PARITY_LIB`` overrides the path (used by callers with a prebuilt
-    library). Otherwise ``make -C infer PARITY_D=<d> liblcm_d<d>.so`` uses the
-    dedicated object directory, so the deployed d=256 build is not touched.
-    A missing library or failed build raises with the compiler output; parity
-    must never silently skip.
+    library). The override is trusted as-is: only its compiled ``LCM_D`` is
+    verified, not that its sources match this worktree. Use the default builder
+    unless you know the override is current.
+
+    Otherwise ``make -C infer PARITY_D=<d> liblcm_d<d>.so`` uses the dedicated
+    object directory, so the deployed d=256 build is not touched. A missing
+    library or failed build raises with the compiler output; parity must never
+    silently skip.
     """
     override = os.environ.get("LCM_PARITY_LIB")
     if override:
@@ -189,8 +195,10 @@ def ensure_parity_lib(d=PARITY_D, build=True):
 
 def load_parity_lib(path=None, d=PARITY_D):
     path = os.path.abspath(path or ensure_parity_lib(d))
-    if path in _LIB_CACHE:
-        return _LIB_CACHE[path]
+    st = os.stat(path)
+    cache_key = (path, st.st_mtime_ns, st.st_size)
+    if cache_key in _LIB_CACHE:
+        return _LIB_CACHE[cache_key]
 
     try:
         ctypes.CDLL("libm.so.6", mode=ctypes.RTLD_GLOBAL)
@@ -237,7 +245,7 @@ def load_parity_lib(path=None, d=PARITY_D):
     if compiled_d != int(d):
         raise RuntimeError(
             f"{path} was built with LCM_D={compiled_d}, expected {d}")
-    _LIB_CACHE[path] = lib
+    _LIB_CACHE[cache_key] = lib
     return lib
 
 
@@ -253,6 +261,14 @@ def load_lib(path):
             f"Note the C engine is dimensioned at compile time, so a .so built "
             f"for the deployed d_model (256) cannot run this comparison.")
     lib = ctypes.CDLL(path)
+    lib.lcm_dim.restype = ctypes.c_int
+    compiled_d = int(lib.lcm_dim())
+    if compiled_d != D_MODEL:
+        raise SystemExit(
+            f"{path} was built with LCM_D={compiled_d}, but this harness "
+            f"expects LCM_D={D_MODEL}. Rebuild with "
+            f"`make -C infer PARITY_D={D_MODEL} liblcm_d{D_MODEL}.so` and "
+            f"pass --lib, or use a matching .so.")
     common = [
         ctypes.POINTER(ctypes.c_float), ctypes.c_int,          # z, d
         ctypes.POINTER(ctypes.c_float), ctypes.c_int,          # hrq_C, M
@@ -453,6 +469,18 @@ def _parity_result(lattice, case, alpha, fields, idx_pairs,
         if j.size == 0:
             continue
         diff = np.abs(j - c)
+        finite = np.isfinite(diff)
+        if not bool(finite.all()):
+            # NaN must never compare as "not greater than max_err". Treat any
+            # non-finite element as +inf and pin its index for the failure
+            # message.
+            k = int(np.flatnonzero(~finite.ravel())[0])
+            idx = np.unravel_index(k, j.shape) if j.ndim > 1 else (k,)
+            max_err = float("inf")
+            max_mm = {"field": name, "index": idx,
+                      "jax": float(j.ravel()[k]), "c": float(c.ravel()[k]),
+                      "abs_err": float("inf")}
+            break
         k = int(np.argmax(diff))
         idx = np.unravel_index(k, j.shape) if j.ndim > 1 else (k,)
         err = float(diff.ravel()[k])
@@ -615,10 +643,10 @@ def _manifold_parity(case, lib, alpha):
     vs = case["values"]["manifold"]
     d = case["d"]
 
-    # R6 boundary: JAX manifold_forward still calls exp_map(z) directly, while
-    # C uses exp_map(safe_unit(z)). Normalising once here makes both sides run
-    # the *same* R6-domain function; production JAX semantics are unchanged.
-    z = safe_unit(case["z"])
+    # R6 (Ruling 29): both sides now apply exp_map(safe_unit(z)) themselves.
+    # z keeps its raw norm (~3.8 here), so a regression to exp_map(z) or to a
+    # harness-side normalisation is visible in the comparison.
+    z = case["z"]
     z_np = _np32(_jax_to_np(z))
     C = _np32(_jax_to_np(p["C"]))
     T = _np32(_jax_to_np(p["T"]))
@@ -762,6 +790,310 @@ def _routing_parity(case, lib, alpha):
         {"mask": jax_mask}, {"mask": mask})
 
 
+def _dir_vec(theta, radius, d=PARITY_D):
+    """Unit-plane prototype ``radius * (cos θ, sin θ)`` with zeros elsewhere."""
+    v = np.zeros(d, dtype=np.float32)
+    v[0] = radius * np.cos(theta)
+    v[1] = radius * np.sin(theta)
+    return v
+
+
+def _simvq_identity(codebook):
+    """Wrap an effective codebook as SimVQ params with ``W = I``."""
+    cb = _np32(codebook)
+    d = cb.shape[1]
+    return {"A": jnp.asarray(cb), "W": jnp.eye(d, dtype=jnp.float32)}
+
+
+def _maxdiff(a, b):
+    return float(np.max(np.abs(np.asarray(a, np.float64)
+                               - np.asarray(b, np.float64))))
+
+
+def _hrq_pair(lib, top, z, fine=None, alpha=0.0, tau=0.1,
+              value_topk=None, value_top=None, value_fine=None):
+    """JAX/C HRQ call on explicit effective codebooks (no random params)."""
+    top = _np32(top)
+    z = _np32(z)
+    d = top.shape[1]
+    if fine is None:
+        fine = np.zeros((0, 0), dtype=np.float32)
+    else:
+        fine = _np32(fine)
+
+    jax_fine = ([_simvq_identity(layer) for layer in fine]
+                if fine.shape[0] else [])
+    jax_params = {"top": _simvq_identity(top), "fine": jax_fine}
+
+    if value_top is not None:
+        v_top = _np32(value_top)
+        v_fine = None if value_fine is None else _np32(value_fine)
+        jax_vs = {"top": jnp.asarray(v_top)}
+        if v_fine is not None:
+            jax_vs["fine"] = jnp.asarray(v_fine)
+    else:
+        v_top = v_fine = None
+        jax_vs = None
+
+    k = int(top.shape[0] if value_topk is None else value_topk)
+    jax_out, jax_idx, jax_sim, _ = hrq_forward(
+        jax_params, jnp.asarray(z)[None, :], tau_fallback=tau,
+        value_scalars=jax_vs, alpha_val=float(alpha), value_topk=k)
+
+    m = HRQMem()
+    m.C_top = _ptr(top)
+    m.M_top = top.shape[0]
+    if fine.shape[0]:
+        m.C_fine = _ptr(fine)
+        m.M_fine = fine.shape[1]
+        m.n_fine = fine.shape[0]
+    m.value_top = _ptr(v_top) if v_top is not None else None
+    m.value_fine = _ptr(v_fine) if v_fine is not None else None
+
+    out = np.zeros(d, dtype=np.float32)
+    idx = ctypes.c_int(-1)
+    sim = ctypes.c_float(float("nan"))
+    rc = lib.hrq_forward_v31(
+        _ptr(z), ctypes.byref(m), ctypes.c_float(float(alpha)),
+        ctypes.c_int(k), ctypes.c_float(float(tau)), _ptr(out),
+        ctypes.byref(idx), ctypes.byref(sim))
+    if rc != 0:
+        raise RuntimeError(f"hrq_forward_v31 returned {rc}")
+
+    return _parity_result(
+        "hrq_crafted", {"seed": 0, "d": d}, alpha, ("out", "top_sim"),
+        [("top_idx", _jax_to_np(jax_idx), np.array([idx.value]))],
+        {"out": _jax_to_np(jax_out)[0],
+         "top_sim": _jax_to_np(jax_sim).reshape(1),
+         "idx": np.asarray(jax_idx, dtype=np.int32).reshape(1)},
+        {"out": out, "top_sim": np.array([sim.value], dtype=np.float32),
+         "idx": np.array([idx.value], dtype=np.int32)})
+
+
+def run_hrq_poincare_parity(d=PARITY_D):
+    """Crafted fixture where Euclidean and Poincaré top-1 disagree."""
+    lib = load_parity_lib(d=d)
+    top = np.stack([_dir_vec(0.0, 0.4, d), _dir_vec(0.5, 0.95, d)])
+    z = _dir_vec(0.0, 0.9, d)
+
+    e_idx = int(np.argmin(np.sum((z[None, :] - top) ** 2, axis=-1)))
+    z_P = exp_map(safe_unit(jnp.asarray(z)[None, :]))
+    c_P = exp_map(jnp.asarray(top))
+    p_sims = np.asarray(poincare_similarity(z_P, c_P)).reshape(-1)
+    p_idx = int(np.argmin(p_sims))
+
+    res = _hrq_pair(lib, top, z, tau=0.1)
+    res.update({
+        "euclidean_idx": e_idx,
+        "poincare_idx": p_idx,
+        "jax_idx": int(res["jax"]["idx"][0]),
+        "c_idx": int(res["c"]["idx"][0]),
+        "poincare_top_sim": float(p_sims[p_idx]),
+    })
+    return res
+
+
+def _hrq_gap_case(lib, top, fine, z, name):
+    z_P = exp_map(safe_unit(jnp.asarray(_np32(z))[None, :]))
+    sims = np.asarray(poincare_similarity(
+        z_P, exp_map(jnp.asarray(_np32(top))))).reshape(-1)
+    s0, s1 = float(sims[0]), float(sims[1])
+    abs_gap = s1 - s0
+    rel_gap = abs_gap / s0
+
+    default = _hrq_pair(lib, top, z, fine=fine, tau=0.1)
+    hard = _hrq_pair(lib, top, z, fine=fine, tau=0.0)
+    soft = _hrq_pair(lib, top, z, fine=fine, tau=1e9)
+
+    return {
+        "name": name,
+        "abs_gap": abs_gap,
+        "rel_gap": rel_gap,
+        "default": default,
+        "hard": hard,
+        "soft": soft,
+        "jax_default_hard": _maxdiff(default["jax"]["out"],
+                                     hard["jax"]["out"]),
+        "jax_default_soft": _maxdiff(default["jax"]["out"],
+                                     soft["jax"]["out"]),
+        "c_default_hard": _maxdiff(default["c"]["out"], hard["c"]["out"]),
+        "c_default_soft": _maxdiff(default["c"]["out"], soft["c"]["out"]),
+        "jax_hard_soft": _maxdiff(hard["jax"]["out"], soft["jax"]["out"]),
+        "c_hard_soft": _maxdiff(hard["c"]["out"], soft["c"]["out"]),
+    }
+
+
+def run_hrq_gap_parity(d=PARITY_D):
+    """Task 8's absolute-vs-relative gap cases, run through both sides.
+
+    Case A: absolute gap > tau > relative gap -> fallback.
+    Case B: relative gap > tau > absolute gap -> hard.
+    """
+    lib = load_parity_lib(d=d)
+    fine = np.stack([np.stack([_dir_vec(-0.75, 1.0, d),
+                               _dir_vec(0.0, 1.0, d)])])
+    z = _dir_vec(0.0, 1.0, d)
+
+    top_a = np.stack([_dir_vec(0.78, 1.0, d),
+                      _dir_vec(-0.81, 1.0, d),
+                      _dir_vec(np.pi, 1.0, d),
+                      _dir_vec(np.pi, 1.0, d)])
+    top_b = np.stack([_dir_vec(0.195, 1.0, d),
+                      _dir_vec(-0.2138, 1.0, d),
+                      _dir_vec(np.pi, 1.0, d),
+                      _dir_vec(np.pi, 1.0, d)])
+
+    return {
+        "case_a": _hrq_gap_case(lib, top_a, fine, z, "A"),
+        "case_b": _hrq_gap_case(lib, top_b, fine, z, "B"),
+    }
+
+
+def _binding_pair(lib, key, val, bind, A_k, A_v, V, z):
+    """JAX/C binding call on explicit effective codebooks."""
+    key = _np32(key)
+    val = _np32(val)
+    bind = _np32(bind)
+    A_k = _np32(A_k)
+    A_v = _np32(A_v)
+    V = _np32(V)
+    z = _np32(z)
+    d = z.shape[0]
+
+    params = {
+        "key_cb": [_simvq_identity(layer) for layer in key],
+        "val_cb": [_simvq_identity(layer) for layer in val],
+        "bind_cb": [_simvq_identity(layer) for layer in bind],
+        "A_k": jnp.asarray(A_k),
+        "A_v": jnp.asarray(A_v),
+    }
+    (jax_out, _residuals, _indices, jax_bq, jax_kq,
+     _val_idx) = binding_forward(params, jnp.asarray(z)[None, :],
+                                 jnp.asarray(V))
+
+    m = BindingMem()
+    m.key_cb = _ptr(key)
+    m.val_cb = _ptr(val)
+    m.bind_cb = _ptr(bind)
+    m.M = key.shape[1]
+    m.n_layers = key.shape[0]
+    m.r_max = V.shape[1]
+    m.A_k = _ptr(A_k)
+    m.A_v = _ptr(A_v)
+
+    out = np.zeros(d, dtype=np.float32)
+    b_q = np.zeros(d, dtype=np.float32)
+    k_q = np.zeros(d, dtype=np.float32)
+    lib.binding_forward_c(_ptr(z), ctypes.byref(m), _ptr(V),
+                          ctypes.c_float(0.0), _ptr(out), _ptr(b_q),
+                          _ptr(k_q))
+
+    return _parity_result(
+        "binding_crafted", {"seed": 0, "d": d}, 0.0,
+        ("v_out", "b_q", "k_q"), [],
+        {"v_out": _jax_to_np(jax_out)[0],
+         "b_q": _jax_to_np(jax_bq)[0],
+         "k_q": _jax_to_np(jax_kq)[0]},
+        {"v_out": out, "b_q": b_q, "k_q": k_q})
+
+
+def run_binding_projection_parity(d=PARITY_D):
+    """Task 9's crafted projection fixture: ``V @ A_k @ z`` vs ``A_k^T V^T z``."""
+    lib = load_parity_lib(d=d)
+    L, M, R = 1, 2, 2
+    V = np.zeros((d, R), dtype=np.float32)
+    V[0, 0] = 1.0
+    V[0, 1] = 0.25
+    V[1, 0] = 0.5
+    V[2, 0] = 0.75
+    V[2, 1] = 1.0
+
+    A_k = np.zeros((R, d), dtype=np.float32)
+    A_k[0, 0] = 1.0
+    A_k[0, 1] = 0.5
+    A_k[1, 2] = 1.0
+    A_v = A_k.copy()
+
+    z = np.zeros(d, dtype=np.float32)
+    z[0], z[1], z[2] = 1.0, 0.3, 0.7
+
+    u = A_k.astype(np.float64) @ z.astype(np.float64)
+    correct = (V.astype(np.float64) @ u).astype(np.float32)
+    t = V.astype(np.float64).T @ z.astype(np.float64)
+    transposed = (A_k.astype(np.float64).T @ t).astype(np.float32)
+
+    key = np.zeros((L, M, d), dtype=np.float32)
+    key[0, 0] = correct
+    key[0, 1] = transposed
+    val = np.zeros((L, M, d), dtype=np.float32)
+    val[0, 0, 3] = 1.0
+    val[0, 1, 4] = 1.0
+    bind = np.zeros((L, M, d), dtype=np.float32)
+    bind[0, 0, 5] = 1.0
+    bind[0, 1, 6] = 1.0
+
+    res = _binding_pair(lib, key, val, bind, A_k, A_v, V, z)
+    res.update({
+        "correct": correct,
+        "transposed": transposed,
+        "jax_correct_err": _maxdiff(res["jax"]["k_q"], correct),
+        "jax_transposed_err": _maxdiff(res["jax"]["k_q"], transposed),
+        "c_correct_err": _maxdiff(res["c"]["k_q"], correct),
+        "c_transposed_err": _maxdiff(res["c"]["k_q"], transposed),
+    })
+    return res
+
+
+def run_sparse_value_bias_parity(d=PARITY_D):
+    """Crafted sparse fixture where the value term provably flips the row.
+
+    z = 0.6·e0, C = [0.7·e0, 0.1·e0], v = [−1, +1]. Without the bias the
+    nearest row is 0; at alpha=2 row 1 wins on ``+alpha·tanh(v)·mean_d²``.
+    """
+    lib = load_parity_lib(d=d)
+    C = np.zeros((2, d), dtype=np.float32)
+    C[0, 0] = 0.7
+    C[1, 0] = 0.1
+    z = np.zeros(d, dtype=np.float32)
+    z[0] = 0.6
+    vs = np.array([-1.0, 1.0], dtype=np.float32)
+
+    params = {"C": jnp.asarray(C), "zero_vec": jnp.zeros((1, d))}
+    zero = np.zeros(d, dtype=np.float32)
+    out = {}
+    for alpha in (0.0, 2.0):
+        jax_out, jax_idx = sparse_forward(
+            params, jnp.asarray(z)[None, :], training=True,
+            value_scalars=jnp.asarray(vs), alpha_val=float(alpha))
+
+        m = SparseMem()
+        m.C = _ptr(C)
+        m.M = C.shape[0]
+        m.zero_vec = _ptr(zero)
+        m.value = _ptr(vs)
+        c_out = np.zeros(d, dtype=np.float32)
+        c_idx = ctypes.c_int(-1)
+        rc = lib.sparse_forward_c(
+            _ptr(z), ctypes.byref(m), ctypes.c_float(1.5),
+            ctypes.c_float(float(alpha)), ctypes.c_float(0.0),
+            ctypes.c_int(1), _ptr(c_out), ctypes.byref(c_idx))
+        if rc != 0:
+            raise RuntimeError(f"sparse_forward_c returned {rc}")
+
+        out[alpha] = _parity_result(
+            "sparse_crafted", {"seed": 0, "d": d}, alpha, ("out",),
+            [("idx", _jax_to_np(jax_idx), np.array([c_idx.value]))],
+            {"out": _jax_to_np(jax_out)[0],
+             "idx": np.asarray(jax_idx, dtype=np.int32).reshape(1)},
+            {"out": c_out,
+             "idx": np.array([c_idx.value], dtype=np.int32)})
+    out["jax_idx_0"] = int(out[0.0]["jax"]["idx"][0])
+    out["jax_idx_2"] = int(out[2.0]["jax"]["idx"][0])
+    out["c_idx_0"] = int(out[0.0]["c"]["idx"][0])
+    out["c_idx_2"] = int(out[2.0]["c"]["idx"][0])
+    return out
+
+
 def run_lattice_parity(lattice, seed=0, d=PARITY_D, alpha=0.0,
                        training=True, d_top=None):
     """Run one lattice through JAX and the C parity build; compare.
@@ -828,9 +1160,11 @@ def run_canonical_fusion_parity(seed=0, d=PARITY_D):
         raise RuntimeError(f"lcm_fuse_only returned {rc}")
 
     jax_z = _jax_to_np(jax_z)[0]
-    err = float(np.max(np.abs(jax_z.astype(np.float64)
-                              - z_c.astype(np.float64))))
-    k = int(np.argmax(np.abs(jax_z - z_c)))
+    diff = np.abs(jax_z.astype(np.float64) - z_c.astype(np.float64))
+    err = float(np.max(diff))
+    if not np.isfinite(err):
+        err = float("inf")
+    k = int(np.argmax(diff))
     return {
         "lattice": "canonical_fusion", "seed": int(seed), "d": int(d),
         "alpha": 0.0, "fields": ("z",), "idx_equal": True,
@@ -862,8 +1196,9 @@ def run_engine_fusion_parity(seed=0, d=PARITY_D):
         z, codebooks, [1e9] * n, tau=0.1, eps=1e-6)
 
     z_np = _np32(_jax_to_np(z))
-    outputs = np.zeros((7, d), dtype=np.float32)
-    confidences = np.zeros(7, dtype=np.float32)
+    n_buf = max(C_MAX_LATTICES, n)
+    outputs = np.zeros((n_buf, d), dtype=np.float32)
+    confidences = np.zeros(n_buf, dtype=np.float32)
     for i, cb in enumerate(codebooks):
         cb_np = _np32(_jax_to_np(cb))
         mem = LatticeMemory()
@@ -879,14 +1214,16 @@ def run_engine_fusion_parity(seed=0, d=PARITY_D):
         confidences[i] = 1.0 / (float(np.sqrt(dist.value)) + 1e-6)
 
     z_c = np.zeros(d, dtype=np.float32)
-    weights = np.zeros(7, dtype=np.float32)
+    weights = np.zeros(C_MAX_LATTICES, dtype=np.float32)
     lib.distance_weighted_fusion(_ptr(outputs), _ptr(confidences), _ptr(z_c),
                                  _ptr(weights), None, ctypes.c_float(0.0))
 
     jax_next = _jax_to_np(jax_next)
-    err = float(np.max(np.abs(jax_next.astype(np.float64)
-                              - z_c.astype(np.float64))))
-    k = int(np.argmax(np.abs(jax_next - z_c)))
+    diff = np.abs(jax_next.astype(np.float64) - z_c.astype(np.float64))
+    err = float(np.max(diff))
+    if not np.isfinite(err):
+        err = float("inf")
+    k = int(np.argmax(diff))
     return {
         "lattice": "engine_fusion", "seed": int(seed), "d": int(d),
         "alpha": 0.0, "fields": ("z",), "idx_equal": True,

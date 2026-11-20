@@ -92,6 +92,5 @@ parity: liblcm_d$(PARITY_D).so
 clean:
 	rm -f *.o *.a *.so test_runner
 	rm -rf parity_obj_d*
-	rm -f liblcm_d*.so
 
 .PHONY: all debug contracts clean test parity

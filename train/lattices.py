@@ -561,9 +561,14 @@ def init_manifold_params(rng, d, M_man, t_dim):
 
 
 def manifold_forward(params, z, value_scalars=None, alpha_val=0.0):
-    """Hyperbolic manifold with local tangent space."""
+    """Hyperbolic manifold with local tangent space.
+
+    R6 domain: the query is ``exp_map(safe_unit(z))``, matching C's
+    ``manifold_forward_c``. Codebooks stay tangent-space parameters and are
+    pushed onto the ball with ``exp_map(C)`` only (they are not re-normalised).
+    """
     d = z.shape[-1]
-    z_P = exp_map(z)
+    z_P = exp_map(safe_unit(z))
     C_P = exp_map(params['C'])
 
     if value_scalars is not None and alpha_val > 0:
