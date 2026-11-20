@@ -69,7 +69,7 @@ extern "C" {
 #endif
 
 /* Derived constants */
-#define LCM_CONSISTENCY_THRESHOLD 0.3f
+#define LCM_CONSISTENCY_THRESHOLD 0.7f   /* R17; value_consistency ∈ [0,1] */
 #define LCM_ENTROPY_THRESHOLD     2.0f  /* v1: unnormalised H, effectively off */
 #define LCM_ENTROPY_THRESHOLD_NORM 0.5f /* R9: v3 H(w)/ln(n_active) */
 #define LCM_CONVERGENCE_TOL       1e-3f

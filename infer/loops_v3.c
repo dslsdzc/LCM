@@ -531,7 +531,9 @@ static float v3_value_consistency_impl(const lcm_memory_v3* mem,
     float c = dot / (sqrtf(n_acc) * sqrtf(n_next));
     if (c > 1.0f) c = 1.0f;
     if (c < -1.0f) c = -1.0f;
-    return c;
+    /* R17: the threshold is on [0,1], so map the cosine from [-1,1].
+     * A cosine of 0 (uncorrelated) becomes 0.5; 0.7 requires cosine >= 0.4. */
+    return 0.5f * (c + 1.0f);
 }
 
 float lcm_value_consistency_v3(const lcm_memory_v3* mem,

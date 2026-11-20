@@ -678,7 +678,22 @@ def _apply_ema_updates(ema, ema_state, stats, cfg, step):
     return new_ema, new_state
 
 
-def make_train_step(cfg, optimizer, joint=False):
+def make_optimizer(cfg):
+    """The production optimizer chain (shared by train_cog and diagnostics).
+
+    ``learning_rate=1.0`` is deliberate: ``train_step`` applies the live
+    schedule value to the updates itself, which is what makes the Supervisor's
+    mid-run LR changes effective.
+    """
+    return optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(learning_rate=1.0, b1=cfg.adam_beta1,
+                    b2=cfg.adam_beta2, eps=cfg.adam_eps,
+                    weight_decay=cfg.weight_decay),
+    )
+
+
+def make_train_step(cfg, optimizer, joint=False, return_grads=False):
     """Create jitted training step with dual-channel output + self-lattice.
 
     The sequence is split at ``cog_context_frac``. z is computed from the
@@ -707,6 +722,11 @@ def make_train_step(cfg, optimizer, joint=False):
 
     The R18 layered codebook/commitment losses run unconditionally (also when
     joint=False); they are main training losses, not Stage 3 extras.
+
+    ``return_grads=True`` adds the clipped trainable-gradient pytree to
+    ``aux_out['grads']``. It is a diagnostics switch (Task-15 smoke): it is not
+    used by the training loop, and retaining the tree for every production step
+    would cost memory for no training benefit.
     """
 
     @jax.jit
@@ -845,8 +865,16 @@ def make_train_step(cfg, optimizer, joint=False):
                 a_loss = jnp.array(0.0)
                 z_margin = jnp.array(0.0)
 
-            # Convergence bonus
-            conv = (diffs[:, -1] < cfg.convergence_tol) & (entropies[:, -1] < cfg.entropy_threshold)
+            # Convergence: R9's normalised entropy gate.
+            # H_norm = H / ln(n_active), n_active = routed lattices with a
+            # non-zero softmask entry, clamped to >=2 (ln(1)=0 is undefined;
+            # a single active node is handled as H_norm=0 by R9, which passes).
+            n_active = jnp.sum(
+                loop_stats['soft_mask'] > 1e-6, axis=-1).astype(jnp.float32)
+            n_active = jnp.maximum(n_active, 2.0)
+            h_norm = entropies[:, -1] / jnp.log(n_active)
+            conv = ((diffs[:, -1] < cfg.convergence_tol)
+                    & (h_norm < cfg.entropy_threshold))
             n_steps = jnp.argmax((diffs < cfg.convergence_tol).astype(jnp.float32), axis=-1) + 1
 
             # Convergence bonus — reward FAST convergence (n=1 → -0.0035,
@@ -914,6 +942,8 @@ def make_train_step(cfg, optimizer, joint=False):
             trainable_params)
         grads = jax.tree_util.tree_map(
             lambda g: jnp.clip(g, -1.0, 1.0), grads)
+        if return_grads:
+            aux_out['grads'] = grads
         # The optimizer sees trainable only. EMA and frozen leaves are not in
         # this tree, so their absence is structural, not a filtered-out zero.
         updates, new_opt = optimizer.update(grads, opt_state, trainable_params)
@@ -1326,12 +1356,7 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     # train_step's `lr` argument dead code: the Supervisor's "LR reduced" line
     # printed a new number while training carried on down the original curve.
     # train_step now applies the live schedule value to the updates itself.
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate=1.0, b1=cfg.adam_beta1,
-                     b2=cfg.adam_beta2, eps=cfg.adam_eps,
-                     weight_decay=cfg.weight_decay),
-    )
+    optimizer = make_optimizer(cfg)
     # R3: optimizer state exists only for the trainable group. EMA codebooks
     # are written by the EMA pass; frozen tensors (danger, the Qwen bridge)
     # must not even allocate Adam moments. Filtering `qwen` alone was not

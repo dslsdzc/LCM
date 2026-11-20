@@ -2428,9 +2428,16 @@ static void test_value_consistency_nonzero(void) {
 
     float vc = lcm_value_consistency_v3(&t10_mem, (const float*)outputs,
                                         active, z_cur, z_next);
-    CHECK(fabsf(vc - 0.6f) < 1e-5f,
-          "value consistency uses the selected LowRank row's scalar and a "
-          "real cosine");
+    CHECK(fabsf(vc - 0.8f) < 1e-5f,
+          "value consistency maps cosine 0.6 to [0,1] as 0.8 (R17)");
+
+    /* A cosine of -1 must map to 0, not stay negative. */
+    float z_neg[LCM_D] = {0};
+    z_neg[0] = -1.0f;
+    float vc_neg = lcm_value_consistency_v3(&t10_mem, (const float*)outputs,
+                                            active, z_cur, z_neg);
+    CHECK(fabsf(vc_neg - 0.0f) < 1e-5f,
+          "value consistency maps cosine -1 to 0.0");
 }
 
 static void test_retrieval_count_resource_abuse(void) {

@@ -57,6 +57,18 @@ def _canonical_tensor_bytes(array):
     return prefix + a.tobytes()
 
 
+def tensor_sha256(a):
+    """SHA-256 of one tensor in the manifest's canonical form.
+
+    Canonical form is ``int32 ndim | int32[ndim] shape | little-endian
+    float32 payload``. The per-tensor hash is the same one ``save_manifest``
+    records and the C loader verifies on read; the name is deliberately not
+    included (the manifest entry carries it).
+    """
+    a = np.ascontiguousarray(np.asarray(a), dtype='<f4')
+    return hashlib.sha256(_canonical_tensor_bytes(a)).hexdigest()
+
+
 def canonical_sha256(tensors):
     """SHA-256 over tensors in name order, each in canonical form."""
     h = hashlib.sha256()
@@ -143,7 +155,7 @@ def save_manifest(output_dir, tensors, file_map=None):
             'offset': canonical_offset,
             'canonical_offset': canonical_offset,
             'length': length,
-            'sha256': hashlib.sha256(_canonical_tensor_bytes(a)).hexdigest(),
+            'sha256': tensor_sha256(a),
         }
         if file_map is not None and name in file_map:
             filename, file_offset, storage = _normalise_file_ref(

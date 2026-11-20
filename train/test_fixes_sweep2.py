@@ -2,7 +2,7 @@
 
 Covers:
   1. resume keeps the trained z_proj (active channel no longer silently dies)
-  2. config entropy_threshold aligned to 2.0 (convergence bonus actually fires)
+  2. config entropy_threshold aligned to 0.5 on the normalised H/ln(n_active) scale
   3. cog decoder.bin loads as 'cog' format with a linear readout
   4. train.py stage-3 EMA updates per codebook (no centroid collapse)
 
@@ -54,10 +54,10 @@ def test_resume_keeps_trained_z_proj():
 
 def test_entropy_threshold_aligned():
     cfg = LCMConfig()
-    assert cfg.entropy_threshold == 2.0, \
-        f"entropy_threshold={cfg.entropy_threshold}, expected 2.0 " \
-        "(0.5 made the convergence bonus dead code: fusion entropy ≈ ln(6) ≈ 1.79)"
-    print("  [PASS] config entropy_threshold == 2.0")
+    assert cfg.entropy_threshold == 0.5, \
+        f"entropy_threshold={cfg.entropy_threshold}, expected 0.5 " \
+        "(R9 normalised H/ln(n_active); make_train_step divides by ln(n_active))"
+    print("  [PASS] config entropy_threshold == 0.5 (normalised)")
 
 
 def test_cog_decoder_linear_readout():

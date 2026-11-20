@@ -21,7 +21,7 @@ import os
 import numpy as np
 
 from train.bin_format import (
-    SELF_LAYOUT_TAG, load_manifest, value_scalar_specs,
+    SELF_LAYOUT_TAG, load_manifest, tensor_sha256, value_scalar_specs,
 )
 
 
@@ -71,7 +71,20 @@ def _read_tensor(ckpt_dir, manifest, name):
         raise ValueError(
             f"{name!r}: {arr.size} floats in {file_name} but shape "
             f"{entry['shape']} needs {expected}")
-    return np.ascontiguousarray(arr.reshape(entry['shape']), dtype=np.float32)
+    shaped = np.ascontiguousarray(arr.reshape(entry['shape']),
+                                 dtype=np.float32)
+    expected_sha = entry.get('sha256')
+    if not expected_sha:
+        raise ValueError(
+            f"manifest tensor {name!r} has no sha256; schema v2 requires "
+            f"per-tensor integrity — re-export required")
+    actual_sha = tensor_sha256(shaped)
+    if actual_sha != expected_sha:
+        raise ValueError(
+            f"{name!r}: sha256 mismatch in {file_name} "
+            f"(manifest {expected_sha[:16]}…, file {actual_sha[:16]}…); "
+            f"the tensor was tampered with or the export is corrupt")
+    return shaped
 
 
 def load_lattice_memories(ckpt_dir, cfg):
@@ -99,9 +112,9 @@ def load_lattice_memories(ckpt_dir, cfg):
     ``self_rows == 1 + self_M`` is the number of rows in ``self_C``.
 
     Raises ValueError on a missing/mismatched tensor instead of silently
-    falling back to first-layer or zero data. Per-tensor sha256 verification
-    is deferred to Task 10/15; this loader relies on the manifest's
-    file/offset/length mapping and shape checks.
+    falling back to first-layer or zero data. Every ``.bin`` tensor is also
+    verified against its manifest per-tensor sha256 before it is returned;
+    pickle-stored training params are not C tensors and are rejected.
     """
     ckpt_dir = str(ckpt_dir)
     manifest = load_manifest(ckpt_dir)

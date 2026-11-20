@@ -153,14 +153,10 @@ class LCMConfig:
     # finite at 16); 16 is both the spec value and the stable one.
     max_inference_steps: int = 16
     convergence_tol: float = 1e-3
-    # 2.0 ≈ ln(7)+ε: uniform fusion entropy (≈1.95) never trips it, so the
-    # entropy gate is effectively disabled — convergence is driven by
-    # convergence_tol only. Aligned with infer/lcm.h LCM_ENTROPY_THRESHOLD.
-    # (0.5 used to make the convergence bonus in cog_train dead code: fusion
-    # entropy ≈ ln(6) ≈ 1.79 could never drop below it.) See the 3.1 audit:
-    # R9 asks for normalised H/ln(n_active) at 0.5; the JAX training path still
-    # uses this raw-nats threshold, so that item is deferred, not claimed fixed.
-    entropy_threshold: float = 2.0
+    # R9/R17: normalised fusion entropy gate, H / ln(n_active) < 0.5.
+    # `make_train_step` and the C v3 engine both interpret this as normalised
+    # entropy; the raw nats value is only kept in diagnostics.
+    entropy_threshold: float = 0.5
     max_retrievals_per_step: int = 128
 
     # Reflection loop (轨迹审计器)

@@ -55,7 +55,7 @@ import optax
 from train.behavior_explorer import BehaviorExplorer
 from train.checkpoint import load_cog_state
 from train.cog_train import (
-    RunIdentity, init_cog_params, make_train_step,
+    RunIdentity, init_cog_params, make_optimizer, make_train_step,
     resolve_dataset_identity, train_cog, _self_observe_step,
 )
 from train.config import LCMConfig
@@ -66,8 +66,9 @@ from train.feature_bank import FeatureBank
 from train.fusion import fuse_lattices_with_aux
 from train.hyp import exp_map, poincare_similarity, safe_unit
 from train.lattices import (
-    _hrq_sims, hrq_forward, hrq_top_prototype, sparse_forward,
+    _hrq_sims, hrq_forward, hrq_top_prototype, routing_gate, sparse_forward,
 )
+from train.losses import cognitive_vq_losses
 from train.narrative_memory import NarrativeMemory
 from train.observability import ObservabilityRecorder
 from train.param_groups import partition_params
@@ -75,10 +76,11 @@ from train.reflection_loop import ReflectionLoop
 from train.self_lattice import self_lattice_forward
 
 REQUIRED_REPORT_KEYS = (
-    "meta", "loss", "lattice_updates", "codebook_utilization", "ema",
-    "route", "sparse_inference", "hrq_routing", "entropy_gate",
-    "feature_bank", "safety", "self_lattice", "overhead", "persistence",
-    "checks",
+    "meta", "loss", "lattice_updates", "codebook_utilization",
+    "codebook_variance", "vq_split", "routing_hard", "observability",
+    "coverage", "ema", "route", "sparse_inference", "hrq_routing",
+    "entropy_gate", "feature_bank", "safety", "self_lattice", "overhead",
+    "persistence", "checks",
 )
 
 # Tiny preset for the unit test. It must keep every structural feature
@@ -363,19 +365,9 @@ def _ema_binding_summary(initial, final):
     }
 
 
-def _make_optimizer(cfg):
-    """The production optimizer construction (train_cog)."""
-    return optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate=1.0, b1=cfg.adam_beta1,
-                    b2=cfg.adam_beta2, eps=cfg.adam_eps,
-                    weight_decay=cfg.weight_decay),
-    )
-
-
 def _route_baseline_delta(initial_params, cfg, steps, lr):
     """C_route movement from weight decay alone (zero gradients)."""
-    optimizer = _make_optimizer(cfg)
+    optimizer = make_optimizer(cfg)
     trainable, _, _ = partition_params(initial_params)
     opt_state = optimizer.init(trainable)
     schedule = optax.cosine_decay_schedule(
@@ -388,8 +380,13 @@ def _route_baseline_delta(initial_params, cfg, steps, lr):
             lambda u, lr_i=float(schedule(i)): lr_i * u, updates)
         p = optax.apply_updates(p, updates)
     if "route" not in p:
-        return {"max_abs": 0.0, "l2": 0.0}
-    return _tree_delta(initial_params["route"], p["route"])
+        return {"full": {"max_abs": 0.0, "l2": 0.0},
+                "C_route": {"max_abs": 0.0, "l2": 0.0}}
+    full = _tree_delta(initial_params["route"], p["route"])
+    c_route = _tree_delta(
+        {"C_route": initial_params["route"]["C_route"]},
+        {"C_route": p["route"]["C_route"]})
+    return {"full": full, "C_route": c_route}
 
 
 def _normalised_entropy(weights):
@@ -400,6 +397,126 @@ def _normalised_entropy(weights):
         return 0.0, n_active
     h = -float(np.sum(w * np.log(w + 1e-12)))
     return h / math.log(n_active), n_active
+
+
+def _lattice_grad_diagnostics(cfg, params, ema, data, shape, spans, seq_len,
+                              steps):
+    """One real ``jax.grad`` of the training loss, aggregated per subtree.
+
+    The smoke's parameter-delta field alone cannot distinguish a real gradient
+    from AdamW weight decay. This diagnostic calls the production
+    ``make_train_step(..., return_grads=True)`` once on the final state and
+    reports ``‖grad_subtree‖`` for every trainable lattice. EMA-owned leaves
+    are absent from the tree by construction and are judged by N/m instead.
+    """
+    optimizer = make_optimizer(cfg)
+    trainable, _, _ = partition_params(params)
+    opt_state = optimizer.init(trainable)
+    grad_step = make_train_step(cfg, optimizer, joint=True, return_grads=True)
+    batch = _sample_batch(data, shape, spans, cfg, B=1, N=seq_len)
+    _, _, _, loss, aux = grad_step(
+        params, opt_state, ema, batch, 0.0, jax.random.PRNGKey(9876),
+        self_state=None, step=int(steps),
+        routing_bias=jnp.zeros(cfg.n_lattices))
+    jax.block_until_ready(loss)
+    grads = aux.get("grads")
+    out = {}
+    for key in ("encoder", "hrq", "lowrank", "manifold", "binding",
+                "contrast", "route", "fusion", "value_scalars"):
+        g = grads.get(key) if isinstance(grads, dict) else None
+        if g is None:
+            out[key] = {"grad_norm": None, "grad_ok": False,
+                        "grad_basis": "missing"}
+            continue
+        total = 0.0
+        for leaf in jax.tree_util.tree_leaves(g):
+            a = np.asarray(jax.device_get(leaf), dtype=np.float64)
+            if a.size:
+                total += float(np.sum(a * a))
+        norm = math.sqrt(total)
+        out[key] = {
+            "grad_norm": norm,
+            "grad_ok": bool(math.isfinite(norm) and norm > 1e-6),
+            "grad_basis": "jax.grad (clipped)",
+        }
+    for key in ("sparse", "self"):
+        out[key] = {"grad_norm": None, "grad_ok": None,
+                    "grad_basis": "EMA-owned; see N/m"}
+    return out
+
+
+def _vq_split_report(cfg, params, aux):
+    """Codebook/commitment split from the same final forward stats."""
+    stats = aux.get("loop_stats")
+    if not stats:
+        return {"pass": False, "error": "no loop_stats for VQ split"}
+    try:
+        _, parts = cognitive_vq_losses(params, stats, cfg)
+    except Exception as exc:  # pragma: no cover - diagnostic
+        return {"pass": False, "error": f"{type(exc).__name__}: {exc}"}
+    vals = {k: float(_np(v)) for k, v in parts.items()}
+    ema_cb = ("sparse_codebook", "manifold_codebook", "binding_codebook")
+    commitment = ("sparse_commitment", "manifold_commitment",
+                  "binding_commitment")
+    ema_codebook_zero = all(abs(vals.get(k, 0.0)) <= 1e-12 for k in ema_cb)
+    commitment_positive = all(vals.get(k, 0.0) > 0 for k in commitment)
+    return {
+        "values": vals,
+        "ema_codebook_loss_zero": ema_codebook_zero,
+        "commitment_loss_positive": commitment_positive,
+        "pass": bool(ema_codebook_zero and commitment_positive),
+    }
+
+
+def _routing_hard_report(cfg, params, data, shape, spans, seq_len):
+    z = _encode_z(params, _sample_batch(
+        data, shape, spans, cfg, B=2, N=seq_len)[0], cfg)
+    mask1, _, _ = routing_gate(params["route"], z, cfg.tau_route, hard=True)
+    mask2, _, _ = routing_gate(params["route"], z, cfg.tau_route, hard=True)
+    m1 = _np(mask1)
+    one_hot = bool(np.all(np.sum(np.isclose(m1, 0.0)
+                                 + np.isclose(m1, 1.0), axis=-1) == m1.shape[-1])
+                   and np.all(np.sum(m1, axis=-1) == 1))
+    deterministic = bool(np.array_equal(_np(mask1), _np(mask2)))
+    return {
+        "hard_deterministic": deterministic,
+        "one_hot": one_hot,
+        "pass": bool(deterministic and one_hot),
+    }
+
+
+def _production_step_median_ms(cfg, params, ema, data, shape, spans, seq_len,
+                               runs=20):
+    """20-run median of the production train_step, no on_step callback."""
+    optimizer = make_optimizer(cfg)
+    trainable, _, _ = partition_params(params)
+    opt_state = optimizer.init(trainable)
+    train_step = make_train_step(cfg, optimizer, joint=True)
+    batch = _sample_batch(data, shape, spans, cfg, B=1, N=seq_len)
+    bias = jnp.zeros(cfg.n_lattices)
+
+    def one(i):
+        out = train_step(
+            params, opt_state, ema, batch, 0.0, jax.random.PRNGKey(2000 + i),
+            self_state=None, step=int(i), routing_bias=bias)
+        jax.block_until_ready(out[3])
+
+    one(0)  # warmup/compile
+    times = []
+    for i in range(runs):
+        t0 = time.perf_counter()
+        one(i + 1)
+        times.append(time.perf_counter() - t0)
+    return float(np.median(times)) * 1000.0
+
+
+def _hash_arrays(*arrays):
+    import hashlib
+    h = hashlib.sha256()
+    for a in arrays:
+        h.update(np.ascontiguousarray(a, dtype=np.float32).tobytes())
+    return h.hexdigest()
+
 
 
 # ---------------------------------------------------------------------------
@@ -491,51 +608,167 @@ def _c_danger_probe(so_path):
     }
 
 
-class _AbortTokenizer:
-    def encode(self, prompt):
-        return SimpleNamespace(ids=[2])
+def _real_safety_probe(final_dir):
+    """Real v2 checkpoint -> real C v3 loop -> abort/no-token/alert/trace.
 
-    def decode(self, ids, skip_special_tokens=True):
-        return "".join(chr(0x41 + (int(i) % 26)) for i in ids)
-
-
-def _python_no_token_probe():
-    """lcm.generate must return no token when the loop returns -2."""
+    Also runs a C gvalue abort-rate probe with the exported anchors at
+    ``safety_margin_relative=0.5`` over positive, neutral and negative inputs.
+    The danger codebook and the C loop are the production ones; only the
+    encoder is patched to inject the crafted latent (a test harness, not a
+    stub of the safety path).
+    """
+    import glob
     from unittest import mock
+
     import lcm
 
-    class _AbortEngine(lcm.LCMInferEngine):
-        """Inherits the real generate() short-circuit, no C engine needed."""
+    ckpt = str(final_dir)
+    engine = lcm.LCMInferEngine(ckpt)
+    d = int(engine.d)
+    M = int(engine.danger_M)
+    threat = np.asarray(engine.danger_t, dtype=np.float32).reshape(M, d)
+    normal = np.asarray(engine.danger_n, dtype=np.float32).reshape(M, d)
+    z_threat = np.ascontiguousarray(threat[0], dtype=np.float32)
+    z_normal = np.ascontiguousarray(normal[0], dtype=np.float32)
 
-        def __init__(self, d=256):
-            self.d = d
-            self.V = 8
-            self.max_seq_len = 8
-            self.n_heads = 1
-            self.tokenizer = _AbortTokenizer()
-            self.encoder = None
-            self.decoder = {
-                "format": "cog", "w_out": np.zeros((d, 8), np.float32)}
-            self._pred_enabled = False
-            self.pred = None
-            self._last_agency_mod = {"tension": 0.0, "explore": 0.0}
-            self._last_loop_ret = 0
+    trace_dir = Path.cwd() / "infer" / "traces"
+    before = set(glob.glob(str(trace_dir / "lcm_v3_*.json")))
 
-        def cognitive_loop(self, z, **kwargs):
-            self._last_loop_ret = -2
-            return np.zeros(self.d, np.float32), False
+    engine._alerts.clear()
+    engine._last_loop_ret = 0
+    _, conv = engine.cognitive_loop(z_threat, max_steps=4, use_safety=False)
+    direct_ret = int(engine._last_loop_ret)
+    direct_alerts = list(engine._alerts)
+    direct_source = (direct_alerts[-1]['conflict_source']
+                     if direct_alerts else None)
 
-    eng = _AbortEngine()
-    z = np.zeros(eng.d, np.float32)
-    z[0] = 1.0
-    with mock.patch.object(lcm, "_encoder_full_with_state",
-                           lambda *a, **k: (z.copy(), None)):
-        tokens = list(eng.generate("hello", max_new=1, use_safety=False))
+    engine._alerts.clear()
+    engine._last_loop_ret = 0
+    with mock.patch.object(
+            lcm, "_encoder_full_with_state",
+            lambda *a, **k: (z_threat.copy(), None)):
+        tokens = list(engine.generate("hello", max_new=1, use_safety=False))
+    gen_ret = int(engine._last_loop_ret)
+    gen_alerts = list(engine._alerts)
+    gen_source = gen_alerts[-1]['conflict_source'] if gen_alerts else None
+    after = set(glob.glob(str(trace_dir / "lcm_v3_*.json")))
+    trace_written = len(after - before) > 0
+
+    # Same exported checkpoint, normal row: informational, not a pass gate.
+    engine._alerts.clear()
+    engine._last_loop_ret = 0
+    _, normal_conv = engine.cognitive_loop(
+        z_normal, max_steps=4, use_safety=False)
+    normal_ret = int(engine._last_loop_ret)
+    normal_source = (engine._alerts[-1]['conflict_source']
+                     if engine._alerts else None)
+
+    # ── C gvalue strict-margin probe (real exported anchors) ────────────────
+    so_path = Path(__file__).resolve().parent.parent / "infer" / "liblcm.so"
+    gv_report = {"available": False}
+    try:
+        ctypes.CDLL("libm.so.6", mode=ctypes.RTLD_GLOBAL)
+        lib = ctypes.CDLL(str(so_path))
+        n_pairs = 4
+        class _GValue(ctypes.Structure):
+            _fields_ = [
+                ("C_pos", ctypes.c_float * (n_pairs * d)),
+                ("C_neg", ctypes.c_float * (n_pairs * d)),
+                ("D", ctypes.c_int),
+                ("integrity_hash", ctypes.c_char * 65),
+            ]
+        lib.gvalue_init.argtypes = [
+            ctypes.POINTER(_GValue), ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_float), ctypes.c_int]
+        lib.gvalue_init.restype = None
+        lib.detect_any_conflict.argtypes = [
+            ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int), ctypes.c_float, ctypes.c_float,
+            ctypes.c_int, ctypes.POINTER(_Conflict)]
+        lib.detect_any_conflict.restype = ctypes.c_bool
+
+        def ptr(arr):
+            return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+        C_pos = np.ascontiguousarray(
+            np.asarray(engine.gv_pos, np.float32).reshape(n_pairs, d))
+        C_neg = np.ascontiguousarray(
+            np.asarray(engine.gv_neg, np.float32).reshape(n_pairs, d))
+        gv = _GValue()
+        lib.gvalue_init(ctypes.byref(gv), ptr(C_pos), ptr(C_neg), d)
+
+        rng = np.random.default_rng(0)
+        eye = np.eye(d, dtype=np.float32)
+        pos = [0.9 * eye[i] for i in range(n_pairs)]
+        neg = [-0.9 * eye[i] for i in range(n_pairs)]
+        neutral = []
+        for _ in range(n_pairs):
+            v = rng.standard_normal(d).astype(np.float32)
+            neutral.append(v / (np.linalg.norm(v) + 1e-12))
+        counts = (ctypes.c_int * 8)(*([0] * 8))
+
+        def classify(z):
+            c = _Conflict()
+            blocked = bool(lib.detect_any_conflict(
+                ptr(z), ptr(z), 0, None, ctypes.cast(
+                    ctypes.byref(gv), ctypes.c_void_p),
+                counts, 1.0, 0.5, 16, ctypes.byref(c)))
+            return blocked, int(c.source)
+
+        def rate(items, expect_blocked):
+            results = [classify(z) for z in items]
+            blocked = sum(1 for b, _ in results if b)
+            if expect_blocked:
+                return blocked / len(results), results
+            return (len(results) - blocked) / len(results), results
+
+        pos_rate, pos_res = rate(pos, expect_blocked=False)
+        neu_rate, neu_res = rate(neutral, expect_blocked=True)
+        neg_rate, neg_res = rate(neg, expect_blocked=True)
+        gv_report = {
+            "available": True,
+            "n": 3 * n_pairs,
+            "margin": 0.5,
+            "positive_safe_rate": pos_rate,
+            "neutral_abort_rate": neu_rate,
+            "negative_abort_rate": neg_rate,
+            "sources": {
+                "positive": sorted({s for _, s in pos_res}),
+                "neutral": sorted({s for _, s in neu_res}),
+                "negative": sorted({s for _, s in neg_res}),
+            },
+            "pass": bool(pos_rate == 1.0 and neu_rate == 1.0
+                         and neg_rate == 1.0),
+        }
+    except Exception as exc:  # pragma: no cover - diagnostic
+        gv_report = {"available": False,
+                     "error": f"{type(exc).__name__}: {exc}"}
+
     return {
+        "engine_loaded": True,
         "abort_code": int(getattr(lcm, "CONFLICT_ABORT_TOKEN", -2)),
-        "loop_ret": int(eng._last_loop_ret),
+        "direct_loop_ret": direct_ret,
+        "direct_loop_converged": bool(conv),
+        "direct_loop_source": direct_source,
+        "generate_ret": gen_ret,
         "tokens_emitted": len(tokens),
-        "no_token": len(tokens) == 0 and int(eng._last_loop_ret) == -2,
+        "alert_fired": bool(gen_alerts),
+        "alert_source": gen_source,
+        "alert_detail": (gen_alerts[-1].get("conflict_detail", "")
+                         if gen_alerts else ""),
+        "trace_written": trace_written,
+        "normal_input_ret": normal_ret,
+        "normal_input_converged": bool(normal_conv),
+        "normal_input_source": normal_source,
+        "gvalue_probe": gv_report,
+        "pass": bool(
+            gen_ret == int(getattr(lcm, "CONFLICT_ABORT_TOKEN", -2))
+            and len(tokens) == 0
+            and gen_source == "CONFLICT_DANGER"
+            and bool(gen_alerts)
+            and trace_written
+            and gv_report.get("pass")),
     }
 
 
@@ -618,7 +851,7 @@ def _persistence_probe(final_dir, final_params, final_ema, final_banks,
     # freshly initialised optimizer. Optimizer state is not part of the
     # checkpoint contract (R10 says params/EMA/buffers), so using the same fresh
     # optimizer on both sides is what isolates save/load losslessness.
-    optimizer = _make_optimizer(cfg)
+    optimizer = make_optimizer(cfg)
     train_step = make_train_step(cfg, optimizer, joint=True)
     try:
         b1 = _sample_batch(data, shape, spans, cfg, B=1, N=seq_len)
@@ -662,6 +895,7 @@ def _persistence_probe(final_dir, final_params, final_ema, final_banks,
             old_error = str(exc)
 
     return {
+        "sampling_ok": bool(b1 is not None and b2 is not None),
         "params_roundtrip_max_abs_err": float(params_err),
         "ema_roundtrip_max_abs_err": float(ema_err),
         "bank_roundtrip_max_abs_err": float(bank_err),
@@ -674,7 +908,8 @@ def _persistence_probe(final_dir, final_params, final_ema, final_banks,
             "(R10: params/EMA/buffers). Both sides use a fresh optimizer, so "
             "the comparison tests state round-trip, not AdamW continuity."),
         "pass": bool(
-            params_err < 1e-6 and ema_err < 1e-6 and bank_err < 1e-6
+            b1 is not None and b2 is not None
+            and params_err < 1e-6 and ema_err < 1e-6 and bank_err < 1e-6
             and two_step_params < 1e-6 and two_step_ema < 1e-6
             and old_rejected),
     }
@@ -711,6 +946,10 @@ def run_smoke(*, steps, data, shape, spans, output,
     init_params, _ = init_cog_params(
         cfg, init_rng, qwen_ckpt=qwen_ckpt, resume=None)
     init_ema = init_ema_state(init_params, cfg)
+    from train.gvalue import make_global_value_vectors
+    _gv_pos0, _gv_neg0 = make_global_value_vectors(int(cfg.d_model))
+    gv_hash_start = _hash_arrays(_np(_gv_pos0), _np(_gv_neg0))
+    danger0 = None
 
     tracker = _UtilTracker()
     losses = []
@@ -736,10 +975,14 @@ def run_smoke(*, steps, data, shape, spans, output,
 
     def on_step(abs_step, loss, aux, params, ema_state, feature_bank,
                 contrast_bank, contrast_last_used, step_time_ms):
+        nonlocal danger0
         losses.append(float(loss))
         step_times_ms.append(float(step_time_ms))
         callback_times.append(time.perf_counter())
         is_safe_steps.append(bool(_np(aux.get("is_safe", True))))
+        if abs_step == 0 and "danger" in params:
+            danger0 = {k: np.array(_np(v), copy=True)
+                       for k, v in params["danger"].items()}
         mask = _np(aux.get("soft_mask"))
         if mask.ndim >= 1 and mask.size:
             soft_masks.append(mask.reshape(-1) if mask.ndim == 1 else mask[0])
@@ -887,9 +1130,36 @@ def run_smoke(*, steps, data, shape, spans, output,
         "threshold": 0.10,
         "per_lattice": utilization_per_lattice,
         "pass": bool(all(v["pass"] for v in utilization_per_lattice.values())),
+        "hrq_scope": ("top codebook only; fine-layer selections are not "
+                      "tracked by this smoke"),
         "note": ("Design §6.3 A: at least 10% of each codebook selected once "
                  "in 100 steps. Batch=1 gives at most 100 selections per "
                  "lattice, so this is the strictest possible reading."),
+    }
+
+    # R3/§6.3 A: real jax.grad per trainable subtree. Param deltas alone can
+    # be produced by AdamW weight decay, so they stay as a secondary field.
+    try:
+        grad_report = _lattice_grad_diagnostics(
+            cfg, fp, fe, data, shape, spans, seq_len, steps)
+    except Exception as exc:  # pragma: no cover - diagnostic
+        grad_report = {key: {"grad_norm": None, "grad_ok": False,
+                             "grad_basis": f"error: {type(exc).__name__}: {exc}"}
+                       for key in ("encoder", "hrq", "lowrank", "manifold",
+                                   "binding", "contrast", "route", "fusion",
+                                   "value_scalars", "sparse", "self")}
+    for key, info in grad_report.items():
+        lattice_updates.setdefault(key, {}).update(info)
+
+    var_values = [v.get("codebook_variance_ok") for v in lattice_updates.values()
+                  if "codebook_variance_ok" in v]
+    codebook_variance = {
+        "threshold": 0.5,
+        "per_lattice": {k: v.get("codebook_variance_ratio")
+                        for k, v in lattice_updates.items()
+                        if "codebook_variance_ratio" in v},
+        "pass": bool(var_values and all(var_values)),
+        "note": "final variance / initial variance >= 0.5",
     }
 
     # ── EMA ─────────────────────────────────────────────────────────────────
@@ -903,15 +1173,25 @@ def run_smoke(*, steps, data, shape, spans, output,
     ema["pass"] = bool(ema) and all(v["changed"] for v in ema.values())
 
     # ── Route baseline ──────────────────────────────────────────────────────
-    route_actual = _tree_delta(init_params["route"], fp["route"])
+    route_full = _tree_delta(init_params["route"], fp["route"])
+    route_c = _tree_delta(
+        {"C_route": init_params["route"]["C_route"]},
+        {"C_route": fp["route"]["C_route"]})
     route_baseline = _route_baseline_delta(init_params, cfg, steps, lr)
     route = {
-        "C_route_delta_max_abs": float(route_actual["max_abs"]),
-        "C_route_delta_l2": float(route_actual["l2"]),
-        "weight_decay_only_delta_max_abs": float(route_baseline["max_abs"]),
-        "weight_decay_only_delta_l2": float(route_baseline["l2"]),
+        "C_route_delta_max_abs": float(route_c["max_abs"]),
+        "C_route_delta_l2": float(route_c["l2"]),
+        "full_route_delta_max_abs": float(route_full["max_abs"]),
+        "full_route_delta_l2": float(route_full["l2"]),
+        "weight_decay_only_C_route_delta_max_abs": float(
+            route_baseline["C_route"]["max_abs"]),
+        "weight_decay_only_C_route_delta_l2": float(
+            route_baseline["C_route"]["l2"]),
+        "weight_decay_only_full_route_delta_max_abs": float(
+            route_baseline["full"]["max_abs"]),
         "beats_weight_decay_baseline": bool(
-            route_actual["max_abs"] > route_baseline["max_abs"]),
+            route_c["max_abs"] > route_baseline["C_route"]["max_abs"]),
+        "metric_scope": "C_route only; W_route is reported separately",
         "note": ("Baseline runs the same AdamW/cosine schedule with zero "
                  "gradients for the same number of steps."),
     }
@@ -1071,8 +1351,9 @@ def run_smoke(*, steps, data, shape, spans, output,
             "peaked_passes_0.5": bool(h_peaked < 0.5),
             "uniform_fails_0.5": bool(h_uniform >= 0.5),
             "threshold": 0.5,
-            "training_convergence_uses_raw_nats_threshold": float(
-                cfg.entropy_threshold),
+            "training_convergence_gate_interpreted_as_normalized": True,
+            "training_convergence_threshold": float(cfg.entropy_threshold),
+            "real_mask_required": True,
         }
         if soft_masks:
             real_mask = jnp.asarray(soft_masks[-1][None, :])
@@ -1084,9 +1365,16 @@ def run_smoke(*, steps, data, shape, spans, output,
                 "real_mask_n_active": n_real,
                 "real_mask_passes_0.5": bool(h_real < 0.5),
             })
+        else:
+            entropy_report.update({
+                "real_mask_H_norm": None,
+                "real_mask_passes_0.5": False,
+                "real_mask_error": "no soft_mask recorded",
+            })
         entropy_report["pass"] = bool(
             entropy_report["peaked_passes_0.5"]
-            and entropy_report["uniform_fails_0.5"])
+            and entropy_report["uniform_fails_0.5"]
+            and entropy_report["real_mask_passes_0.5"])
     except Exception as exc:  # pragma: no cover
         entropy_report["error"] = f"{type(exc).__name__}: {exc}"
 
@@ -1129,6 +1417,10 @@ def run_smoke(*, steps, data, shape, spans, output,
                     and np.all(state2["N"] + state2["m"].sum(axis=1) == 0))
         sparse_ok = bool(replaced_s == 5 and cold)
         bank_report = {
+            "synthetic_probe": True,
+            "synthetic_note": (
+                "constructed 8-d FeatureBank and 5 injected dead rows; this is "
+                "the replacement policy test, not a 100-step training event"),
             "contrast_dead_injected": 5,
             "contrast_replaced": replaced,
             "contrast_used_farthest_point": farthest_correct,
@@ -1143,15 +1435,36 @@ def run_smoke(*, steps, data, shape, spans, output,
 
     # ── Safety ──────────────────────────────────────────────────────────────
     so_path = Path(__file__).resolve().parent.parent / "infer" / "liblcm.so"
+    gv_pos_end, gv_neg_end = make_global_value_vectors(int(cfg.d_model))
+    gv_hash_end = _hash_arrays(_np(gv_pos_end), _np(gv_neg_end))
+    danger_final = fp.get("danger", {}) if isinstance(fp, dict) else {}
+    danger_unchanged = bool(
+        danger0 is not None
+        and set(danger0) == set(danger_final)
+        and all(np.array_equal(danger0[k], _np(danger_final[k]))
+                for k in danger0))
     safety = {
         "training_is_safe_all_steps": bool(
             is_safe_steps and all(is_safe_steps)),
         "training_is_safe_fraction": (float(np.mean(is_safe_steps))
                                       if is_safe_steps else None),
+        "safety_oracle": False,
+        "training_safe_note": (
+            "Stage-2 training has no gvalue/danger oracle; aux['is_safe'] is "
+            "hardcoded True except for non-finite loss. This is not a safety "
+            "verdict."),
         "structural_placeholder_note": (
             "gvalue/danger are structural placeholders built from fixed "
             "anchors and the first batch's z. They exercise the trigger chain; "
             "they do not establish semantic safety."),
+        "frozen_hashes": {
+            "gvalue_hash_start": gv_hash_start,
+            "gvalue_hash_end": gv_hash_end,
+            "gvalue_unchanged": gv_hash_start == gv_hash_end,
+            "danger_changed_after_init": not danger_unchanged,
+            "danger_unchanged_after_init": danger_unchanged,
+            "danger_window": "from the post-step-0 snapshot to the final step",
+        },
     }
     if so_path.exists():
         try:
@@ -1162,11 +1475,22 @@ def run_smoke(*, steps, data, shape, spans, output,
     else:
         safety["c_danger_probe"] = {
             "available": False, "error": f"{so_path} not built"}
-    try:
-        safety["python_no_token_probe"] = _python_no_token_probe()
-    except Exception as exc:  # pragma: no cover
-        safety["python_no_token_probe"] = {
-            "error": f"{type(exc).__name__}: {exc}"}
+    if int(cfg.d_model) == 256 and so_path.exists():
+        try:
+            safety["real_checkpoint_probe"] = _real_safety_probe(final_dir)
+        except Exception as exc:  # pragma: no cover - diagnostic
+            safety["real_checkpoint_probe"] = {
+                "engine_loaded": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "pass": False,
+            }
+    else:
+        safety["real_checkpoint_probe"] = {
+            "engine_loaded": False,
+            "skipped": ("the C engine is compiled for LCM_D=256; this smoke "
+                        f"uses d_model={cfg.d_model}"),
+            "pass": False,
+        }
     try:
         safety["gvalue"] = _gvalue_probe()
     except Exception as exc:  # pragma: no cover
@@ -1176,21 +1500,25 @@ def run_smoke(*, steps, data, shape, spans, output,
     except Exception as exc:  # pragma: no cover
         safety["export"] = {"error": f"{type(exc).__name__}: {exc}"}
     c_probe = safety.get("c_danger_probe", {})
-    no_token = safety.get("python_no_token_probe", {})
+    real = safety.get("real_checkpoint_probe", {})
     export = safety.get("export", {})
     gv = safety.get("gvalue", {})
+    frozen = safety.get("frozen_hashes", {})
+    safety["gvalue_abort_rate"] = real.get("gvalue_probe", {})
     safety["pass"] = bool(
         safety["training_is_safe_all_steps"]
         and c_probe.get("threat_blocked")
         and c_probe.get("neutral_blocked") is False
         and c_probe.get("constructed_codebooks_distinct")
         and c_probe.get("hash_stable")
-        and no_token.get("no_token")
+        and real.get("pass")
         and gv.get("pos_neg_distinct")
         and gv.get("strict_neutral_violates")
         and gv.get("verify_integrity")
         and export.get("gvalue_pos_neg_distinct")
         and export.get("danger_threat_normal_distinct")
+        and frozen.get("gvalue_unchanged")
+        and frozen.get("danger_unchanged_after_init")
     )
 
     # ── Self bias ───────────────────────────────────────────────────────────
@@ -1225,21 +1553,58 @@ def run_smoke(*, steps, data, shape, spans, output,
     except Exception as exc:  # pragma: no cover
         self_report["error"] = f"{type(exc).__name__}: {exc}"
 
+    # ── Codebook / commitment split (R18) ──────────────────────────────────
+    try:
+        vq_split = _vq_split_report(cfg, fp, final.get("aux") or {})
+    except Exception as exc:  # pragma: no cover
+        vq_split = {"pass": False,
+                    "error": f"{type(exc).__name__}: {exc}"}
+
+    # ── Routing hard (R19) ─────────────────────────────────────────────────
+    try:
+        routing_hard = _routing_hard_report(
+            cfg, fp, data, shape, spans, seq_len)
+    except Exception as exc:  # pragma: no cover
+        routing_hard = {"pass": False,
+                        "error": f"{type(exc).__name__}: {exc}"}
+
+    # ── Black-box observability (R16/e.md) ─────────────────────────────────
+    obs_handle = getattr(train_cog, "last_observability", None)
+    n_records = len(obs_handle.ring) if obs_handle is not None else 0
+    long_term_records = (len(obs_handle.long_term)
+                         if obs_handle is not None else 0)
+    observability = {
+        "raw_records": int(n_records),
+        "long_term_records": int(long_term_records),
+        "expected_records": int(steps),
+        "pass": bool(n_records == int(steps)),
+        "errors": dict(getattr(obs_handle, "errors", {}))
+        if obs_handle is not None else {},
+    }
+
     # ── Self-observation overhead ───────────────────────────────────────────
     overhead = {}
     try:
-        # train_cog's step_time_ms measures jitted dispatch, not device
-        # completion (JAX is asynchronous). Use the delta between consecutive
-        # post-step callbacks instead: each callback starts only after the
-        # previous callback's device syncs, so the delta is real wall-clock for
-        # one complete step + observation + bank/host work.
+        # Production step time, measured without the smoke's on_step callback
+        # and with block_until_ready. Callback-to-callback intervals are kept
+        # only as a reference.
         intervals_ms = (np.diff(np.asarray(callback_times)) * 1000.0
                         if len(callback_times) >= 2 else np.array([]))
-        step_median_ms = (float(np.median(intervals_ms))
-                          if intervals_ms.size else None)
+        callback_interval_ms = (float(np.median(intervals_ms))
+                                if intervals_ms.size else None)
         dispatch_median_ms = (float(np.median(
             [t for t in step_times_ms if t > 0]))
             if any(t > 0 for t in step_times_ms) else None)
+        production_step_ms = None
+        production_error = None
+        try:
+            production_step_ms = _production_step_median_ms(
+                cfg, fp, fe, data, shape, spans, seq_len, runs=20)
+        except Exception as exc:  # pragma: no cover - diagnostic
+            production_error = f"{type(exc).__name__}: {exc}"
+        step_median_ms = (production_step_ms
+                          if production_step_ms is not None
+                          else callback_interval_ms)
         obs = ObservabilityRecorder(
             raw_capacity=1000, long_term_capacity=10000,
             record_every_n=1, long_term_every=100)
@@ -1264,16 +1629,19 @@ def run_smoke(*, steps, data, shape, spans, output,
             "runs": 20,
             "observation_median_ms": obs_median_s * 1000.0,
             "training_step_median_ms": step_median_ms,
+            "production_step_median_ms": production_step_ms,
+            "production_step_error": production_error,
+            "callback_interval_median_ms": callback_interval_ms,
             "dispatch_median_ms_reference": dispatch_median_ms,
             "overhead_fraction": frac,
             "under_5pct": (bool(frac is not None and frac < 0.05)),
             "method": ("20-run median wall-clock of the real "
-                       "_self_observe_step path divided by the median "
-                       "callback-to-callback training-step interval. The "
-                       "latter is device-synced wall-clock; train_cog's own "
-                       "step_time_ms is only dispatch time. The first JIT "
-                       "step is excluded because its callback precedes any "
-                       "steady-state interval."),
+                       "_self_observe_step path divided by a 20-run median of "
+                       "the production train_step measured without the smoke "
+                       "on_step callback and with jax.block_until_ready per "
+                       "run. The callback interval is only a reference. The "
+                       "first JIT step is a warmup, not a measurement."),
+            "on_step_excluded": True,
         }
         try:
             reflection.wait(timeout=10.0)
@@ -1291,26 +1659,74 @@ def run_smoke(*, steps, data, shape, spans, output,
                        "error": f"{type(exc).__name__}: {exc}"}
 
     # ── Checks summary ──────────────────────────────────────────────────────
+    trainable_keys = [k for k, v in grad_report.items()
+                      if v.get("grad_ok") is not None]
+    grad_ok = bool(trainable_keys and all(
+        grad_report[k]["grad_ok"] for k in trainable_keys))
+    ema_required = [k for k in ("sparse", "manifold", "binding", "self")
+                    if k in ema]
+    ema_ok = bool(ema_required and all(
+        ema[k]["changed"] for k in ema_required))
     checks = {
         "loss_all_finite": loss_report["all_finite"],
         "loss_decreased": loss_report["decreased_below_0.8"],
-        "all_lattices_updated": bool(all(
-            v.get("updated_gt_1e-6", False)
-            for k, v in lattice_updates.items()
-            if k in ("encoder", "hrq", "sparse", "lowrank", "manifold",
-                     "binding", "contrast", "route", "fusion", "self",
-                     "value_scalars"))),
-        "ema_changed": ema.get("pass", False),
+        "grad_norms_gt_1e-6": grad_ok,
+        "ema_statistics_changed": ema_ok,
+        "all_lattices_updated": bool(grad_ok and ema_ok),
         "codebook_utilization_10pct": codebook_utilization["pass"],
+        "codebook_variance_50pct": codebook_variance["pass"],
+        "vq_codebook_commitment_split": vq_split.get("pass", False),
+        "routing_hard_deterministic": routing_hard.get("pass", False),
+        "hrq_inactive_lfq_disabled": sparse_report.get(
+            "lfq_disabled_without_c_top", False),
         "route_beats_weight_decay": route["beats_weight_decay_baseline"],
         "sparse_lfq": sparse_report.get("pass", False),
         "hrq_value_routing": hrq_route.get("pass", False),
         "entropy_gate": entropy_report.get("pass", False),
         "feature_bank": bank_report.get("pass", False),
         "safety_chain": safety.get("pass", False),
+        "frozen_safety_hash": bool(
+            safety.get("frozen_hashes", {}).get("gvalue_unchanged")
+            and safety.get("frozen_hashes", {}).get(
+                "danger_unchanged_after_init")),
+        "observability_records": observability.get("pass", False),
         "self_bias": self_report.get("pass", False),
         "overhead_under_5pct": overhead.get("under_5pct", False),
         "persistence": persistence.get("pass", False),
+    }
+
+    coverage = {
+        "codebook_commitment_split": {
+            "smoke": "vq_codebook_commitment_split",
+            "test": ("train/test_vq_losses.py::"
+                     "test_ema_codebook_loss_skipped_but_commitment_trains_r"),
+        },
+        "binding_unbind_roundtrip": {
+            "smoke": None,
+            "test": ("train/test_binding_unbind.py::"
+                     "test_unbind_recovers_value_code"),
+        },
+        "routing_hard_determinism": {
+            "smoke": "routing_hard_deterministic",
+            "test": "train/test_vq_losses.py::test_routing_hard_is_deterministic",
+        },
+        "hrq_inactive_sparse_lfq_disabled": {
+            "smoke": "hrq_inactive_lfq_disabled",
+            "test": "train/test_sparse_lfq.py::test_no_lfq_without_c_top",
+        },
+        "codebook_variance": {
+            "smoke": "codebook_variance_50pct",
+            "test": None,
+        },
+        "gvalue_danger_hash_unchanged": {
+            "smoke": "frozen_safety_hash",
+            "test": None,
+        },
+        "observability_step_records": {
+            "smoke": "observability_records",
+            "test": ("train/test_self_awareness_wiring.py:"
+                     "black-box recording tests"),
+        },
     }
 
     report = {
@@ -1354,6 +1770,11 @@ def run_smoke(*, steps, data, shape, spans, output,
         "loss": loss_report,
         "lattice_updates": lattice_updates,
         "codebook_utilization": codebook_utilization,
+        "codebook_variance": codebook_variance,
+        "vq_split": vq_split,
+        "routing_hard": routing_hard,
+        "observability": observability,
+        "coverage": coverage,
         "ema": ema,
         "route": route,
         "sparse_inference": sparse_report,
@@ -1447,9 +1868,9 @@ def _markdown(report):
         f"finite={_fmt(loss['all_finite'])}, "
         f"<0.8={_fmt(loss['decreased_below_0.8'])}")
     lines.append("")
-    lines.append("## Per-lattice updates\n")
-    lines.append("| lattice | Δmax abs | updated>1e-6 | utilisation | var ratio |")
-    lines.append("|---|---|---|---|---|")
+    lines.append("## Per-lattice updates and gradients\n")
+    lines.append("| lattice | grad norm | grad>1e-6 | Δmax abs (secondary) | var ratio | utilisation |")
+    lines.append("|---|---|---|---|---|---|")
     for key in ("encoder", "hrq", "sparse", "lowrank", "manifold",
                 "binding", "contrast", "route", "fusion", "self",
                 "value_scalars"):
@@ -1457,9 +1878,51 @@ def _markdown(report):
         u = e.get("utilization", {})
         uf = u.get("mean_fraction") if isinstance(u, dict) else None
         lines.append(
-            f"| {key} | {_fmt(e.get('param_delta_max_abs'))} | "
-            f"{_fmt(e.get('updated_gt_1e-6'))} | "
-            f"{_fmt(uf, 3)} | {_fmt(e.get('codebook_variance_ratio'), 3)} |")
+            f"| {key} | {_fmt(e.get('grad_norm'))} | "
+            f"{_fmt(e.get('grad_ok'))} | "
+            f"{_fmt(e.get('param_delta_max_abs'))} | "
+            f"{_fmt(e.get('codebook_variance_ratio'), 3)} | "
+            f"{_fmt(uf, 3)} |")
+    lines.append("")
+    lines.append("### Coverage table (design §6.3)\n")
+    lines.append("| item | smoke | focused test |")
+    lines.append("|---|---|---|")
+    for name, entry in report["coverage"].items():
+        lines.append(
+            f"| {name} | {_fmt(entry.get('smoke'))} | "
+            f"{_fmt(entry.get('test'))} |")
+    lines.append("")
+    lines.append("## Codebook variance (final/initial ≥ 0.5)\n")
+    lines.append("| lattice | ratio |")
+    lines.append("|---|---|")
+    for name, ratio in report["codebook_variance"]["per_lattice"].items():
+        lines.append(f"| {name} | {_fmt(ratio, 4)} |")
+    lines.append(f"\nResult: {_fmt(report['codebook_variance']['pass'])}")
+    lines.append("")
+    lines.append("## Codebook / commitment split (R18)\n")
+    vq = report["vq_split"]
+    lines.append(
+        f"- EMA codebook loss zero: {_fmt(vq.get('ema_codebook_loss_zero'))}")
+    lines.append(
+        f"- commitment loss positive: {_fmt(vq.get('commitment_loss_positive'))}")
+    for key, value in (vq.get("values") or {}).items():
+        if key.endswith(("_codebook", "_commitment")):
+            lines.append(f"- `{key}`: {_fmt(value)}")
+    lines.append(f"- pass: {_fmt(vq.get('pass'))}")
+    lines.append("")
+    lines.append("## Routing hard (R19)\n")
+    rh = report["routing_hard"]
+    lines.append(f"- deterministic: {_fmt(rh.get('hard_deterministic'))}")
+    lines.append(f"- one-hot: {_fmt(rh.get('one_hot'))}")
+    lines.append(f"- pass: {_fmt(rh.get('pass'))}")
+    lines.append("")
+    lines.append("## Observability (R16)\n")
+    ob = report["observability"]
+    lines.append(
+        f"- raw records: {ob.get('raw_records')}/{ob.get('expected_records')} "
+        f"(long-term {ob.get('long_term_records')})")
+    lines.append(f"- errors: {ob.get('errors')}")
+    lines.append(f"- pass: {_fmt(ob.get('pass'))}")
     lines.append("")
     lines.append("## Codebook utilisation (design §6.3 A: ≥10%)\n")
     lines.append("| lattice | unique/M | pass |")
@@ -1483,8 +1946,11 @@ def _markdown(report):
     r = report["route"]
     lines.append(
         f"C_route Δmax {_fmt(r['C_route_delta_max_abs'])} vs weight-decay-only "
-        f"{_fmt(r['weight_decay_only_delta_max_abs'])} → "
+        f"{_fmt(r['weight_decay_only_C_route_delta_max_abs'])} → "
         f"{_fmt(r['beats_weight_decay_baseline'])}")
+    lines.append(
+        f"Full route tree Δmax {_fmt(r.get('full_route_delta_max_abs'))} "
+        f"({r.get('metric_scope')})")
     lines.append("")
     lines.append("## Sparse / LFQ\n")
     sp = report["sparse_inference"]
@@ -1514,21 +1980,39 @@ def _markdown(report):
     s = report["safety"]
     lines.append(
         f"- training is_safe all steps: "
-        f"{_fmt(s.get('training_is_safe_all_steps'))}")
+        f"{_fmt(s.get('training_is_safe_all_steps'))} "
+        f"(oracle={s.get('safety_oracle')}; {s.get('training_safe_note')})")
     cp = s.get("c_danger_probe", {})
     lines.append(
-        f"- C danger probe: blocked={_fmt(cp.get('threat_blocked'))}, "
+        f"- synthetic C danger probe: blocked={_fmt(cp.get('threat_blocked'))}, "
         f"neutral_blocked={_fmt(cp.get('neutral_blocked'))}, "
         f"source={cp.get('threat_source')}, hash_stable="
         f"{_fmt(cp.get('hash_stable'))}")
-    nt = s.get("python_no_token_probe", {})
+    real = s.get("real_checkpoint_probe", {})
     lines.append(
-        f"- Python abort: ret={nt.get('loop_ret')}, "
-        f"tokens={nt.get('tokens_emitted')}, no_token="
-        f"{_fmt(nt.get('no_token'))}")
+        f"- real checkpoint C loop: ret={real.get('direct_loop_ret')}, "
+        f"generate_ret={real.get('generate_ret')}, "
+        f"tokens={real.get('tokens_emitted')}, "
+        f"alert={_fmt(real.get('alert_fired'))} "
+        f"({real.get('alert_source')}), trace={_fmt(real.get('trace_written'))}")
+    lines.append(
+        f"- normal input through the real loop: ret={real.get('normal_input_ret')}, "
+        f"source={real.get('normal_input_source')} (informational; the danger "
+        f"codebook is a structural placeholder)")
+    gvc = s.get("gvalue_abort_rate", {})
+    lines.append(
+        f"- C gvalue margin=0.5: pos_safe={_fmt(gvc.get('positive_safe_rate'))}, "
+        f"neutral_abort={_fmt(gvc.get('neutral_abort_rate'))}, "
+        f"negative_abort={_fmt(gvc.get('negative_abort_rate'))}, "
+        f"n={gvc.get('n')}")
+    fh = s.get("frozen_hashes", {})
+    lines.append(
+        f"- frozen hashes: gvalue unchanged={_fmt(fh.get('gvalue_unchanged'))}, "
+        f"danger unchanged after step 0="
+        f"{_fmt(fh.get('danger_unchanged_after_init'))}")
     gv = s.get("gvalue", {})
     lines.append(
-        f"- gvalue: pos≠neg={_fmt(gv.get('pos_neg_distinct'))}, "
+        f"- JAX gvalue: pos≠neg={_fmt(gv.get('pos_neg_distinct'))}, "
         f"strict neutral violates={_fmt(gv.get('strict_neutral_violates'))}, "
         f"integrity={_fmt(gv.get('verify_integrity'))}")
     ex = s.get("export", {})
@@ -1548,8 +2032,9 @@ def _markdown(report):
     oh = report["overhead"]
     lines.append(
         f"- observation median {_fmt(oh.get('observation_median_ms'), 3)} ms; "
-        f"train_step median {_fmt(oh.get('training_step_median_ms'), 3)} ms; "
-        f"overhead {_fmt((oh.get('overhead_fraction') or 0) * 100, 2)}% "
+        f"production train_step median "
+        f"{_fmt(oh.get('production_step_median_ms'), 3)} ms; "
+        f"overhead {_fmt((oh.get('overhead_fraction') or 0) * 100, 3)}% "
         f"(<5%: {_fmt(oh.get('under_5pct'))})")
     lines.append(f"- {oh.get('method', '')}")
     lines.append("")
@@ -1572,11 +2057,20 @@ def _markdown(report):
     lines.append(
         "- 100 steps do not prove language ability; only conformance.\n"
         "- gvalue/danger codebooks are structural placeholders, not semantic "
-        "safety anchors.\n"
-        "- The entropy gate is verified on crafted softmasks; the real training "
-        "mask result is reported above without being forced to pass.\n"
-        "- JAX training still uses a raw-nats entropy threshold; R9's "
-        "normalised gate is implemented in the C engine and in this probe.\n")
+        "safety anchors. The real C loop is exercised, but its normal-input "
+        "abort result is informational, not a safety guarantee.\n"
+        "- The entropy gate includes the real training mask in its verdict; "
+        "a crafted gate pass alone is not enough.\n"
+        "- Per-tensor manifest sha256 is verified for .bin tensors; pickle "
+        "training params are not C tensors and are rejected by the loader.\n"
+        "- Feature-bank replacement is a synthetic policy probe, not a "
+        "100-step training event.\n"
+        "- Stage-2 training has no safety oracle; is_safe=True is a training "
+        "placeholder.\n"
+        "- HRQ utilisation counts the top codebook only; fine-layer selections "
+        "are not included.\n"
+        "- JAX and C now both interpret the entropy threshold as normalised "
+        "H/ln(n_active)=0.5.\n")
     lines.append("")
     return "\n".join(lines)
 
@@ -1601,6 +2095,9 @@ def main(argv=None):
     p.add_argument("--no-joint", action="store_true")
     p.add_argument("--no-self-awareness", action="store_true")
     p.add_argument("--save-every", type=int, default=None)
+    p.add_argument("--allow-fail", action="store_true",
+                   help="return 0 even when conformance checks fail (the JSON "
+                        "still records the failure)")
     args = p.parse_args(argv)
 
     report = run_smoke(
@@ -1612,11 +2109,16 @@ def main(argv=None):
         joint=not args.no_joint,
         self_awareness=not args.no_self_awareness,
         qwen_ckpt=args.qwen_ckpt, save_every=args.save_every)
-    checks = sum(1 for v in report["checks"].values() if v is True)
+    failed = [k for k, v in report["checks"].items() if v is not True]
+    checks = len(report["checks"]) - len(failed)
     total = len(report["checks"])
     print(f"[SMOKE] {checks}/{total} checks PASS")
+    if failed:
+        print(f"[SMOKE] FAIL: {', '.join(failed)}")
     print(f"[SMOKE] report → {report['meta']['report_json']}")
     print(f"[SMOKE] table  → {report['meta']['report_md']}")
+    if failed and not args.allow_fail:
+        return 1
     return 0
 
 

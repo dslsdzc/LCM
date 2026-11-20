@@ -6,6 +6,7 @@ layer markers, so a loader that reads only layer 0 or only block 0 fails.
 Run:
     JAX_PLATFORMS=cpu be/bin/python -m pytest train/test_c_load.py -v
 """
+import json
 import struct
 import zlib
 
@@ -14,7 +15,7 @@ import pytest
 
 from train.bin_format import (
     FORMAT_VERSION, HEADER_FMT_V2, HEADER_SIZE_V2, SELF_LAYOUT_TAG,
-    canonical_sha256, load_manifest, save_manifest,
+    canonical_sha256, load_manifest, save_manifest, tensor_sha256,
 )
 from lcm import load_lattice_memories
 
@@ -412,6 +413,29 @@ def test_truncated_lowrank_is_rejected(tmp_path):
         raise AssertionError("truncated lowrank_codebook.bin was accepted")
 
 
+def test_manifest_tensor_sha256_rejects_tampered_payload(tmp_path):
+    """R10: a mutated .bin payload must fail the per-tensor sha256 check."""
+    _build_fixture(tmp_path)
+    path = tmp_path / 'hrq_codebook.bin'
+    data = bytearray(path.read_bytes())
+    # Flip one bit in the first payload float, after the 32-byte header.
+    data[HEADER_SIZE_V2] ^= 0x01
+    path.write_bytes(bytes(data))
+    with pytest.raises(ValueError, match="sha256 mismatch|tampered|corrupt"):
+        load_lattice_memories(str(tmp_path), _cfg())
+
+
+def test_manifest_missing_sha256_is_rejected(tmp_path):
+    """A v2 manifest without a per-tensor hash is not silently trusted."""
+    _build_fixture(tmp_path)
+    manifest = load_manifest(str(tmp_path))
+    manifest['tensors']['hrq_codebook'].pop('sha256')
+    (tmp_path / 'manifest.json').write_text(
+        json.dumps(manifest), encoding='utf-8')
+    with pytest.raises(ValueError, match="no sha256|re-export"):
+        load_lattice_memories(str(tmp_path), _cfg())
+
+
 def test_pre_r15_self_lattice_is_rejected(tmp_path):
     """Ruling 35: same-size old core+modes+tau+bias files must not load."""
     _build_fixture(tmp_path)
@@ -419,5 +443,11 @@ def test_pre_r15_self_lattice_is_rejected(tmp_path):
     data = np.fromfile(path, dtype=np.float32)
     data[-2] = 1.0  # old tau_self slot, not SELF_LAYOUT_TAG
     data.tofile(path)
+    # A real pre-R15 file would have a manifest hash matching the old bytes.
+    # Refresh it so the loader reaches the R15 layout-tag rejection instead of
+    # failing first on the (also correct) sha256 check.
+    manifest = load_manifest(str(tmp_path))
+    manifest['tensors']['self_lattice']['sha256'] = tensor_sha256(data)
+    (tmp_path / 'manifest.json').write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="R15|layout tag|migrated"):
         load_lattice_memories(str(tmp_path), _cfg())
