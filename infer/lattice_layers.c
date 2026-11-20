@@ -138,12 +138,17 @@ void lowrank_forward_c(const float* z, const lowrank_mem_t* m, float alpha_val,
 
 /* ─── Contrast: two independent residual chains (b.md §4.6) ─────────────── */
 
-void contrast_forward_c(const float* z, const contrast_mem_t* m,
-                        float alpha_val, float* out) {
+void contrast_forward_v31(const float* z, const contrast_mem_t* m,
+                          float alpha_val, float* out,
+                          int* idx_a, int* idx_b) {
     if (!out) return;
     if (!z || !m || !m->C_a || !m->C_b || m->M <= 0
         || m->M > LCM_MAX_M || m->n_layers <= 0) {
         memset(out, 0, sizeof(vec_t));
+        if (m && m->n_layers > 0) {
+            if (idx_a) memset(idx_a, 0, (size_t)m->n_layers * sizeof(int));
+            if (idx_b) memset(idx_b, 0, (size_t)m->n_layers * sizeof(int));
+        }
         return;
     }
 
@@ -156,8 +161,9 @@ void contrast_forward_c(const float* z, const contrast_mem_t* m,
     for (int l = 0; l < m->n_layers; l++) {
         const float* cba = m->C_a
             + (size_t)l * (size_t)m->M * LCM_D;
-        lattice_pick_row(ra, m->M, m->value_a, alpha_val,
-                         lattice_cb_row, cba, c);
+        int a = lattice_pick_row(ra, m->M, m->value_a, alpha_val,
+                                 lattice_cb_row, cba, c);
+        if (idx_a) idx_a[l] = a;
         for (int i = 0; i < LCM_D; i++) {
             oa[i] += c[i];
             ra[i] -= c[i];
@@ -165,8 +171,9 @@ void contrast_forward_c(const float* z, const contrast_mem_t* m,
 
         const float* cbb = m->C_b
             + (size_t)l * (size_t)m->M * LCM_D;
-        lattice_pick_row(rb, m->M, m->value_b, alpha_val,
-                         lattice_cb_row, cbb, c);
+        int b = lattice_pick_row(rb, m->M, m->value_b, alpha_val,
+                                 lattice_cb_row, cbb, c);
+        if (idx_b) idx_b[l] = b;
         for (int i = 0; i < LCM_D; i++) {
             ob[i] += c[i];
             rb[i] -= c[i];
@@ -175,6 +182,11 @@ void contrast_forward_c(const float* z, const contrast_mem_t* m,
 
     for (int i = 0; i < LCM_D; i++)
         out[i] = 0.5f * (oa[i] + ob[i]);
+}
+
+void contrast_forward_c(const float* z, const contrast_mem_t* m,
+                        float alpha_val, float* out) {
+    contrast_forward_v31(z, m, alpha_val, out, NULL, NULL);
 }
 
 /* ─── Binding: cross-layer HRR bind + conjugate unbind (b.md §4.5) ──────── */

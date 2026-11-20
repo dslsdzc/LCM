@@ -21,28 +21,228 @@ Usage:
     cd infer && make LCM_D=32          # LCM_D must equal cfg.d_model
     JAX_PLATFORMS=cpu be/bin/python -m train.parity_c_compare --dump /tmp/lcm_parity_jax.npz \
         --lib /tmp/lcm_parity_build/liblcm.so
+
+The per-lattice parity harness used by `train/test_parity_lattices.py` lives
+below the CLI helpers: `run_lattice_parity`, `run_canonical_fusion_parity` and
+`run_engine_fusion_parity`. It builds/loads a dedicated `liblcm_d32.so` so the
+deployed d=256 engine is never involved.
 """
 import argparse
 import ctypes
 import os
+import subprocess
 
 import numpy as np
+
+import jax
+import jax.numpy as jnp
+
+from train.cog_loop import dag_fuse
+from train.fusion import fuse_lattices_with_aux
+from train.hyp import safe_unit
+from train.lattices import (
+    binding_forward, contrast_forward, hrq_forward, init_binding_params,
+    init_contrast_params, init_hrq_params, init_lowrank_params,
+    init_manifold_params, init_route_params, init_sparse_params,
+    lowrank_forward, manifold_forward, routing_gate, sparse_forward,
+)
 
 D_MODEL = 32
 N_LATTICES = 6
 LATTICES = ("hrq", "sparse", "lowrank", "manifold", "binding", "contrast")
 
-_DEFAULT_LIB = os.path.join(
+DEFAULT_LIB = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "infer", "liblcm.so")
+
+# ─── Per-lattice parity harness (design §6.2, task 11) ──────────────────────
+#
+# This half of the module is imported by `train/test_parity_lattices.py`. It
+# deliberately does not reuse the dump-driven CLI above: parity should compare
+# the two implementations of *the same function*, not the whole deployed step.
+# Fixed seed, fixed z, fixed params; the only variables are the lattice and
+# the value-bias strength.
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PARITY_D = 32
+PARITY_LATTICES = ("hrq", "sparse", "lowrank", "manifold", "binding",
+                   "contrast", "routing")
+
+_FP = ctypes.POINTER(ctypes.c_float)
+_IP = ctypes.POINTER(ctypes.c_int)
+
+
+class HRQMem(ctypes.Structure):
+    _fields_ = [
+        ("C_top", _FP), ("M_top", ctypes.c_int),
+        ("C_fine", _FP), ("M_fine", ctypes.c_int), ("n_fine", ctypes.c_int),
+        ("value_top", _FP), ("value_fine", _FP),
+    ]
+
+
+class SparseMem(ctypes.Structure):
+    _fields_ = [
+        ("C", _FP), ("M", ctypes.c_int), ("zero_vec", _FP), ("value", _FP),
+        ("N", _FP), ("m", _FP), ("last_used", _IP),
+    ]
+
+
+class LowrankMem(ctypes.Structure):
+    _fields_ = [
+        ("U", _FP), ("V", _FP), ("ranks", _IP),
+        ("n_layers", ctypes.c_int), ("M_lr", ctypes.c_int),
+        ("r_max", ctypes.c_int), ("value", _FP),
+    ]
+
+
+class ManifoldMem(ctypes.Structure):
+    _fields_ = [
+        ("C", _FP), ("M", ctypes.c_int), ("T", _FP),
+        ("t_dim", ctypes.c_int), ("value", _FP),
+    ]
+
+
+class BindingMem(ctypes.Structure):
+    _fields_ = [
+        ("key_cb", _FP), ("val_cb", _FP), ("bind_cb", _FP),
+        ("M", ctypes.c_int), ("n_layers", ctypes.c_int),
+        ("r_max", ctypes.c_int),
+        ("A_k", _FP), ("A_v", _FP),
+        ("value_key", _FP), ("value_val", _FP), ("value_bind", _FP),
+    ]
+
+
+class ContrastMem(ctypes.Structure):
+    _fields_ = [
+        ("C_a", _FP), ("C_b", _FP), ("M", ctypes.c_int),
+        ("n_layers", ctypes.c_int), ("value_a", _FP), ("value_b", _FP),
+    ]
+
+
+class LatticeMemory(ctypes.Structure):
+    _fields_ = [("C", _FP), ("M", ctypes.c_int), ("D", ctypes.c_int)]
+
+
+_LIB_CACHE = {}
+
+
+def _np32(x):
+    return np.ascontiguousarray(np.asarray(x, dtype=np.float32))
+
+
+def _jax_to_np(x):
+    return np.asarray(x, dtype=np.float32)
+
+
+def _ptr(a):
+    return a.ctypes.data_as(_FP)
+
+
+def _iptr(a):
+    return a.ctypes.data_as(_IP)
+
+
+def parity_lib_path(d=PARITY_D):
+    return os.path.join(REPO_ROOT, "infer", f"liblcm_d{int(d)}.so")
+
+
+def ensure_parity_lib(d=PARITY_D, build=True):
+    """Return a parity .so built for ``LCM_D == d``.
+
+    ``LCM_PARITY_LIB`` overrides the path (used by callers with a prebuilt
+    library). Otherwise ``make -C infer PARITY_D=<d> liblcm_d<d>.so`` uses the
+    dedicated object directory, so the deployed d=256 build is not touched.
+    A missing library or failed build raises with the compiler output; parity
+    must never silently skip.
+    """
+    override = os.environ.get("LCM_PARITY_LIB")
+    if override:
+        if not os.path.isfile(override):
+            raise FileNotFoundError(
+                f"LCM_PARITY_LIB={override!r} does not exist; build the parity "
+                f"library or unset the variable")
+        return override
+
+    path = parity_lib_path(d)
+    if build:
+        cmd = ["make", "-C", os.path.join(REPO_ROOT, "infer"),
+               f"PARITY_D={int(d)}", f"liblcm_d{int(d)}.so"]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+        except OSError as exc:
+            raise RuntimeError(
+                f"cannot run {' '.join(cmd)}: {exc}. The per-lattice parity "
+                f"tests need a C99 compiler and `make`.") from exc
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"parity C build failed (LCM_D={d}):\n"
+                f"$ {' '.join(cmd)}\n"
+                f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"{path} not found. Build it with:\n"
+            f"    make -C infer PARITY_D={int(d)} liblcm_d{int(d)}.so\n"
+            f"The engine is dimensioned at compile time, so the deployed "
+            f"d=256 liblcm.so cannot be reused at d={d}.")
+    return path
+
+
+def load_parity_lib(path=None, d=PARITY_D):
+    path = os.path.abspath(path or ensure_parity_lib(d))
+    if path in _LIB_CACHE:
+        return _LIB_CACHE[path]
+
+    try:
+        ctypes.CDLL("libm.so.6", mode=ctypes.RTLD_GLOBAL)
+    except OSError:
+        pass
+    lib = ctypes.CDLL(path)
+
+    lib.hrq_forward_v31.restype = ctypes.c_int
+    lib.hrq_forward_v31.argtypes = [
+        _FP, ctypes.POINTER(HRQMem), ctypes.c_float, ctypes.c_int,
+        ctypes.c_float, _FP, _IP, _FP]
+    lib.sparse_forward_c.restype = ctypes.c_int
+    lib.sparse_forward_c.argtypes = [
+        _FP, ctypes.POINTER(SparseMem), ctypes.c_float, ctypes.c_float,
+        ctypes.c_float, ctypes.c_int, _FP, _IP]
+    lib.lowrank_forward_c.restype = None
+    lib.lowrank_forward_c.argtypes = [
+        _FP, ctypes.POINTER(LowrankMem), ctypes.c_float, _FP, _IP]
+    lib.manifold_forward_c.restype = None
+    lib.manifold_forward_c.argtypes = [
+        _FP, ctypes.POINTER(ManifoldMem), ctypes.c_float, _FP, _IP]
+    lib.contrast_forward_v31.restype = None
+    lib.contrast_forward_v31.argtypes = [
+        _FP, ctypes.POINTER(ContrastMem), ctypes.c_float, _FP, _IP, _IP]
+    lib.binding_forward_c.restype = None
+    lib.binding_forward_c.argtypes = [
+        _FP, ctypes.POINTER(BindingMem), _FP, ctypes.c_float, _FP, _FP, _FP]
+    lib.routing_gate_c.restype = None
+    lib.routing_gate_c.argtypes = [
+        _FP, _FP, _FP, ctypes.c_int, _FP]
+    lib.lcm_fuse_only.restype = ctypes.c_int
+    lib.lcm_fuse_only.argtypes = [
+        _FP, ctypes.c_int, ctypes.c_int, _FP, _FP, ctypes.c_int, _FP, _FP,
+        _FP]
+    lib.distance_weighted_fusion.restype = None
+    lib.distance_weighted_fusion.argtypes = [
+        _FP, _FP, _FP, _FP, ctypes.c_void_p, ctypes.c_float]
+    lib.retrieve_single.restype = None
+    lib.retrieve_single.argtypes = [
+        _FP, ctypes.POINTER(LatticeMemory), _FP, _FP, _IP]
+    lib.lcm_dim.restype = ctypes.c_int
+
+    compiled_d = int(lib.lcm_dim())
+    if compiled_d != int(d):
+        raise RuntimeError(
+            f"{path} was built with LCM_D={compiled_d}, expected {d}")
+    _LIB_CACHE[path] = lib
+    return lib
 
 
 def _f32(a):
     return np.ascontiguousarray(a, dtype=np.float32)
-
-
-def _ptr(a):
-    return a.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
 
 def load_lib(path):
@@ -151,10 +351,558 @@ def _report(label, z_jax, z_c):
     return diff.max()
 
 
+# ─── Fixed parity case ──────────────────────────────────────────────────────
+
+PARITY_CASE = {
+    "M_top": 8, "M_fine": 4, "n_fine": 2, "value_topk": 4,
+    "M_sparse": 8, "M_lr": 8, "ranks": (2, 4),
+    "M_man": 8, "t_dim": 3,
+    "M_bind": 6, "n_bind": 2, "r_max": 4,
+    "M_contrast": 6, "n_contrast": 2,
+    "n_lattices": 6,
+}
+
+
+def _build_case(seed=0, d=PARITY_D):
+    """Fixed parameters, fixed z, fixed value scalars.
+
+    Every random quantity is derived from ``seed`` alone. The point is that
+    both sides run the *same* function: if the JAX and C implementations drift,
+    the only difference left is the implementation, not the inputs.
+    """
+    cfg = PARITY_CASE
+    rng = jax.random.PRNGKey(int(seed))
+    keys = jax.random.split(rng, 12)
+
+    params = {
+        "hrq": init_hrq_params(keys[0], d, cfg["M_top"], cfg["M_fine"],
+                               cfg["n_fine"]),
+        "sparse": init_sparse_params(keys[1], d, cfg["M_sparse"]),
+        "lowrank": init_lowrank_params(keys[2], d, cfg["M_lr"],
+                                       cfg["ranks"]),
+        "manifold": init_manifold_params(keys[3], d, cfg["M_man"],
+                                         cfg["t_dim"]),
+        "binding": init_binding_params(keys[4], d, cfg["M_bind"],
+                                       cfg["n_bind"], cfg["r_max"]),
+        "contrast": init_contrast_params(keys[5], d, cfg["M_contrast"],
+                                         cfg["n_contrast"]),
+        "route": init_route_params(keys[6], cfg["n_lattices"], d),
+    }
+
+    # Norm != 1 on purpose: the R6 safe_unit boundary is part of the contract.
+    z = jax.random.normal(keys[7], (1, d)) * 0.7
+
+    vkeys = jax.random.split(keys[8], 10)
+
+    def rv(k, n):
+        return jax.random.normal(k, (n,)) * 0.5
+
+    values = {
+        "hrq": {"top": rv(vkeys[0], cfg["M_top"]),
+                "fine": rv(vkeys[1], cfg["M_fine"])},
+        "sparse": rv(vkeys[2], cfg["M_sparse"]),
+        "lowrank": rv(vkeys[3], cfg["M_lr"]),
+        "manifold": rv(vkeys[4], cfg["M_man"]),
+        "binding": {"key": rv(vkeys[5], cfg["M_bind"]),
+                    "val": rv(vkeys[6], cfg["M_bind"]),
+                    "bind": rv(vkeys[7], cfg["M_bind"])},
+        "contrast": {"a": rv(vkeys[8], cfg["M_contrast"]),
+                     "b": rv(vkeys[9], cfg["M_contrast"])},
+    }
+    return {"seed": int(seed), "d": int(d), "z": z, "params": params,
+            "values": values, "cfg": cfg}
+
+
+def _first_idx_mismatch(name, jax_idx, c_idx):
+    j = np.asarray(jax_idx, dtype=np.int64).ravel()
+    c = np.asarray(c_idx, dtype=np.int64).ravel()
+    if j.shape != c.shape:
+        return (name, "shape", j.shape, c.shape)
+    bad = np.flatnonzero(j != c)
+    if bad.size == 0:
+        return None
+    k = int(bad[0])
+    return (name, k, int(j[k]), int(c[k]))
+
+
+def _parity_result(lattice, case, alpha, fields, idx_pairs,
+                   jax_values, c_values):
+    idx_equal = True
+    idx_mismatch = None
+    for name, jax_idx, c_idx in idx_pairs:
+        m = _first_idx_mismatch(name, jax_idx, c_idx)
+        if m is not None:
+            idx_equal = False
+            idx_mismatch = m
+            break
+
+    max_err = 0.0
+    max_mm = None
+    for name in fields:
+        j = np.asarray(jax_values[name], dtype=np.float64)
+        c = np.asarray(c_values[name], dtype=np.float64)
+        if j.shape != c.shape:
+            return {
+                "lattice": lattice, "seed": case["seed"], "d": case["d"],
+                "alpha": float(alpha), "fields": tuple(fields),
+                "idx_equal": False, "max_abs_err": float("inf"),
+                "jax": jax_values, "c": c_values,
+                "idx_mismatch": (name, "shape", j.shape, c.shape),
+                "max_mismatch": None,
+            }
+        if j.size == 0:
+            continue
+        diff = np.abs(j - c)
+        k = int(np.argmax(diff))
+        idx = np.unravel_index(k, j.shape) if j.ndim > 1 else (k,)
+        err = float(diff.ravel()[k])
+        if err > max_err:
+            max_err = err
+            max_mm = {"field": name, "index": idx,
+                      "jax": float(j.ravel()[k]), "c": float(c.ravel()[k]),
+                      "abs_err": err}
+
+    return {
+        "lattice": lattice, "seed": case["seed"], "d": case["d"],
+        "alpha": float(alpha), "fields": tuple(fields),
+        "idx_equal": bool(idx_equal), "max_abs_err": float(max_err),
+        "jax": jax_values, "c": c_values,
+        "idx_mismatch": idx_mismatch, "max_mismatch": max_mm,
+    }
+
+
+# ─── One lattice at a time ──────────────────────────────────────────────────
+
+def _hrq_parity(case, lib, alpha):
+    p = case["params"]["hrq"]
+    vs = case["values"]["hrq"]
+    d = case["d"]
+    z = case["z"]
+
+    top = _np32(_jax_to_np(p["top"]["A"] @ p["top"]["W"]))
+    fine = _np32(np.stack([_jax_to_np(fb["A"] @ fb["W"])
+                           for fb in p["fine"]]))
+    v_top = _np32(vs["top"])
+    v_fine = _np32(vs["fine"])
+
+    jax_out, jax_idx, jax_sim, _ = hrq_forward(
+        p, z, tau_fallback=0.1, value_scalars={"top": vs["top"],
+                                               "fine": vs["fine"]},
+        alpha_val=float(alpha), value_topk=case["cfg"]["value_topk"])
+
+    m = HRQMem()
+    m.C_top = _ptr(top)
+    m.M_top = top.shape[0]
+    m.C_fine = _ptr(fine)
+    m.M_fine = fine.shape[1]
+    m.n_fine = fine.shape[0]
+    m.value_top = _ptr(v_top)
+    m.value_fine = _ptr(v_fine)
+
+    z_np = _np32(_jax_to_np(z))
+    out = np.zeros(d, dtype=np.float32)
+    idx = ctypes.c_int(-1)
+    sim = ctypes.c_float(float("nan"))
+    rc = lib.hrq_forward_v31(
+        _ptr(z_np), ctypes.byref(m), ctypes.c_float(float(alpha)),
+        ctypes.c_int(case["cfg"]["value_topk"]), ctypes.c_float(0.1),
+        _ptr(out), ctypes.byref(idx), ctypes.byref(sim))
+    if rc != 0:
+        raise RuntimeError(f"hrq_forward_v31 returned {rc}")
+
+    return _parity_result(
+        "hrq", case, alpha, ("out", "top_sim"),
+        [("top_idx", _jax_to_np(jax_idx), np.array([idx.value]))],
+        {"out": _jax_to_np(jax_out)[0],
+         "top_sim": _jax_to_np(jax_sim).reshape(1)},
+        {"out": out, "top_sim": np.array([sim.value], dtype=np.float32)})
+
+
+def _sparse_parity(case, lib, alpha, training=True, d_top=None):
+    p = case["params"]["sparse"]
+    vs = case["values"]["sparse"]
+    d = case["d"]
+    z = case["z"]
+
+    C = _np32(_jax_to_np(p["C"]))
+    zero = _np32(_jax_to_np(p["zero_vec"][0]))
+    v = _np32(vs)
+
+    if d_top is None:
+        jax_d_top = None
+        jax_c_top = None
+        c_d_top = 0.0
+    else:
+        # c_top only needs the (B, d) shape for the dependency-edge check; the
+        # LFQ comparison itself uses d_top and the non-zero codebook.
+        jax_d_top = jnp.full((1,), float(d_top), dtype=jnp.float32)
+        jax_c_top = jnp.zeros((1, d), dtype=jnp.float32)
+        c_d_top = float(d_top)
+
+    jax_out, jax_idx = sparse_forward(
+        p, z, training=training, lambda_lfq=1.5, d_top=jax_d_top,
+        c_top=jax_c_top, value_scalars=vs, alpha_val=float(alpha))
+
+    m = SparseMem()
+    m.C = _ptr(C)
+    m.M = C.shape[0]
+    m.zero_vec = _ptr(zero)
+    m.value = _ptr(v)
+
+    z_np = _np32(_jax_to_np(z))
+    out = np.zeros(d, dtype=np.float32)
+    idx = ctypes.c_int(-1)
+    rc = lib.sparse_forward_c(
+        _ptr(z_np), ctypes.byref(m), ctypes.c_float(1.5),
+        ctypes.c_float(float(alpha)), ctypes.c_float(c_d_top),
+        ctypes.c_int(int(training)), _ptr(out), ctypes.byref(idx))
+    if rc != 0:
+        raise RuntimeError(f"sparse_forward_c returned {rc}")
+
+    return _parity_result(
+        "sparse", case, alpha, ("out",),
+        [("idx", _jax_to_np(jax_idx), np.array([idx.value]))],
+        {"out": _jax_to_np(jax_out)[0],
+         "idx": np.asarray(jax_idx, dtype=np.int32).reshape(1)},
+        {"out": out, "idx": np.array([idx.value], dtype=np.int32)})
+
+
+def _lowrank_parity(case, lib, alpha):
+    p = case["params"]["lowrank"]
+    vs = case["values"]["lowrank"]
+    ranks = tuple(case["cfg"]["ranks"])
+    d = case["d"]
+    z = case["z"]
+
+    V = _np32(_jax_to_np(p["A_V"] @ p["W_V"]))
+    r_max = V.shape[1]
+    U = np.zeros((len(ranks), case["cfg"]["M_lr"], r_max),
+                 dtype=np.float32)
+    for layer, u in enumerate(p["U"]):
+        u_np = _jax_to_np(u)
+        U[layer, :, :u_np.shape[1]] = u_np
+    ranks_np = np.ascontiguousarray(np.asarray(ranks, dtype=np.int32))
+    v = _np32(vs)
+
+    jax_out, aux = lowrank_forward(
+        p, z, ranks, value_scalars=vs, alpha_val=float(alpha),
+        return_aux=True)
+    jax_idx = np.stack([_jax_to_np(i)[0] for i in aux["indices"]])
+
+    m = LowrankMem()
+    m.U = _ptr(U)
+    m.V = _ptr(V)
+    m.ranks = _iptr(ranks_np)
+    m.n_layers = len(ranks)
+    m.M_lr = U.shape[1]
+    m.r_max = r_max
+    m.value = _ptr(v)
+
+    z_np = _np32(_jax_to_np(z))
+    out = np.zeros(d, dtype=np.float32)
+    idx = np.zeros(len(ranks), dtype=np.int32)
+    lib.lowrank_forward_c(_ptr(z_np), ctypes.byref(m),
+                          ctypes.c_float(float(alpha)), _ptr(out), _iptr(idx))
+
+    return _parity_result(
+        "lowrank", case, alpha, ("out",),
+        [("idx", jax_idx, idx)],
+        {"out": _jax_to_np(jax_out)[0]}, {"out": out})
+
+
+def _manifold_parity(case, lib, alpha):
+    p = case["params"]["manifold"]
+    vs = case["values"]["manifold"]
+    d = case["d"]
+
+    # R6 boundary: JAX manifold_forward still calls exp_map(z) directly, while
+    # C uses exp_map(safe_unit(z)). Normalising once here makes both sides run
+    # the *same* R6-domain function; production JAX semantics are unchanged.
+    z = safe_unit(case["z"])
+    z_np = _np32(_jax_to_np(z))
+    C = _np32(_jax_to_np(p["C"]))
+    T = _np32(_jax_to_np(p["T"]))
+    v = _np32(vs)
+
+    jax_out, jax_idx = manifold_forward(
+        p, z, value_scalars=vs, alpha_val=float(alpha))
+
+    m = ManifoldMem()
+    m.C = _ptr(C)
+    m.M = C.shape[0]
+    m.T = _ptr(T)
+    m.t_dim = T.shape[2]
+    m.value = _ptr(v)
+
+    out = np.zeros(d, dtype=np.float32)
+    idx = ctypes.c_int(-1)
+    lib.manifold_forward_c(_ptr(z_np), ctypes.byref(m),
+                           ctypes.c_float(float(alpha)), _ptr(out),
+                           ctypes.byref(idx))
+
+    return _parity_result(
+        "manifold", case, alpha, ("out",),
+        [("idx", _jax_to_np(jax_idx), np.array([idx.value]))],
+        {"out": _jax_to_np(jax_out)[0]}, {"out": out})
+
+
+def _binding_parity(case, lib, alpha):
+    p = case["params"]["binding"]
+    vs = case["values"]["binding"]
+    d = case["d"]
+    z = case["z"]
+
+    V = _np32(_jax_to_np(case["params"]["lowrank"]["A_V"]
+                         @ case["params"]["lowrank"]["W_V"]))
+    key = _np32(np.stack([_jax_to_np(cb["A"] @ cb["W"])
+                          for cb in p["key_cb"]]))
+    val = _np32(np.stack([_jax_to_np(cb["A"] @ cb["W"])
+                          for cb in p["val_cb"]]))
+    bind = _np32(np.stack([_jax_to_np(cb["A"] @ cb["W"])
+                           for cb in p["bind_cb"]]))
+    A_k = _np32(_jax_to_np(p["A_k"]))
+    A_v = _np32(_jax_to_np(p["A_v"]))
+    v_key = _np32(vs["key"])
+    v_val = _np32(vs["val"])
+    v_bind = _np32(vs["bind"])
+
+    (jax_out, _residuals, _indices, jax_bq, jax_kq,
+     _val_idx) = binding_forward(
+        p, z, jnp.asarray(V), value_scalars=vs, alpha_val=float(alpha))
+
+    m = BindingMem()
+    m.key_cb = _ptr(key)
+    m.val_cb = _ptr(val)
+    m.bind_cb = _ptr(bind)
+    m.M = key.shape[1]
+    m.n_layers = key.shape[0]
+    m.r_max = V.shape[1]
+    m.A_k = _ptr(A_k)
+    m.A_v = _ptr(A_v)
+    m.value_key = _ptr(v_key)
+    m.value_val = _ptr(v_val)
+    m.value_bind = _ptr(v_bind)
+
+    z_np = _np32(_jax_to_np(z))
+    out = np.zeros(d, dtype=np.float32)
+    b_q = np.zeros(d, dtype=np.float32)
+    k_q = np.zeros(d, dtype=np.float32)
+    lib.binding_forward_c(_ptr(z_np), ctypes.byref(m), _ptr(V),
+                          ctypes.c_float(float(alpha)), _ptr(out),
+                          _ptr(b_q), _ptr(k_q))
+
+    return _parity_result(
+        "binding", case, alpha, ("v_out", "b_q", "k_q"), [],
+        {"v_out": _jax_to_np(jax_out)[0],
+         "b_q": _jax_to_np(jax_bq)[0],
+         "k_q": _jax_to_np(jax_kq)[0]},
+        {"v_out": out, "b_q": b_q, "k_q": k_q})
+
+
+def _contrast_parity(case, lib, alpha):
+    p = case["params"]["contrast"]
+    vs = case["values"]["contrast"]
+    d = case["d"]
+    z = case["z"]
+
+    C_a = _np32(np.stack([_jax_to_np(cb["A"] @ cb["W"])
+                          for cb in p["C_a"]]))
+    C_b = _np32(np.stack([_jax_to_np(cb["A"] @ cb["W"])
+                          for cb in p["C_b"]]))
+    v_a = _np32(vs["a"])
+    v_b = _np32(vs["b"])
+
+    jax_out, jax_idx, _ = contrast_forward(
+        p, z, value_scalars=vs, alpha_val=float(alpha))
+    jax_idx_a = np.stack([_jax_to_np(i)[0] for i in jax_idx["a"]])
+    jax_idx_b = np.stack([_jax_to_np(i)[0] for i in jax_idx["b"]])
+
+    m = ContrastMem()
+    m.C_a = _ptr(C_a)
+    m.C_b = _ptr(C_b)
+    m.M = C_a.shape[1]
+    m.n_layers = C_a.shape[0]
+    m.value_a = _ptr(v_a)
+    m.value_b = _ptr(v_b)
+
+    z_np = _np32(_jax_to_np(z))
+    out = np.zeros(d, dtype=np.float32)
+    idx_a = np.zeros(C_a.shape[0], dtype=np.int32)
+    idx_b = np.zeros(C_b.shape[0], dtype=np.int32)
+    lib.contrast_forward_v31(_ptr(z_np), ctypes.byref(m),
+                             ctypes.c_float(float(alpha)), _ptr(out),
+                             _iptr(idx_a), _iptr(idx_b))
+
+    return _parity_result(
+        "contrast", case, alpha, ("out",),
+        [("idx_a", jax_idx_a, idx_a), ("idx_b", jax_idx_b, idx_b)],
+        {"out": _jax_to_np(jax_out)[0]}, {"out": out})
+
+
+def _routing_parity(case, lib, alpha):
+    p = case["params"]["route"]
+    d = case["d"]
+    z = case["z"]
+    n = case["cfg"]["n_lattices"]
+
+    jax_mask, _z_route, _idx = routing_gate(p, z, tau=0.5, hard=True)
+    jax_mask = _jax_to_np(jax_mask)[0]
+
+    C_route = _np32(_jax_to_np(p["C_route"]))
+    W_route = _np32(_jax_to_np(p["W_route"]))
+    z_np = _np32(_jax_to_np(z))
+    mask = np.zeros(n, dtype=np.float32)
+    lib.routing_gate_c(_ptr(z_np), _ptr(C_route), _ptr(W_route),
+                       ctypes.c_int(n), _ptr(mask))
+
+    return _parity_result(
+        "routing", case, alpha, ("mask",),
+        [("mask", (jax_mask > 0.5).astype(np.int8),
+          (mask > 0.5).astype(np.int8))],
+        {"mask": jax_mask}, {"mask": mask})
+
+
+def run_lattice_parity(lattice, seed=0, d=PARITY_D, alpha=0.0,
+                       training=True, d_top=None):
+    """Run one lattice through JAX and the C parity build; compare.
+
+    Returns ``{'idx_equal', 'max_abs_err', 'jax', 'c', ...}``. Discrete
+    outputs are compared exactly; continuous outputs by max absolute error.
+    ``alpha`` is the R22 value-bias strength (0 disables it); ``training``
+    selects the Sparse branch. ``d_top`` enables Sparse's LFQ decision (None
+    leaves it disabled, matching "HRQ did not activate").
+    """
+    if lattice not in PARITY_LATTICES:
+        raise ValueError(f"unknown lattice {lattice!r}; "
+                         f"expected one of {PARITY_LATTICES}")
+    case = _build_case(seed=seed, d=d)
+    lib = load_parity_lib(d=d)
+
+    if lattice == "hrq":
+        return _hrq_parity(case, lib, alpha)
+    if lattice == "sparse":
+        return _sparse_parity(case, lib, alpha, training=training,
+                              d_top=d_top)
+    if lattice == "lowrank":
+        return _lowrank_parity(case, lib, alpha)
+    if lattice == "manifold":
+        return _manifold_parity(case, lib, alpha)
+    if lattice == "binding":
+        return _binding_parity(case, lib, alpha)
+    if lattice == "contrast":
+        return _contrast_parity(case, lib, alpha)
+    return _routing_parity(case, lib, alpha)
+
+
+# ─── Fusion parity ──────────────────────────────────────────────────────────
+
+def run_canonical_fusion_parity(seed=0, d=PARITY_D):
+    """R9 canonical fusion: JAX ``fuse_lattices_with_aux`` vs C ``lcm_fuse_only``."""
+    lib = load_parity_lib(d=d)
+    cfg = PARITY_CASE
+    n = cfg["n_lattices"]
+    keys = jax.random.split(jax.random.PRNGKey(int(seed)), 5)
+
+    outputs = jax.random.normal(keys[0], (n, d))
+    logits = jax.random.normal(keys[1], (1, n)) * 2.0
+    soft_mask = jax.nn.softmax(logits, axis=-1)
+    alpha = jax.random.uniform(keys[2], (n,), minval=0.5, maxval=1.5)
+    ln_scale = 1.0 + 0.1 * jax.random.normal(keys[3], (d,))
+    ln_bias = 0.05 * jax.random.normal(keys[4], (d,))
+
+    jax_z, _, _ = fuse_lattices_with_aux(
+        [outputs[i][None, :] for i in range(n)], soft_mask,
+        {"alpha": alpha, "ln_scale": ln_scale, "ln_bias": ln_bias})
+
+    out_flat = _np32(_jax_to_np(outputs).reshape(-1))
+    mask = _np32(_jax_to_np(soft_mask)[0])
+    alpha_np = _np32(_jax_to_np(alpha))
+    scale_np = _np32(_jax_to_np(ln_scale))
+    bias_np = _np32(_jax_to_np(ln_bias))
+    z_c = np.zeros(d, dtype=np.float32)
+    rc = lib.lcm_fuse_only(
+        _ptr(out_flat), ctypes.c_int(n), ctypes.c_int(d), _ptr(mask),
+        _ptr(alpha_np), ctypes.c_int(n), _ptr(scale_np), _ptr(bias_np),
+        _ptr(z_c))
+    if rc != 0:
+        raise RuntimeError(f"lcm_fuse_only returned {rc}")
+
+    jax_z = _jax_to_np(jax_z)[0]
+    err = float(np.max(np.abs(jax_z.astype(np.float64)
+                              - z_c.astype(np.float64))))
+    k = int(np.argmax(np.abs(jax_z - z_c)))
+    return {
+        "lattice": "canonical_fusion", "seed": int(seed), "d": int(d),
+        "alpha": 0.0, "fields": ("z",), "idx_equal": True,
+        "max_abs_err": err,
+        "jax": {"z": jax_z}, "c": {"z": z_c},
+        "idx_mismatch": None,
+        "max_mismatch": {"field": "z", "index": (k,),
+                         "jax": float(jax_z[k]), "c": float(z_c[k]),
+                         "abs_err": err},
+    }
+
+
+def run_engine_fusion_parity(seed=0, d=PARITY_D):
+    """R9 engine fusion: JAX ``cog_loop.dag_fuse`` vs C engine fusion.
+
+    The C side performs its own nearest-neighbour retrieval (``retrieve_single``)
+    and reciprocal-distance fusion (``distance_weighted_fusion``), so the
+    comparison covers the whole engine formula, not just the weighted sum.
+    """
+    lib = load_parity_lib(d=d)
+    keys = jax.random.split(jax.random.PRNGKey(int(seed)), 8)
+    z = jax.random.normal(keys[0], (d,)) * 0.7
+
+    n = PARITY_CASE["n_lattices"]
+    sizes = (9, 7, 8, 6, 7, 9)
+    codebooks = [jax.random.normal(keys[1 + i], (sizes[i], d)) * 0.3
+                 for i in range(n)]
+    jax_next, _diff, _entropy = dag_fuse(
+        z, codebooks, [1e9] * n, tau=0.1, eps=1e-6)
+
+    z_np = _np32(_jax_to_np(z))
+    outputs = np.zeros((7, d), dtype=np.float32)
+    confidences = np.zeros(7, dtype=np.float32)
+    for i, cb in enumerate(codebooks):
+        cb_np = _np32(_jax_to_np(cb))
+        mem = LatticeMemory()
+        mem.C = _ptr(cb_np)
+        mem.M = cb_np.shape[0]
+        mem.D = d
+        out = np.zeros(d, dtype=np.float32)
+        dist = ctypes.c_float(float("nan"))
+        idx = ctypes.c_int(-1)
+        lib.retrieve_single(_ptr(z_np), ctypes.byref(mem), _ptr(out),
+                            ctypes.byref(dist), ctypes.byref(idx))
+        outputs[i] = out
+        confidences[i] = 1.0 / (float(np.sqrt(dist.value)) + 1e-6)
+
+    z_c = np.zeros(d, dtype=np.float32)
+    weights = np.zeros(7, dtype=np.float32)
+    lib.distance_weighted_fusion(_ptr(outputs), _ptr(confidences), _ptr(z_c),
+                                 _ptr(weights), None, ctypes.c_float(0.0))
+
+    jax_next = _jax_to_np(jax_next)
+    err = float(np.max(np.abs(jax_next.astype(np.float64)
+                              - z_c.astype(np.float64))))
+    k = int(np.argmax(np.abs(jax_next - z_c)))
+    return {
+        "lattice": "engine_fusion", "seed": int(seed), "d": int(d),
+        "alpha": 0.0, "fields": ("z",), "idx_equal": True,
+        "max_abs_err": err,
+        "jax": {"z": jax_next}, "c": {"z": z_c},
+        "idx_mismatch": None,
+        "max_mismatch": {"field": "z", "index": (k,),
+                         "jax": float(jax_next[k]), "c": float(z_c[k]),
+                         "abs_err": err},
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dump", default="/tmp/lcm_parity_jax.npz")
-    ap.add_argument("--lib", default=_DEFAULT_LIB)
+    ap.add_argument("--lib", default=DEFAULT_LIB)
     args = ap.parse_args()
 
     d = np.load(args.dump)

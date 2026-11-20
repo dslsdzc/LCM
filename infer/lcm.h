@@ -704,6 +704,17 @@ void manifold_forward_c(const float* z, const manifold_mem_t* m,
 void contrast_forward_c(const float* z, const contrast_mem_t* m,
                         float alpha_val, float* out);
 
+/* Contrast v3.1 — same forward, with the selected rows exposed.
+ *
+ * idx_a/idx_b (optional) receive the per-layer row selected in C_a/C_b under
+ * this call's own value bias. They exist for R21 feature-bank bookkeeping and
+ * the JAX<->C parity harness; the forward value is identical to
+ * contrast_forward_c. No allocation.
+ */
+void contrast_forward_v31(const float* z, const contrast_mem_t* m,
+                          float alpha_val, float* out,
+                          int* idx_a, int* idx_b);
+
 /* Binding v3 — R20 conformant forward (b.md §4.5, JAX binding_forward).
  *
  *   u_k = A_k z; z_k = V u_k               (W_k=V@A_k, z_k=W_k z)

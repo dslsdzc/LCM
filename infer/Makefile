@@ -62,8 +62,36 @@ test: test_runner.c liblcm.a liblcm.so
 	$(CC) $(CFLAGS) -o test_runner test_runner.c -L. -llcm $(LDFLAGS)
 	LD_LIBRARY_PATH=. ./test_runner
 
+# ── JAX<->C parity build (task 11) ──────────────────────────────────────────
+# The JAX parity harness runs at d=32 while the deployed engine is d=256, so
+# this target builds a second .so in its own object directory. It never touches
+# liblcm.so or the production *.o files.
+#
+#   make parity                      # liblcm_d32.so
+#   make PARITY_D=64 parity          # liblcm_d64.so
+PARITY_D      ?= 32
+PARITY_OBJDIR  = parity_obj_d$(PARITY_D)
+PARITY_OBJS    = $(SRCS:%.c=$(PARITY_OBJDIR)/%.o)
+# Drop the global -DLCM_D=<deployed> so the parity build cannot silently pick
+# up the wrong dimension when PARITY_D != LCM_D.
+PARITY_CFLAGS  = $(filter-out -DLCM_D=%,$(CFLAGS)) \
+                 -DLCM_D=$(PARITY_D) $(OPTFLAGS) -DNDEBUG -fPIC
+
+liblcm_d$(PARITY_D).so: $(PARITY_OBJS)
+	$(CC) -shared $(PARITY_CFLAGS) -o $@ $(PARITY_OBJS) $(LDFLAGS)
+
+$(PARITY_OBJDIR)/%.o: %.c lcm.h lcm_api.h lattice_internal.h | $(PARITY_OBJDIR)
+	$(CC) $(PARITY_CFLAGS) -c -o $@ $<
+
+$(PARITY_OBJDIR):
+	mkdir -p $@
+
+parity: liblcm_d$(PARITY_D).so
+
 # ── Clean ───────────────────────────────────────────────────────────────────
 clean:
 	rm -f *.o *.a *.so test_runner
+	rm -rf parity_obj_d*
+	rm -f liblcm_d*.so
 
-.PHONY: all debug contracts clean test
+.PHONY: all debug contracts clean test parity

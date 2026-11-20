@@ -16,6 +16,8 @@ train/*.cpython-*.so
 infer/*.o
 infer/*.a
 infer/*.so
+infer/liblcm_d*.so
+infer/parity_obj_d*/
 infer/test_runner
 
 # --- Checkpoints & training data ---
