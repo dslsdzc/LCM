@@ -47,6 +47,81 @@ static int fill_memory(memory_t* mem, int d,
     return 0;
 }
 
+/* ─── v3 full-parameter memory binding (R10, task 7) ───────────────────── */
+
+static int v3_hrq_valid(const hrq_mem_t* m) {
+    if (!m || m->M_top <= 0 || !m->C_top) return 0;
+    if (m->n_fine < 0 || m->M_fine < 0) return 0;
+    if (m->n_fine > 0 && (m->M_fine <= 0 || !m->C_fine)) return 0;
+    return 1;
+}
+
+static int v3_lowrank_valid(const lowrank_mem_t* m) {
+    if (!m || m->n_layers <= 0 || m->M_lr <= 0 || m->r_max <= 0) return 0;
+    if (!m->U || !m->V || !m->ranks) return 0;
+    for (int i = 0; i < m->n_layers; i++)
+        if (m->ranks[i] <= 0 || m->ranks[i] > m->r_max) return 0;
+    return 1;
+}
+
+int lcm_bind_memory_v3(lcm_memory_v3* mem, int D, int n_lattices,
+                       const hrq_mem_t* hrq,
+                       const sparse_mem_t* sparse,
+                       const lowrank_mem_t* lowrank,
+                       const manifold_mem_t* manifold,
+                       const binding_mem_t* binding,
+                       const contrast_mem_t* contrast,
+                       const fusion_mem_t* fusion) {
+    if (!mem) return -1;
+    memset(mem, 0, sizeof(*mem));
+
+    /* Dimension and routing count. The .so is compiled for one LCM_D; a
+     * mismatch silently corrupts every fixed-size vec_t access. */
+    if (D <= 0 || D != LCM_D) return -1;
+    if (n_lattices <= 0 || n_lattices > LCM_MAX_LATTICES) return -1;
+    if (!hrq || !sparse || !lowrank || !manifold || !binding ||
+        !contrast || !fusion) return -1;
+    if (fusion->n_lattices != n_lattices) return -1;
+
+    if (!v3_hrq_valid(hrq)) return -1;
+
+    if (sparse->M <= 0 || !sparse->C || !sparse->zero_vec) return -1;
+
+    if (!v3_lowrank_valid(lowrank)) return -1;
+
+    if (manifold->M <= 0 || manifold->t_dim <= 0 ||
+        !manifold->C || !manifold->T) return -1;
+
+    if (binding->M <= 0 || binding->n_layers <= 0) return -1;
+    if (!binding->key_cb || !binding->val_cb || !binding->bind_cb
+        || !binding->A_k || !binding->A_v) return -1;
+
+    if (contrast->M <= 0 || contrast->n_layers <= 0) return -1;
+    if (!contrast->C_a || !contrast->C_b) return -1;
+
+    if (!fusion->route_C || !fusion->route_W || !fusion->alpha
+        || !fusion->ln_scale || !fusion->ln_bias || !fusion->self_C)
+        return -1;
+    if (fusion->M_self <= 0) return -1;
+
+    /* Descriptors are copies of caller-owned structs; every array pointer is
+     * borrowed unchanged. Nothing is allocated or written. */
+    mem->D = D;
+    mem->n_lattices = n_lattices;
+    mem->hrq = *hrq;
+    mem->sparse = *sparse;
+    mem->lowrank = *lowrank;
+    mem->manifold = *manifold;
+    mem->binding = *binding;
+    mem->contrast = *contrast;
+    mem->fusion = *fusion;
+    mem->tau_route = 0.5f;
+    mem->tau_route_fallback = 0.1f;
+    mem->tau_self = 1.0f;
+    mem->lambda_lfq = 1.5f;
+    return 0;
+}
+
 /* ─── Single-step inference ─────────────────────────────────────────────── */
 
 int lcm_infer_step(const float* z, int d,

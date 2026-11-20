@@ -134,6 +134,110 @@ typedef struct {
     int              manifold_t_dim;                 /* Tangent space dimension (0=default 4) */
 } memory_t;
 
+/* ─── Schema-v2 full-parameter memory (R10, task 7) ─────────────────────────
+ *
+ * The v1 structs above describe one flat codebook per lattice — the layout the
+ * old bridge exported (first layer only). The v3 structs below carry every
+ * layer and every side parameter the JAX model trains. Python reads
+ * manifest.json, allocates the arrays and fills these structs; C never parses
+ * JSON, never allocates, and only reads. All arrays are caller-owned.
+ *
+ * Layer offsets are the training/export layouts:
+ *   HRQ fine     C_fine[layer][row][j]   = C_fine[(layer*M_fine + row)*D + j]
+ *   LowRank      U[layer][row][j]        = U[(layer*M_lr + row)*r_max + j]
+ *   Binding      key_cb[layer][row][j]   = key_cb[(layer*M + row)*D + j]
+ *   Contrast     C_a[layer][row][j]      = C_a[(layer*M + row)*D + j]
+ */
+
+typedef struct {
+    const float* C_top;      /* [M_top][D] */
+    int          M_top;
+    const float* C_fine;     /* [n_fine][M_fine][D] */
+    int          M_fine;
+    int          n_fine;
+    const float* value_top;  /* [M_top], optional (NULL ⇒ no value bias) */
+    const float* value_fine; /* [M_fine] shared by fine layers, optional */
+} hrq_mem_t;
+
+typedef struct {
+    const float* C;          /* [M][D] */
+    int          M;
+    const float* zero_vec;   /* [D] */
+    const float* value;      /* [M], optional */
+    const float* N;          /* [M] EMA counts, optional (inference ignores) */
+    const float* m;          /* [M][D] EMA means, optional */
+    const int*   last_used;  /* [M], optional (R21 clock) */
+} sparse_mem_t;
+
+typedef struct {
+    const float* U;          /* [n_layers][M_lr][r_max], zero-padded to r_max */
+    const float* V;          /* [D][r_max] */
+    const int*   ranks;      /* [n_layers], each in [1, r_max] */
+    int          n_layers;
+    int          M_lr;
+    int          r_max;
+    const float* value;      /* [M_lr], optional */
+} lowrank_mem_t;
+
+typedef struct {
+    const float* C;          /* [M][D] */
+    int          M;
+    const float* T;          /* [M][D][t_dim] */
+    int          t_dim;
+    const float* value;      /* [M], optional */
+} manifold_mem_t;
+
+typedef struct {
+    const float* key_cb;     /* [n_layers][M][D] */
+    const float* val_cb;     /* [n_layers][M][D] */
+    const float* bind_cb;    /* [n_layers][M][D] */
+    int          M;
+    int          n_layers;
+    const float* A_k;        /* [r_max][D] HRR key projection */
+    const float* A_v;        /* [r_max][D] HRR value projection */
+    const float* value_key;  /* [M], optional */
+    const float* value_val;  /* [M], optional */
+    const float* value_bind; /* [M], optional */
+} binding_mem_t;
+
+typedef struct {
+    const float* C_a;        /* [n_layers][M][D] */
+    const float* C_b;        /* [n_layers][M][D] */
+    int          M;
+    int          n_layers;
+    const float* value_a;    /* [M], optional */
+    const float* value_b;    /* [M], optional */
+} contrast_mem_t;
+
+typedef struct {
+    const float* route_C;    /* [n_lattices][D] */
+    const float* route_W;    /* [D][n_lattices] */
+    int          n_lattices;
+    const float* alpha;      /* [n_lattices] fusion scaling */
+    const float* ln_scale;   /* [D] */
+    const float* ln_bias;    /* [D] */
+    const float* self_C;     /* [1 + M_self][D]; row 0 is frozen core (R15) */
+    int          M_self;     /* number of EMA mode rows (excludes core) */
+    float        alpha_self; /* self_bias strength */
+} fusion_mem_t;
+
+typedef struct {
+    int D;                   /* must equal LCM_D */
+    int n_lattices;          /* routing/fusion lattice count (config, ≤ MAX) */
+    hrq_mem_t      hrq;
+    sparse_mem_t   sparse;
+    lowrank_mem_t  lowrank;
+    manifold_mem_t manifold;
+    binding_mem_t  binding;
+    contrast_mem_t contrast;
+    fusion_mem_t   fusion;
+    /* Scalar hyper-parameters; defaults set by lcm_bind_memory_v3(). */
+    float tau_route;            /* Gumbel-Softmax temperature (0.5) */
+    float tau_route_fallback;   /* HRQ relative-gap threshold (0.1) */
+    float tau_self;             /* self familiarity temperature (1.0) */
+    float lambda_lfq;           /* sparse LFQ multiplier (1.5) */
+} lcm_memory_v3;
+
 /* ─── Global Value Lattice ───────────────────────────────────────────────── */
 
 typedef struct {
@@ -277,6 +381,26 @@ int  save_trace_to_file(const inference_trace_t* trace, const char* filepath);
 
 /* Compiled dimension query (runtime .so/checkpoint LCM_D mismatch check) */
 int  lcm_dim(void);
+
+/* Fill a v3 memory struct from caller-owned arrays (R10, task 7).
+ *
+ * Copies the seven per-lattice descriptors and validates them:
+ *   - D must equal LCM_D (a .so built for another dimension is rejected),
+ *   - 1 ≤ n_lattices ≤ LCM_MAX_LATTICES and fusion.n_lattices must match,
+ *   - every required pointer is non-NULL and every layer count/rank is valid.
+ * Optional pointers (value scalars, EMA state) may be NULL.
+ *
+ * No allocation, no JSON, no file I/O. Returns 0 on success, -1 on a bad
+ * descriptor. On failure `mem` is left zeroed.
+ */
+int  lcm_bind_memory_v3(lcm_memory_v3* mem, int D, int n_lattices,
+                        const hrq_mem_t* hrq,
+                        const sparse_mem_t* sparse,
+                        const lowrank_mem_t* lowrank,
+                        const manifold_mem_t* manifold,
+                        const binding_mem_t* binding,
+                        const contrast_mem_t* contrast,
+                        const fusion_mem_t* fusion);
 
 /* Conflict detection */
 bool detect_any_conflict(const float* z_next, const float* z_cur, int step,

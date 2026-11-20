@@ -341,6 +341,235 @@ static void test_bridge_uses_projected_anchors(void) {
     CHECK(ret_bad == -1, "bridge: negative input aborts");
 }
 
+/* ── v3 full-parameter memory layout (task 7) ───────────────────────────── */
+
+enum {
+    T7_M = 3,          /* rows per codebook */
+    T7_NL = 2,         /* layers for lowrank/binding/contrast */
+    T7_NF = 2,         /* HRQ fine layers */
+    T7_R = 4,          /* r_max */
+    T7_NLAT = 6        /* fusion/route lattice count */
+};
+
+static float t7_hrq_top[T7_M * LCM_D];
+static float t7_hrq_fine[T7_NF * T7_M * LCM_D];
+static float t7_sparse_C[T7_M * LCM_D];
+static float t7_sparse_zero[LCM_D];
+static float t7_lowrank_U[T7_NL * T7_M * T7_R];
+static float t7_lowrank_V[LCM_D * T7_R];
+static float t7_man_C[T7_M * LCM_D];
+static float t7_man_T[T7_M * LCM_D * 2];
+static float t7_bind_key[T7_NL * T7_M * LCM_D];
+static float t7_bind_val[T7_NL * T7_M * LCM_D];
+static float t7_bind_bind[T7_NL * T7_M * LCM_D];
+static float t7_A_k[T7_R * LCM_D];
+static float t7_A_v[T7_R * LCM_D];
+static float t7_contrast_a[T7_NL * T7_M * LCM_D];
+static float t7_contrast_b[T7_NL * T7_M * LCM_D];
+static float t7_route_C[T7_NLAT * LCM_D];
+static float t7_route_W[LCM_D * T7_NLAT];
+static float t7_alpha[T7_NLAT];
+static float t7_ln_scale[LCM_D];
+static float t7_ln_bias[LCM_D];
+static float t7_self_C[(1 + 2) * LCM_D];
+static int   t7_ranks[T7_NL] = {2, 4};
+
+/* Plant a distinguishable first element in every layer. */
+static void t7_mark_layers(float* p, int n_layers, int stride, float base) {
+    for (int l = 0; l < n_layers; l++) p[l * stride] = base + (float)l;
+}
+
+static int t7_bind_valid(lcm_memory_v3* out) {
+    hrq_mem_t hrq;
+    sparse_mem_t sparse;
+    lowrank_mem_t lowrank;
+    manifold_mem_t manifold;
+    binding_mem_t binding;
+    contrast_mem_t contrast;
+    fusion_mem_t fusion;
+
+    memset(&hrq, 0, sizeof(hrq));
+    hrq.C_top = t7_hrq_top; hrq.M_top = T7_M;
+    hrq.C_fine = t7_hrq_fine; hrq.M_fine = T7_M; hrq.n_fine = T7_NF;
+    hrq.value_top = NULL; hrq.value_fine = NULL;
+
+    memset(&sparse, 0, sizeof(sparse));
+    sparse.C = t7_sparse_C; sparse.M = T7_M;
+    sparse.zero_vec = t7_sparse_zero;
+    sparse.value = NULL; sparse.N = NULL; sparse.m = NULL; sparse.last_used = NULL;
+
+    memset(&lowrank, 0, sizeof(lowrank));
+    lowrank.U = t7_lowrank_U; lowrank.V = t7_lowrank_V;
+    lowrank.ranks = t7_ranks; lowrank.n_layers = T7_NL;
+    lowrank.M_lr = T7_M; lowrank.r_max = T7_R; lowrank.value = NULL;
+
+    memset(&manifold, 0, sizeof(manifold));
+    manifold.C = t7_man_C; manifold.M = T7_M;
+    manifold.T = t7_man_T; manifold.t_dim = 2; manifold.value = NULL;
+
+    memset(&binding, 0, sizeof(binding));
+    binding.key_cb = t7_bind_key; binding.val_cb = t7_bind_val;
+    binding.bind_cb = t7_bind_bind;
+    binding.M = T7_M; binding.n_layers = T7_NL;
+    binding.A_k = t7_A_k; binding.A_v = t7_A_v;
+    binding.value_key = NULL; binding.value_val = NULL;
+    binding.value_bind = NULL;
+
+    memset(&contrast, 0, sizeof(contrast));
+    contrast.C_a = t7_contrast_a; contrast.C_b = t7_contrast_b;
+    contrast.M = T7_M; contrast.n_layers = T7_NL;
+    contrast.value_a = NULL; contrast.value_b = NULL;
+
+    memset(&fusion, 0, sizeof(fusion));
+    fusion.route_C = t7_route_C; fusion.route_W = t7_route_W;
+    fusion.n_lattices = T7_NLAT;
+    fusion.alpha = t7_alpha; fusion.ln_scale = t7_ln_scale;
+    fusion.ln_bias = t7_ln_bias;
+    fusion.self_C = t7_self_C; fusion.M_self = 2;
+    fusion.alpha_self = 0.05f;
+
+    return lcm_bind_memory_v3(out, LCM_D, T7_NLAT, &hrq, &sparse, &lowrank,
+                              &manifold, &binding, &contrast, &fusion);
+}
+
+static void test_memory_v3_layout(void) {
+    static lcm_memory_v3 mem;
+
+    memset(t7_hrq_top, 0, sizeof(t7_hrq_top));
+    memset(t7_hrq_fine, 0, sizeof(t7_hrq_fine));
+    memset(t7_sparse_C, 0, sizeof(t7_sparse_C));
+    memset(t7_sparse_zero, 0, sizeof(t7_sparse_zero));
+    memset(t7_lowrank_U, 0, sizeof(t7_lowrank_U));
+    memset(t7_lowrank_V, 0, sizeof(t7_lowrank_V));
+    memset(t7_man_C, 0, sizeof(t7_man_C));
+    memset(t7_man_T, 0, sizeof(t7_man_T));
+    memset(t7_bind_key, 0, sizeof(t7_bind_key));
+    memset(t7_bind_val, 0, sizeof(t7_bind_val));
+    memset(t7_bind_bind, 0, sizeof(t7_bind_bind));
+    memset(t7_A_k, 0, sizeof(t7_A_k));
+    memset(t7_A_v, 0, sizeof(t7_A_v));
+    memset(t7_contrast_a, 0, sizeof(t7_contrast_a));
+    memset(t7_contrast_b, 0, sizeof(t7_contrast_b));
+    memset(t7_route_C, 0, sizeof(t7_route_C));
+    memset(t7_route_W, 0, sizeof(t7_route_W));
+    memset(t7_alpha, 0, sizeof(t7_alpha));
+    memset(t7_ln_scale, 0, sizeof(t7_ln_scale));
+    memset(t7_ln_bias, 0, sizeof(t7_ln_bias));
+    memset(t7_self_C, 0, sizeof(t7_self_C));
+
+    t7_hrq_top[1] = 11.0f;
+    t7_mark_layers(t7_hrq_fine, T7_NF, T7_M * LCM_D, 21.0f);
+    t7_mark_layers(t7_sparse_C, 1, T7_M * LCM_D, 31.0f);
+    t7_sparse_zero[0] = 41.0f;
+    t7_mark_layers(t7_lowrank_U, T7_NL, T7_M * T7_R, 51.0f);
+    t7_lowrank_V[0] = 61.0f;
+    t7_mark_layers(t7_man_C, 1, T7_M * LCM_D, 71.0f);
+    t7_mark_layers(t7_man_T, T7_M, LCM_D * 2, 81.0f);
+    t7_mark_layers(t7_bind_key, T7_NL, T7_M * LCM_D, 91.0f);
+    t7_mark_layers(t7_bind_val, T7_NL, T7_M * LCM_D, 101.0f);
+    t7_mark_layers(t7_bind_bind, T7_NL, T7_M * LCM_D, 111.0f);
+    t7_A_k[0] = 121.0f;
+    t7_A_v[0] = 131.0f;
+    t7_mark_layers(t7_contrast_a, T7_NL, T7_M * LCM_D, 141.0f);
+    t7_mark_layers(t7_contrast_b, T7_NL, T7_M * LCM_D, 151.0f);
+    t7_mark_layers(t7_route_C, T7_NLAT, LCM_D, 161.0f);
+    t7_route_W[0] = 171.0f;
+    t7_alpha[T7_NLAT - 1] = 181.0f;
+    t7_ln_scale[0] = 191.0f;
+    t7_ln_bias[0] = 201.0f;
+    t7_self_C[0] = 211.0f;
+
+    int rc = t7_bind_valid(&mem);
+    CHECK(rc == 0, "lcm_bind_memory_v3 accepts a valid descriptor");
+    CHECK(mem.D == LCM_D && mem.n_lattices == T7_NLAT,
+          "bound memory carries D and n_lattices");
+    CHECK(mem.hrq.C_top == t7_hrq_top && mem.hrq.M_top == T7_M,
+          "HRQ top pointer/rows preserved");
+    CHECK(mem.hrq.C_fine == t7_hrq_fine && mem.hrq.n_fine == T7_NF,
+          "HRQ fine pointer/layers preserved");
+    CHECK(mem.sparse.zero_vec == t7_sparse_zero,
+          "sparse zero_vec pointer preserved");
+    CHECK(mem.lowrank.U == t7_lowrank_U && mem.lowrank.ranks == t7_ranks,
+          "lowrank U/ranks pointers preserved");
+    CHECK(mem.manifold.T == t7_man_T && mem.manifold.t_dim == 2,
+          "manifold T pointer/t_dim preserved");
+    CHECK(mem.binding.A_k == t7_A_k && mem.binding.A_v == t7_A_v,
+          "binding projections preserved");
+    CHECK(mem.fusion.route_C == t7_route_C && mem.fusion.alpha_self == 0.05f,
+          "fusion route/alpha_self preserved");
+    CHECK(mem.fusion.self_C == t7_self_C && mem.fusion.M_self == 2,
+          "fusion self codebook preserved");
+
+    /* Every layer starts at layer * M * D (or layer * M * r_max for U). */
+    int layers_ok = 1;
+    for (int l = 0; l < T7_NL; l++) {
+        if (mem.lowrank.U[l * T7_M * T7_R] != 51.0f + (float)l) layers_ok = 0;
+        if (mem.binding.key_cb[l * T7_M * LCM_D] != 91.0f + (float)l) layers_ok = 0;
+        if (mem.binding.val_cb[l * T7_M * LCM_D] != 101.0f + (float)l) layers_ok = 0;
+        if (mem.binding.bind_cb[l * T7_M * LCM_D] != 111.0f + (float)l) layers_ok = 0;
+        if (mem.contrast.C_a[l * T7_M * LCM_D] != 141.0f + (float)l) layers_ok = 0;
+        if (mem.contrast.C_b[l * T7_M * LCM_D] != 151.0f + (float)l) layers_ok = 0;
+    }
+    for (int l = 0; l < T7_NF; l++)
+        if (mem.hrq.C_fine[l * T7_M * LCM_D] != 21.0f + (float)l) layers_ok = 0;
+    for (int l = 0; l < T7_NLAT; l++)
+        if (mem.fusion.route_C[l * LCM_D] != 161.0f + (float)l) layers_ok = 0;
+    CHECK(layers_ok, "v3 layer offset = layer*M*D (and layer*M*r_max for U)");
+    CHECK(mem.lowrank.ranks[1] == 4 && mem.lowrank.r_max == T7_R,
+          "lowrank ranks kept per layer");
+    CHECK(mem.tau_route == 0.5f && mem.tau_route_fallback == 0.1f
+              && mem.lambda_lfq == 1.5f,
+          "bind sets the documented scalar defaults");
+
+    /* D / layer-count / pointer validation. */
+    CHECK(t7_bind_valid(&mem) == 0, "re-binding an already bound struct works");
+    CHECK(lcm_bind_memory_v3(&mem, LCM_D - 1, T7_NLAT,
+                             &(hrq_mem_t){0}, &(sparse_mem_t){0},
+                             &(lowrank_mem_t){0}, &(manifold_mem_t){0},
+                             &(binding_mem_t){0}, &(contrast_mem_t){0},
+                             &(fusion_mem_t){0}) == -1,
+          "rejects D != LCM_D");
+    CHECK(mem.D == 0, "a rejected bind leaves mem zeroed");
+
+    int bad_ranks[2] = {1, T7_R + 1};
+    lowrank_mem_t bad_lr;
+    binding_mem_t bad_bind;
+    fusion_mem_t  bad_fu;
+    hrq_mem_t hrq; sparse_mem_t sp; manifold_mem_t man;
+    contrast_mem_t ct;
+
+    memset(&hrq, 0, sizeof(hrq));
+    hrq.C_top = t7_hrq_top; hrq.M_top = T7_M;
+    hrq.C_fine = t7_hrq_fine; hrq.M_fine = T7_M; hrq.n_fine = T7_NF;
+    memset(&sp, 0, sizeof(sp));
+    sp.C = t7_sparse_C; sp.M = T7_M; sp.zero_vec = t7_sparse_zero;
+    memset(&man, 0, sizeof(man));
+    man.C = t7_man_C; man.M = T7_M; man.T = t7_man_T; man.t_dim = 2;
+    memset(&ct, 0, sizeof(ct));
+    ct.C_a = t7_contrast_a; ct.C_b = t7_contrast_b; ct.M = T7_M;
+    ct.n_layers = T7_NL;
+
+    bad_lr = (lowrank_mem_t){0};
+    bad_lr.U = t7_lowrank_U; bad_lr.V = t7_lowrank_V;
+    bad_lr.ranks = bad_ranks; bad_lr.n_layers = T7_NL;
+    bad_lr.M_lr = T7_M; bad_lr.r_max = T7_R;
+    bad_bind = (binding_mem_t){0};
+    bad_bind.key_cb = t7_bind_key; bad_bind.val_cb = t7_bind_val;
+    bad_bind.bind_cb = t7_bind_bind;
+    bad_bind.M = T7_M; bad_bind.n_layers = 0;
+    bad_bind.A_k = t7_A_k; bad_bind.A_v = t7_A_v;
+    bad_fu = (fusion_mem_t){0};
+    bad_fu.route_C = t7_route_C; bad_fu.route_W = t7_route_W;
+    bad_fu.n_lattices = T7_NLAT;
+    bad_fu.alpha = NULL;  /* required */
+    bad_fu.ln_scale = t7_ln_scale; bad_fu.ln_bias = t7_ln_bias;
+    bad_fu.self_C = t7_self_C; bad_fu.M_self = 2;
+
+    CHECK(lcm_bind_memory_v3(&mem, LCM_D, T7_NLAT, &hrq, &sp, &bad_lr,
+                             &man, &bad_bind, &ct, &bad_fu) == -1,
+          "rejects rank > r_max / zero binding layers / NULL fusion alpha");
+}
+
 static void test_hrr_no_overwrite(void) {
     /* Regression: HRR bind/unbind nodes used to leak into outputs[0] (the
      * HRQ slot) — the fused z came out as ~1/D phase-reconstruction garbage
@@ -403,6 +632,7 @@ int main(void) {
     test_danger_threshold_relative_gap();
     test_danger_hash_tamper();
     test_bridge_uses_projected_anchors();
+    test_memory_v3_layout();
     test_hrr_no_overwrite();
     test_fusion_l2_weights();
     if (failures == 0)

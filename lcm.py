@@ -34,6 +34,10 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 import numpy as np
 from tqdm import tqdm
 
+# JAX-free schema-v2 loader: reads manifest.json and returns every layer the
+# C engine binds. Kept importable without JAX (the C inference path).
+from train.c_load import load_lattice_memories
+
 try:
     import jax
     import jax.numpy as jnp
@@ -1598,49 +1602,68 @@ class LCMInferEngine:
         self._last_agency_mod = {'tension': 0.0, 'explore': 0.0}
 
     def _load_codebooks(self):
+        """Load every layer and side tensor from the v2 manifest (R10).
+
+        The old loader took only HRQ block 0 / binding layer 0 / contrast C_a
+        layer 0 and treated the rest of each file as absent. The v3 memory
+        needs all layers plus route/fusion/value scalars/self/binding
+        projections, so the manifest-driven loader is the single source.
+        """
         ckpt = self.checkpoint_dir
-        hrq_data, _, _ = load_codebook_for_c(ckpt, "hrq_codebook.bin")
-        n_hrq = self.cfg.get('n_hrq_layers', 3)
-        M_top = self.cfg.get('M_top', 512)
-        M_fine = self.cfg.get('M_fine', 256)
-        self.hrq_M = M_top + n_hrq * M_fine
-        self.hrq_C = hrq_data
+        mem = load_lattice_memories(str(ckpt), self.cfg)
+        self.memory_v3 = mem  # keeps every array alive for ctypes pointers
 
-        sparse_data, _, _ = load_codebook_for_c(ckpt, "sparse_codebook.bin")
-        self.sparse_M = self.cfg.get('M_sparse', 512)
-        self.sparse_C = np.ascontiguousarray(
-            sparse_data[:self.sparse_M * self.d], dtype=np.float32)
+        # HRQ: flat order top then fine layers, which is what hrq_forward_c
+        # indexes (C_top followed by n_fine blocks of C_fine).
+        self.hrq_top = mem['hrq_top']
+        self.hrq_fine = mem['hrq_fine']
+        n_fine, M_fine, _ = self.hrq_fine.shape
+        self.hrq_M = mem['hrq_top'].shape[0] + n_fine * M_fine
+        self.hrq_C = np.ascontiguousarray(np.concatenate([
+            self.hrq_top.ravel(), self.hrq_fine.ravel()]))
 
-        lr_flat = np.fromfile(ckpt / "lowrank_codebook.bin", dtype=np.float32)
-        M_lr = self.cfg.get('M_lr', 256)
-        ranks = self.cfg.get('ranks', [2, 4, 8])
-        self.lr_M = M_lr
-        pos, U_list = 0, []
-        for r_k in ranks:
-            U_list.append(lr_flat[pos:pos + M_lr * r_k].reshape(M_lr, r_k))
-            pos += M_lr * r_k
+        self.sparse_M = mem['sparse_C'].shape[0]
+        self.sparse_C = np.ascontiguousarray(mem['sparse_C'].ravel())
+        self.sparse_zero = np.ascontiguousarray(mem['sparse_zero'].ravel())
+
+        self.lr_M = mem['lowrank_U'].shape[1]
+        self.lr_U = mem['lowrank_U']
+        self.lr_V = mem['lowrank_V']
+        self.lr_ranks = mem['lowrank_ranks']
+        r0 = int(self.lr_ranks[0])
+        # The v1/v2 bridges still take one codebook; reconstruct layer 0 at
+        # its own rank, exactly like train/lattices.py::lowrank_forward.
         self.lr_C = np.ascontiguousarray(
-            U_list[0] @ lr_flat[pos:].reshape(self.d, -1)[:, :ranks[0]].T,
-            dtype=np.float32)
+            self.lr_U[0, :, :r0] @ self.lr_V[:, :r0].T)
 
-        man_data, self.man_M, _ = load_codebook_for_c(ckpt, "manifold_codebook.bin")
-        self.man_C = np.ascontiguousarray(man_data[:self.man_M * self.d], dtype=np.float32)
-        t_dim = self.cfg.get('t_dim', 4)
-        self.man_T = np.ascontiguousarray(man_data[self.man_M * self.d:], dtype=np.float32)
-        self.man_t_dim = t_dim
+        self.man_M = mem['manifold_C'].shape[0]
+        self.man_C = np.ascontiguousarray(mem['manifold_C'].ravel())
+        self.man_T = np.ascontiguousarray(mem['manifold_T'].ravel())
+        self.man_t_dim = mem['manifold_T'].shape[2]
 
-        bind_flat = np.fromfile(ckpt / "bind_codebook.bin", dtype=np.float32)
-        M_bind = self.cfg.get('M_bind', 512)
-        self.bind_M = M_bind
-        offset = 2 * M_bind * self.d
-        self.bind_C = np.ascontiguousarray(
-            bind_flat[offset:offset + M_bind * self.d], dtype=np.float32)
+        self.bind_M = mem['bind_key'].shape[1]
+        self.bind_key = mem['bind_key']
+        self.bind_val = mem['bind_val']
+        self.bind_bind = mem['bind_bind']
+        self.bind_A_k = mem['bind_A_k']
+        self.bind_A_v = mem['bind_A_v']
+        self.bind_C = np.ascontiguousarray(self.bind_bind[0].ravel())
 
-        contrast_flat = np.fromfile(ckpt / "contrast_codebook.bin", dtype=np.float32)
-        M_contrast = self.cfg.get('M_contrast', 512)
-        self.contrast_M = M_contrast
-        self.contrast_C = np.ascontiguousarray(
-            contrast_flat[:M_contrast * self.d], dtype=np.float32)
+        self.contrast_M = mem['contrast_a'].shape[1]
+        self.contrast_a = mem['contrast_a']
+        self.contrast_b = mem['contrast_b']
+        self.contrast_C = np.ascontiguousarray(self.contrast_a[0].ravel())
+
+        self.route_C = mem['route_C']
+        self.route_W = mem['route_W']
+        self.fusion_alpha = mem['fusion_alpha']
+        self.fusion_ln_scale = mem['fusion_ln_scale']
+        self.fusion_ln_bias = mem['fusion_ln_bias']
+        self.value_scalars = mem['value_scalars']
+        self.self_C = mem['self_C']
+        self.self_M = mem['self_C'].shape[0]
+        self.self_tau = mem['self_tau']
+        self.self_bias = mem['self_bias']
 
         gv_data, gv_n, _ = load_codebook_for_c(ckpt, "gvalue_codebook.bin")
         gv_pos = gv_data[:gv_n * self.d]

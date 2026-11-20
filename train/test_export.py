@@ -101,11 +101,37 @@ def test_manifest_covers_exported_tensors(exported):
                          dtype=np.float32, offset=HEADER_SIZE_V2)
     assert tensors["sparse_codebook"]["sha256"] == canonical_sha256(
         {"sparse_codebook": sparse})
-    # offset/length locate each tensor in the canonical stream.
+    # canonical_offset/length locate each tensor in the canonical stream.
     offset = 0
-    for entry in sorted(tensors.values(), key=lambda e: e["offset"]):
-        assert entry["offset"] == offset
+    for entry in sorted(tensors.values(),
+                        key=lambda e: e["canonical_offset"]):
+        assert entry["canonical_offset"] == offset
         offset += entry["length"]
+    # Ruling 9: exported payloads also map to their real file and byte offset.
+    for name, filename in (
+            ("encoder", "encoder.bin"),
+            ("decoder", "decoder.bin"),
+            ("hrq_codebook", "hrq_codebook.bin"),
+            ("sparse_codebook", "sparse_codebook.bin"),
+            ("lowrank_codebook", "lowrank_codebook.bin"),
+            ("manifold_codebook", "manifold_codebook.bin"),
+            ("bind_codebook", "bind_codebook.bin"),
+            ("contrast_codebook", "contrast_codebook.bin"),
+            ("gvalue_codebook", "gvalue_codebook.bin"),
+            ("danger_codebook", "danger_codebook.bin"),
+            ("route_codebook", "route_codebook.bin"),
+            ("fusion", "fusion.bin"),
+            ("value_scalars", "value_scalars.bin"),
+            ("self_lattice", "self_lattice.bin"),
+            ("binding_proj", "binding_proj.bin")):
+        assert tensors[name]["file"] == filename
+    for name in ("hrq_codebook", "sparse_codebook", "manifold_codebook",
+                 "gvalue_codebook", "danger_codebook", "value_scalars"):
+        assert tensors[name]["offset"] == HEADER_SIZE_V2
+    for name in ("encoder", "decoder", "lowrank_codebook", "bind_codebook",
+                 "contrast_codebook", "route_codebook", "fusion",
+                 "self_lattice", "binding_proj"):
+        assert tensors[name]["offset"] == 0
 
 
 def test_exported_config_carries_the_real_training_config(exported):

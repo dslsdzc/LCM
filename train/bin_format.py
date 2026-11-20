@@ -56,17 +56,40 @@ def canonical_sha256(tensors):
     return h.hexdigest()
 
 
-def save_manifest(output_dir, tensors):
+def _normalise_file_ref(ref):
+    """Normalise a ``file_map`` value to ``(filename, byte_offset)``.
+
+    Accepted forms: ``"x.bin"``, ``("x.bin", 32)``, or
+    ``{"file": "x.bin", "offset": 32}``. The offset is the byte position of
+    the tensor payload inside the file (32 for header-bearing v2 codebooks).
+    """
+    if isinstance(ref, str):
+        return ref, 0
+    if isinstance(ref, (tuple, list)) and len(ref) == 2:
+        return str(ref[0]), int(ref[1])
+    if isinstance(ref, dict) and 'file' in ref:
+        return str(ref['file']), int(ref.get('offset', 0))
+    raise TypeError(f"bad file_map entry {ref!r}; expected str/(name, off)/dict")
+
+
+def save_manifest(output_dir, tensors, file_map=None):
     """Write manifest.json describing every tensor in canonical form.
 
     Tensors must already be float32: silently casting a float64 tensor would
-    record a dtype the caller did not have. ``offset``/``length`` locate the
-    tensor in the canonical float32 stream (name-sorted, concatenated), not in
-    a particular .bin file: the manifest is an integrity record, and the
-    logical names map to files by convention.
+    record a dtype the caller did not have.
+
+    ``canonical_offset`` always locates the tensor in the canonical float32
+    stream (name-sorted, concatenated) used by ``canonical_sha256``.
+    ``canonical_sha256`` itself stays name-sorted and independent of files.
+
+    ``file_map`` is optional and maps a logical tensor name to the ``.bin``
+    file (and byte offset) that actually stores its payload. When supplied,
+    the entry gains a ``file`` field and ``offset`` becomes the byte offset
+    inside that file (Ruling 9); ``canonical_offset`` keeps the stream
+    position. Tensors without a mapping keep ``offset == canonical_offset``.
     """
     entries = {}
-    offset = 0
+    canonical_offset = 0
     for name in sorted(tensors):
         source = np.asarray(tensors[name])
         if source.dtype != np.float32:
@@ -74,15 +97,21 @@ def save_manifest(output_dir, tensors):
                 f"manifest tensor {name!r} must be float32, got {source.dtype}")
         a = np.ascontiguousarray(source, dtype='<f4')
         length = a.nbytes
-        entries[name] = {
+        entry = {
             'name': name,
             'shape': [int(x) for x in a.shape],
             'dtype': 'float32',
-            'offset': offset,
+            'offset': canonical_offset,
+            'canonical_offset': canonical_offset,
             'length': length,
             'sha256': hashlib.sha256(_canonical_tensor_bytes(a)).hexdigest(),
         }
-        offset += length
+        if file_map is not None and name in file_map:
+            filename, file_offset = _normalise_file_ref(file_map[name])
+            entry['file'] = filename
+            entry['offset'] = file_offset
+        entries[name] = entry
+        canonical_offset += length
     manifest = {'format_version': FORMAT_VERSION, 'tensors': entries}
     path = os.path.join(output_dir, MANIFEST_NAME)
     with open(path, 'w') as f:
