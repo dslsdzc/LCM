@@ -73,6 +73,9 @@ def create_train_state(cfg: LCMConfig, rng, enable_continual=True):
             'bind': [{'N': jnp.zeros(cfg.M_bind), 'm': jnp.zeros((cfg.M_bind, cfg.d_model))}
                      for _ in range(cfg.n_bind_layers)],
         },
+        # R15: C_self[0] is frozen; C_self[1:] is EMA-owned.
+        'self': {'N': jnp.zeros(cfg.n_self_codes),
+                 'm': jnp.zeros((cfg.n_self_codes, cfg.d_model))},
     }
 
     # Feature bank (dead vector prevention)
@@ -193,11 +196,46 @@ def _jitted_ema(params, ema_state, z, aux, cfg):
             states.append({'N': N_new, 'm': m_new})
         binding_new[key] = states
 
+    # Self (R15) — nearest row per sample; row 0 stays frozen. Stage-1 has no
+    # last_used field, matching the existing sparse/manifold accumulators.
+    if 'self' in params:
+        C_self = params['self']['C_self']
+        idx = (aux or {}).get('self_idx')
+        if idx is None:
+            counts_self, sums_self = _assign(C_self, z)
+        else:
+            onehot_self = jax.nn.one_hot(
+                jnp.asarray(idx, dtype=jnp.int32), C_self.shape[0],
+                dtype=jnp.float32)
+            counts_self = onehot_self.sum(axis=0)
+            sums_self = onehot_self.T @ z
+        prev_self = ema_state.get('self')
+        if prev_self is None:
+            prev_self = {'N': jnp.zeros(C_self.shape[0]),
+                         'm': jnp.zeros_like(C_self)}
+        g_self = cfg.get('gamma_self', 0.99)
+        N_self_new = g_self * prev_self['N'] + (1 - g_self) * counts_self
+        m_self_new = g_self * prev_self['m'] + (1 - g_self) * sums_self
+        # An unassigned row keeps its vector rather than collapsing to zero.
+        C_self_new = jnp.where(
+            (N_self_new > 0.0)[:, None],
+            m_self_new / jnp.clip(N_self_new, 1.0)[:, None],
+            C_self)
+        C_self_new = C_self_new.at[0].set(C_self[0])
+        N_self_new = N_self_new.at[0].set(0.0)
+        m_self_new = m_self_new.at[0].set(0.0)
+        params['self'] = dict(params['self'], C_self=C_self_new)
+        self_state_new = {'N': N_self_new, 'm': m_self_new}
+    else:
+        self_state_new = ema_state.get('self')
+
     ema_state_new = {
         'sparse': {'N': N_s_new, 'm': m_s_new},
         'manifold': {'N': N_m_new, 'm': m_m_new},
         'binding': binding_new,
     }
+    if self_state_new is not None:
+        ema_state_new['self'] = self_state_new
     return params, ema_state_new
 
 

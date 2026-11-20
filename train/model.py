@@ -66,9 +66,20 @@ def init_all_params(cfg: LCMConfig, rng):
     # Shared low-rank base V (stored in lowrank params, used by binding)
     # Already in params['lowrank']
 
-    # Self lattice params (initialized but managed separately)
+    # Self lattice params. R15 seeds C_self[1:] from a small batch of
+    # bottleneck vectors produced by the freshly initialised encoder (the
+    # e.md §6 "sampled from early encoder outputs" path). The core row stays a
+    # separate frozen identity anchor.
+    n_modes = max(1, int(cfg.n_self_codes) - 1)
+    seq = max(2, min(int(cfg.max_seq_len), 16))
+    sample_tokens = jax.random.randint(
+        jax.random.fold_in(keys[11], 101), (n_modes, seq), 0, cfg.vocab_size,
+        dtype=jnp.int32)
+    self_samples = safe_unit(encoder_forward(
+        params['encoder'], sample_tokens, cfg.n_heads))
     params['self'] = init_self_params(
-        keys[11], d, cfg.n_self_codes, alpha_self=cfg.alpha_self)
+        keys[11], d, cfg.n_self_codes, init_samples=self_samples,
+        alpha_self=cfg.alpha_self)
     self_state = init_self_state(cfg.n_self_codes, d)
 
     # Global value lattice — not in params (excluded from optimizer)
@@ -121,7 +132,8 @@ def forward(params, gvalue, x, cfg: LCMConfig, training=True, rng=None,
     self_bias = None
     if 'self' in params:
         self_output, self_bias, self_aux = self_lattice_forward(
-            params['self'], z, training=training, return_aux=True)
+            params['self'], z, training=training, return_aux=True,
+            alpha_self=cfg.alpha_self)
         if self_state is not None:
             self_state_out = update_self_state(
                 self_state, self_aux['idx'], self_output,
@@ -172,6 +184,7 @@ def forward(params, gvalue, x, cfg: LCMConfig, training=True, rng=None,
         'safety_margin': min_margin,
         'self_state': self_state_out,
         'self_bias': self_bias,
+        'self_idx': self_aux['idx'] if 'self' in params else None,
         'world_dev': world_dev,
     }
 
@@ -193,9 +206,17 @@ def get_frozen_param_names():
     README and the EMA design; it was never applied anywhere, so nothing
     depended on it. ``gvalue`` is absent from ``params`` altogether (it lives
     on ``TrainingState`` as a ``GValueCodebook``) and needs no entry.
+
+    R15 ``self/C_self`` is different: it is *EMA-only* (no gradient path) and
+    row 0 is permanently frozen. Stage-1/train_memory restore this leaf after
+    AdamW so weight decay cannot move the core; their per-code EMA pass then
+    writes the mode rows. ``self/bias_self`` is the frozen mirror of
+    ``cfg.alpha_self`` (Ruling 34), never a learned parameter.
     """
     return [
         'danger/C',      # Danger lattice — frozen, never trained
+        'self/C_self',   # R15: EMA-owned; row 0 is the identity anchor
+        'self/bias_self',  # R15/Ruling 34: frozen cfg.alpha_self mirror
     ]
 
 

@@ -51,21 +51,14 @@ import numpy as np
 # because train.checkpoint is the public checkpoint API.
 from train.bin_format import (  # noqa: F401  (re-exported)
     FORMAT_VERSION, HEADER_FMT_V2, HEADER_SIZE_V2, MANIFEST_NAME,
-    OLD_FORMAT_ERROR, _compute_checksum, canonical_sha256, load_manifest,
-    read_bin_v2, save_manifest, value_scalar_specs as _value_scalar_specs,
+    OLD_FORMAT_ERROR, SELF_LAYOUT_TAG, _compute_checksum, canonical_sha256,
+    load_manifest, read_bin_v2, save_manifest,
+    value_scalar_specs as _value_scalar_specs,
 )
 
 # Codebook type constants
 CB_EUCLIDEAN = 1
 CB_HYPERBOLIC = 2
-
-# R15 self_lattice.bin layout tag. The payload is
-#   C_self[0] (core, d) | C_self[1:] (modes, (M-1)*d) | tag (1) | bias_self (1)
-# The tag occupies the slot the pre-R15 format called ``tau_self``. The C
-# loader reads it as an unused temperature (default 1.0), so it is safe to use
-# as a marker here; old ``core + modes + tau + bias`` files carry 1.0 and are
-# rejected instead of silently reinterpreted as C_self (Ruling 11).
-SELF_LAYOUT_TAG = -1.0
 
 
 def _pack_header(M, d, n_layers, cb_type, curvature=1.0):
@@ -424,7 +417,8 @@ def save_checkpoint(state, cfg, output_dir="checkpoint", step=None):
     # made resume non-deterministic.
     _save_fusion(params, os.path.join(output_dir, "fusion.bin"))
     _save_value_scalars(params, os.path.join(output_dir, "value_scalars.bin"), cfg)
-    _save_self(params, os.path.join(output_dir, "self_lattice.bin"))
+    _save_self(params, os.path.join(output_dir, "self_lattice.bin"),
+               alpha_self=cfg.alpha_self)
     _save_binding_proj(params, os.path.join(output_dir, "binding_proj.bin"))
     print(f"  [CKPT] fusion / value_scalars / self_lattice / binding_proj")
 
@@ -495,26 +489,33 @@ def _save_value_scalars(params, path, cfg):
     return flat
 
 
-def _save_self(params, path):
+def _save_self(params, path, alpha_self=None):
     """self lattice params: C_self rows + R15 layout tag + bias_self.
 
     Layout (kept compatible with ``infer/c_load.py``): row 0 is the frozen
     core, rows 1: are the EMA modes, then two scalars. The first scalar is the
-    pre-R15 ``tau_self`` slot, now a layout tag; the second is ``bias_self``
-    (the familiarity strength, exported to C as ``alpha_self``).
+    pre-R15 ``tau_self`` slot, now a layout tag; the second is the familiarity
+    strength, exported to C as ``alpha_self``.
+
+    ``alpha_self`` (when given) is the frozen config scalar of the current run
+    (Ruling 34); otherwise the frozen ``params['self']['bias_self']`` mirror is
+    used. Either way the written value is clamped non-negative.
     """
     sp = params['self']
     C_self = np.asarray(sp['C_self'], dtype=np.float32)
     if C_self.ndim != 2 or C_self.shape[0] < 1:
         raise ValueError(f"C_self must be (M_self, d), got {C_self.shape}")
-    bias = np.asarray(sp['bias_self'], dtype=np.float32).ravel()
-    if bias.size != 1:
-        raise ValueError(f"bias_self must be scalar, got shape {bias.shape}")
+    raw_alpha = (sp['bias_self'] if alpha_self is None
+                 else alpha_self)
+    alpha = np.asarray(raw_alpha, dtype=np.float32).ravel()
+    if alpha.size != 1:
+        raise ValueError(f"alpha_self must be scalar, got shape {alpha.shape}")
+    # Ruling 34: export the clamped, non-negative strength C will actually use.
+    alpha_value = float(np.maximum(alpha[0], 0.0))
     flat = np.concatenate([
         C_self[0].ravel(),
         C_self[1:].ravel(),
-        np.array([SELF_LAYOUT_TAG], dtype=np.float32),
-        bias,
+        np.array([SELF_LAYOUT_TAG, alpha_value], dtype=np.float32),
     ]).astype(np.float32)
     flat.tofile(path)
     return flat
@@ -602,7 +603,7 @@ def _load_self(path, cfg):
             "self_lattice.bin predates R15 (no C_self layout tag); old "
             "core+modes weights are discarded, not migrated")
     C_self = jnp.array(flat[:n_rows * d].reshape(n_rows, d))
-    bias_self = jnp.array(flat[-1])
+    bias_self = jnp.maximum(jnp.array(flat[-1]), 0.0)
     return {'C_self': C_self, 'bias_self': bias_self}
 
 
@@ -753,6 +754,11 @@ def load_checkpoint(output_dir, cfg=None, rng=None, load_opt=True,
             f"{self_path} is missing; a checkpoint without C_self is not a "
             f"valid R15 model. Pass allow_missing_self=True to reset it "
             f"explicitly (old core+modes weights are discarded, not migrated)")
+
+    # Ruling 34: alpha_self is a frozen config scalar. The checkpoint's
+    # bias_self is a mirror for the C export, not a learned parameter.
+    params['self']['bias_self'] = jnp.asarray(
+        cfg.alpha_self, dtype=jnp.float32)
 
     # HRQ codebook (flat format — varying M per layer)
     hrq_path = os.path.join(output_dir, "hrq_codebook.bin")

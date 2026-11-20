@@ -26,6 +26,15 @@ FORMAT_VERSION = 2
 OLD_FORMAT_ERROR = "old checkpoint format; re-export required"
 MANIFEST_NAME = "manifest.json"
 
+# R15 self_lattice.bin layout tag. The payload is
+#   C_self[0] (core, d) | C_self[1:] (modes, (M-1)*d) | tag (1) | bias_self (1)
+# The tag occupies the slot the pre-R15 format called ``tau_self``. The C
+# loader reads it as an unused temperature, so it is safe as a marker here; old
+# ``core + modes + tau + bias`` files carry 1.0 and must be rejected, never
+# reinterpreted as C_self (Ruling 11/35). Kept in this JAX-free module so
+# ``train/c_load.py`` can validate it without importing train.checkpoint.
+SELF_LAYOUT_TAG = -1.0
+
 # Frozen contract (R10): the format is 32 bytes, not whatever calcsize says
 # after an accidental edit.
 assert HEADER_SIZE_V2 == 32, HEADER_SIZE_V2

@@ -140,7 +140,9 @@ def test_frozen_constants_stay_out_of_the_optimizer_tree():
     # C_self belongs wholly to the EMA group (a JAX array cannot be split), so
     # the core row is protected inside ema_update_self, not by a frozen path.
     assert 'C_self' in em['self'] and 'C_self' not in tr.get('self', {})
-    assert 'bias_self' in tr['self'] and 'bias_self' not in em['self']
+    # Ruling 34: bias_self is the frozen cfg.alpha_self mirror, not trainable.
+    assert 'bias_self' in fr['self'] and 'bias_self' not in tr.get('self', {})
+    assert 'bias_self' not in em['self']
     # The frozen Qwen bridge is ~2 GB and must never enter AdamW.
     assert 'qwen' in fr and 'qwen' not in tr
     assert 'z_proj' not in tr and 'z_proj' in fr

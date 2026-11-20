@@ -32,7 +32,9 @@ from jax import lax
 
 from train.config import LCMConfig
 from train.data import WikiDataIter
-from train.model import init_all_params, forward
+from train.model import (
+    forward, get_frozen_param_names, init_all_params, restore_frozen_params,
+)
 from train.losses import compute_vq_loss
 from train.lattices import manifold_orth_loss
 
@@ -112,8 +114,15 @@ def make_memory_step(cfg, gvalue_C_pos, gvalue_C_neg):
         # Restore original gen_head (optimizer shouldn't have changed it)
         new_params['gen_head'] = params['gen_head']
 
+        # R15/Ruling 36: C_self and the frozen alpha mirror are EMA-owned, not
+        # optimizer parameters. AdamW's decoupled weight decay moves every leaf
+        # regardless of gradient, so restore the frozen prefix before the EMA
+        # pass writes C_self[1:].
+        new_params = restore_frozen_params(
+            new_params, params, tuple(get_frozen_param_names()))
+
         # ── EMA updates (codebook-specific) ───────────────────────────
-        new_params, new_ema = _jitted_ema(new_params, ema_state, z)
+        new_params, new_ema = _jitted_ema(new_params, ema_state, z, aux)
 
         # ── Feature bank ──────────────────────────────────────────────
         new_fb = _jitted_feature_bank(feature_bank, z, step)
@@ -126,7 +135,7 @@ def make_memory_step(cfg, gvalue_C_pos, gvalue_C_neg):
 # ─── EMA + Feature bank helpers (from train.py) ─────────────────────────
 
 @jax.jit
-def _jitted_ema(params, ema_state, z):
+def _jitted_ema(params, ema_state, z, aux=None):
     """EMA updates for sparsely-managed codebooks.
 
     按最近码索引做每码本更新：z 只更新其最近码的 N/m 累计量，
@@ -165,11 +174,44 @@ def _jitted_ema(params, ema_state, z):
     m_m_new = 0.99 * m_m + 0.01 * sums_m
     params['manifold']['C'] = m_m_new / jnp.clip(N_m_new, 1.0)[:, None]
 
+    # Self (R15): C_self[0] frozen, modes EMA-updated from the row the forward
+    # selected. Stage-1/train_memory do not persist last_used for this state.
+    self_state_new = ema_state.get('self')
+    if 'self' in params:
+        C_self = params['self']['C_self']
+        idx = (aux or {}).get('self_idx')
+        if idx is None:
+            dists_self = jnp.sum(
+                (z[:, None, :] - C_self[None, :, :]) ** 2, axis=-1)
+            idx = jnp.argmin(dists_self, axis=-1)
+        onehot_self = jax.nn.one_hot(
+            jnp.asarray(idx, dtype=jnp.int32), C_self.shape[0],
+            dtype=jnp.float32)
+        counts_self = onehot_self.sum(axis=0)
+        sums_self = onehot_self.T @ z
+        prev_self = self_state_new
+        if prev_self is None:
+            prev_self = {'N': jnp.zeros(C_self.shape[0]),
+                         'm': jnp.zeros_like(C_self)}
+        N_self_new = 0.99 * prev_self['N'] + 0.01 * counts_self
+        m_self_new = 0.99 * prev_self['m'] + 0.01 * sums_self
+        C_self_new = jnp.where(
+            (N_self_new > 0.0)[:, None],
+            m_self_new / jnp.clip(N_self_new, 1.0)[:, None],
+            C_self)
+        C_self_new = C_self_new.at[0].set(C_self[0])
+        N_self_new = N_self_new.at[0].set(0.0)
+        m_self_new = m_self_new.at[0].set(0.0)
+        params['self'] = dict(params['self'], C_self=C_self_new)
+        self_state_new = {'N': N_self_new, 'm': m_self_new}
+
     new_ema = {
         'sparse': {'N': N_s_new, 'm': m_s_new},
         'manifold': {'N': N_m_new, 'm': m_m_new},
         'binding': ema_state.get('binding', {}),
     }
+    if self_state_new is not None:
+        new_ema['self'] = self_state_new
     return params, new_ema
 
 
@@ -232,6 +274,9 @@ def train_memory(cfg, data_path, shape_path, output_dir,
             'sparse': {'N': jnp.zeros(cfg.M_sparse), 'm': jnp.zeros((cfg.M_sparse, cfg.d_model))},
             'manifold': {'N': jnp.zeros(cfg.M_man), 'm': jnp.zeros((cfg.M_man, cfg.d_model))},
             'binding': {},
+            # R15: row 0 is the frozen core; modes 1: are EMA-updated.
+            'self': {'N': jnp.zeros(cfg.n_self_codes),
+                     'm': jnp.zeros((cfg.n_self_codes, cfg.d_model))},
         }
         feature_bank = {
             'bank': jnp.zeros((cfg.bank_capacity, cfg.d_model)),
@@ -247,6 +292,9 @@ def train_memory(cfg, data_path, shape_path, output_dir,
             'sparse': {'N': jnp.zeros(cfg.M_sparse), 'm': jnp.zeros((cfg.M_sparse, cfg.d_model))},
             'manifold': {'N': jnp.zeros(cfg.M_man), 'm': jnp.zeros((cfg.M_man, cfg.d_model))},
             'binding': {},
+            # R15: row 0 is the frozen core; modes 1: are EMA-updated.
+            'self': {'N': jnp.zeros(cfg.n_self_codes),
+                     'm': jnp.zeros((cfg.n_self_codes, cfg.d_model))},
         }
         feature_bank = {
             'bank': jnp.zeros((cfg.bank_capacity, cfg.d_model)),

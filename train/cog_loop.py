@@ -207,7 +207,8 @@ def cog_loop_scan(z, params, cfg, max_steps=None, rng=None,
         self_extras = {}
         if 'self' in params:
             self_output, self_bias, self_aux = self_lattice_forward(
-                params['self'], z_cur, training=True, return_aux=True)
+                params['self'], z_cur, training=True, return_aux=True,
+                alpha_self=cfg.alpha_self)
             self_extras = {
                 'self_idx': self_aux['idx'],
                 'self_bias': self_bias,

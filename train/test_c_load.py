@@ -10,10 +10,11 @@ import struct
 import zlib
 
 import numpy as np
+import pytest
 
 from train.bin_format import (
-    FORMAT_VERSION, HEADER_FMT_V2, HEADER_SIZE_V2, canonical_sha256,
-    load_manifest, save_manifest,
+    FORMAT_VERSION, HEADER_FMT_V2, HEADER_SIZE_V2, SELF_LAYOUT_TAG,
+    canonical_sha256, load_manifest, save_manifest,
 )
 from lcm import load_lattice_memories
 
@@ -63,7 +64,9 @@ def _cfg():
         'M_contrast': M_CONTRAST,
         'n_contrast_layers': N_CONTRAST,
         'n_lattices': N_LATTICES,
-        'n_self_codes': N_SELF,
+        'n_self_codes': N_SELF + 1,
+        'n_self_rows': N_SELF + 1,
+        'n_self_modes': N_SELF,
     }
 
 
@@ -208,13 +211,13 @@ def _build_fixture(tmp_path, ranks=RANKS):
                       tensors['value_scalars'])
     file_map['value_scalars'] = ('value_scalars.bin', HEADER_SIZE_V2)
 
-    # Self: core + modes + tau + bias.
+    # Self: C_self rows (core + modes) + R15 layout tag + bias.
     self_core = np.full(D, 0.375, dtype=np.float32)
     self_modes = np.zeros((N_SELF, D), dtype=np.float32)
     for j in range(N_SELF):
         self_modes[j, :] = 0.01 * (j + 1)
     exp['self_C'] = np.concatenate([self_core[None, :], self_modes])
-    exp['self_tau'] = 0.25
+    exp['self_tau'] = SELF_LAYOUT_TAG
     exp['self_bias'] = 0.125
     tensors['self_lattice'] = np.concatenate([
         self_core, self_modes.ravel(),
@@ -407,3 +410,14 @@ def test_truncated_lowrank_is_rejected(tmp_path):
         assert 'short read' in str(exc) or 'truncated' in str(exc)
     else:
         raise AssertionError("truncated lowrank_codebook.bin was accepted")
+
+
+def test_pre_r15_self_lattice_is_rejected(tmp_path):
+    """Ruling 35: same-size old core+modes+tau+bias files must not load."""
+    _build_fixture(tmp_path)
+    path = tmp_path / 'self_lattice.bin'
+    data = np.fromfile(path, dtype=np.float32)
+    data[-2] = 1.0  # old tau_self slot, not SELF_LAYOUT_TAG
+    data.tofile(path)
+    with pytest.raises(ValueError, match="R15|layout tag|migrated"):
+        load_lattice_memories(str(tmp_path), _cfg())

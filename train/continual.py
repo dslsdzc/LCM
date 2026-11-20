@@ -215,6 +215,11 @@ def expand_ema_state(ema_state: dict, n_new: int, cfg) -> dict:
                      axis=0)}
                 for st in ema_state['binding'].get(fam, [])
             ]
+    # R15: C_self is fixed at M_self rows (its codebook is not expanded), so
+    # its EMA accumulators are carried through unchanged. Dropping the key here
+    # would silently reset self state on the next task switch.
+    if 'self' in ema_state:
+        out['self'] = ema_state['self']
     return out
 
 

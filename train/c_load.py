@@ -20,7 +20,9 @@ import os
 
 import numpy as np
 
-from train.bin_format import load_manifest, value_scalar_specs
+from train.bin_format import (
+    SELF_LAYOUT_TAG, load_manifest, value_scalar_specs,
+)
 
 
 def _require(cfg, key):
@@ -282,14 +284,25 @@ def load_lattice_memories(ckpt_dir, cfg):
             value_scalars[name][family] = arr
         pos += m
 
-    # ── Self lattice: core + modes + 2 scalars (R15) ──────────────────────
-    n_self = int(_require(cfg, 'n_self_codes'))
+    # ── Self lattice: core + modes + 2 scalars (R15/Ruling 35) ────────────
+    # New exports carry n_self_modes (EMA rows, excluding the core) and
+    # n_self_rows = 1 + n_self_modes. Older R15 exports only carried
+    # n_self_codes in the mode-count meaning, so that is the fallback.
+    if 'n_self_modes' in cfg:
+        n_self = int(cfg['n_self_modes'])
+    else:
+        n_self = int(_require(cfg, 'n_self_codes'))
+    n_self_rows = int(cfg.get('n_self_rows', n_self + 1))
+    if n_self < 1 or n_self_rows != n_self + 1:
+        raise ValueError(
+            f"config.json has n_self_modes={n_self}, n_self_rows="
+            f"{n_self_rows}; R15 requires rows = modes + 1")
     self_flat = _read_tensor(ckpt_dir, manifest, 'self_lattice').ravel()
     expected = d + n_self * d + 2
     if self_flat.size != expected:
         raise ValueError(
             f"self_lattice has {self_flat.size} floats; expected {expected} "
-            f"(d={d}, n_self_codes={n_self})")
+            f"(d={d}, n_self_modes={n_self})")
     pos = 0
     self_core = np.ascontiguousarray(self_flat[pos:pos + d])
     pos += d
@@ -298,6 +311,14 @@ def load_lattice_memories(ckpt_dir, cfg):
     pos += n_self * d
     self_tau = float(self_flat[pos])
     self_bias = float(self_flat[pos + 1])
+    if not np.isclose(self_tau, SELF_LAYOUT_TAG, atol=1e-6):
+        raise ValueError(
+            "self_lattice predates R15 (missing layout tag); old core+modes "
+            "checkpoints are rejected, not migrated (Ruling 35)")
+    if self_bias < 0.0:
+        raise ValueError(
+            f"self_lattice has negative alpha_self={self_bias}; R15 exports "
+            "the clamped, non-negative familiarity strength")
     # C_self[row 0] is the frozen identity anchor; modes follow (R15).
     self_C = np.ascontiguousarray(
         np.concatenate([self_core[None, :], self_modes], axis=0))

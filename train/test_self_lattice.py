@@ -2,7 +2,7 @@
 
 ``C_self[0]`` is the frozen identity anchor. ``C_self[1:]`` are EMA modes.
 The forward returns the nearest codebook row (STE) and a familiarity scalar in
-``[0, bias_self]``; fusion adds ``self_bias * z_self`` *before* LayerNorm.
+``[0, alpha_self]``; fusion adds ``self_bias * z_self`` *before* LayerNorm.
 
 Run from repo root:
     JAX_PLATFORMS=cpu /home/DslsDZC/LCM/be/bin/python -m pytest \
@@ -81,6 +81,19 @@ def test_init_modes_from_encoder_samples():
     assert np.all(np.isfinite(np.asarray(p['C_self'][4])))
 
 
+def test_init_cog_params_seeds_modes_from_encoder():
+    """R15 init path uses the freshly initialised encoder's bottlenecks."""
+    from train.cog_train import init_cog_params
+
+    cfg = _tiny_cfg()
+    params, _ = init_cog_params(cfg, jax.random.PRNGKey(0))
+    modes = params['self']['C_self'][1:]
+    norms = np.asarray(jnp.linalg.norm(modes, axis=-1))
+    # safe_unit normalises the encoder outputs; random fallback rows would not
+    # all be unit-length.
+    np.testing.assert_allclose(norms, 1.0, atol=1e-4)
+
+
 # ─── Forward: nearest row + familiarity scalar ──────────────────────────────
 
 
@@ -103,6 +116,19 @@ def test_z_self_is_a_codebook_row_not_a_mode_blend():
     assert not np.allclose(np.asarray(z_self[0]), np.asarray(blend[0]))
 
 
+def test_selected_codebook_row_is_stop_gradient():
+    """Ruling 37: EMA owns the codebook; the forward must not train it."""
+    p = _params()
+    z = jnp.array([[0.20, 0.90, 0.10, 0.0, 0.0, 0.0, 0.0, 0.0]])
+
+    def loss(C):
+        return jnp.sum(self_lattice_forward(
+            {'C_self': C, 'bias_self': p['bias_self']}, z)[0])
+
+    grad_C = jax.grad(loss)(p['C_self'])
+    np.testing.assert_allclose(np.asarray(grad_C), 0.0, atol=1e-7)
+
+
 def test_self_bias_varies_with_z_and_stays_in_range():
     p = _params()
     alpha = float(p['bias_self'])
@@ -120,19 +146,29 @@ def test_self_bias_varies_with_z_and_stays_in_range():
 
 def test_negative_cosine_clips_self_bias_to_zero():
     """A state opposite to its nearest prototype is not "familiar"."""
-    # Positive-only prototypes: -e0 is nearest to e0, with cosine -1.
-    p = {'C_self': jnp.eye(D)[:M], 'bias_self': jnp.array(ALPHA)}
+    # Row 0 is e0; row 1 is far away. z=-e0 is nearest to row 0 with cosine -1.
+    C = jnp.zeros((2, D))
+    C = C.at[0, 0].set(1.0)
+    C = C.at[1, 1].set(100.0)
+    p = {'C_self': C, 'bias_self': jnp.array(ALPHA)}
     z = jnp.array([[-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
-    _, bias = self_lattice_forward(p, z, training=False)
+    _, bias, aux = self_lattice_forward(
+        p, z, training=False, return_aux=True)
+    assert int(aux['idx'][0]) == 0
+    assert float(aux['cosine'][0]) < 0.0
     assert float(bias[0]) == 0.0
 
 
 def test_self_bias_never_exceeds_configured_alpha():
-    p = {'C_self': _codebook(), 'bias_self': jnp.array(0.2)}
+    cfg = _tiny_cfg()
+    p = init_self_params(jax.random.PRNGKey(0), D, M_self=M,
+                         alpha_self=cfg.alpha_self)
+    np.testing.assert_allclose(float(p['bias_self']), cfg.alpha_self,
+                               atol=1e-7)
     z = jnp.stack([_codebook()[0], _codebook()[1], _codebook()[2]])
     _, bias = self_lattice_forward(p, z, training=False)
     assert np.all(np.asarray(bias) >= 0.0)
-    assert np.all(np.asarray(bias) <= 0.2 + 1e-6)
+    assert np.all(np.asarray(bias) <= cfg.alpha_self + 1e-6)
 
 
 # ─── EMA: core frozen, modes move ───────────────────────────────────────────
@@ -141,7 +177,7 @@ def test_self_bias_never_exceeds_configured_alpha():
 def test_ema_freezes_core_row_and_updates_modes():
     C = _codebook() * 2.0
     state = {'N': jnp.zeros(M), 'm': jnp.zeros((M, D)),
-             'last_used': jnp.zeros(M, dtype=jnp.int32)}
+             'last_used': jnp.array([7, 0, 0, 0, 0], dtype=jnp.int32)}
     z = jnp.array([[5.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
                    [0.0, 0.0, 7.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
     idx = jnp.array([0, 2])  # core is explicitly selected by the first row
@@ -150,9 +186,11 @@ def test_ema_freezes_core_row_and_updates_modes():
 
     np.testing.assert_array_equal(np.asarray(C_new[0]), np.asarray(C[0]))
     assert not np.array_equal(np.asarray(C_new[2]), np.asarray(C[2]))
-    # The frozen row does not accumulate EMA statistics.
+    # The frozen row does not accumulate EMA statistics and its usage clock
+    # does not move either.
     assert float(state_new['N'][0]) == 0.0
     assert float(jnp.linalg.norm(state_new['m'][0])) == 0.0
+    assert int(state_new['last_used'][0]) == 7
     assert float(state_new['N'][2]) > 0.0
     assert int(state_new['last_used'][2]) == 3
 
@@ -176,7 +214,8 @@ def test_core_stays_bit_identical_through_a_training_step():
     ema = init_ema_state(params, cfg)
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adamw(learning_rate=1.0, weight_decay=0.0))
+        optax.adamw(learning_rate=1.0, weight_decay=0.5))
+    bias_before = np.asarray(params['self']['bias_self'])
     trainable, _, _ = partition_params(params)
     opt_state = optimizer.init(trainable)
     train_step = make_train_step(cfg, optimizer, joint=False)
@@ -190,9 +229,67 @@ def test_core_stays_bit_identical_through_a_training_step():
     assert np.isfinite(float(loss))
     np.testing.assert_array_equal(
         np.asarray(params2['self']['C_self'][0]), core_before)
+    # Ruling 34: the alpha mirror is frozen, not a learned scalar.
+    np.testing.assert_array_equal(
+        np.asarray(params2['self']['bias_self']), bias_before)
     assert not np.array_equal(
         np.asarray(params2['self']['C_self'][1:]), modes_before)
     assert float(np.sum(np.asarray(ema2['self']['N'][1:]))) > 0.0
+
+
+def test_stage1_weight_decay_does_not_move_core():
+    """Ruling 36: Stage-1's AdamW must not touch EMA-owned C_self.
+
+    Exercises the exact Stage-1 mechanism: AdamW with wd=0.5 moves every leaf,
+    ``restore_frozen_params(get_frozen_param_names())`` puts back C_self and
+    the alpha mirror, and ``train._jitted_ema`` then updates only the modes.
+    """
+    from train.model import get_frozen_param_names, restore_frozen_params
+    from train.train import _jitted_ema
+
+    C = _codebook()
+    C = C.at[0].set(jnp.full((D,), 100.0))
+    params = {
+        'self': {'C_self': C, 'bias_self': jnp.array(ALPHA)},
+        'sparse': {'C': jnp.ones((4, D)) * 0.5},
+        'manifold': {'C': jnp.ones((4, D)) * 0.25},
+    }
+    ema = {
+        'self': {'N': jnp.zeros(M), 'm': jnp.zeros((M, D))},
+        'sparse': {'N': jnp.zeros(4), 'm': jnp.zeros((4, D))},
+        'manifold': {'N': jnp.zeros(4), 'm': jnp.zeros((4, D))},
+    }
+    core_before = np.asarray(C[0])
+    modes_before = np.asarray(C[1:])
+    bias_before = np.asarray(params['self']['bias_self'])
+
+    opt = optax.adamw(learning_rate=1.0, weight_decay=0.5)
+    opt_state = opt.init(params)
+    grads = jax.tree_util.tree_map(jnp.zeros_like, params)
+    updates, _ = opt.update(grads, opt_state, params)
+    decayed = optax.apply_updates(params, updates)
+    assert not np.array_equal(
+        np.asarray(decayed['self']['C_self']), np.asarray(C)), \
+        "fixture no longer exercises nonzero weight decay"
+
+    restored = restore_frozen_params(
+        decayed, params, tuple(get_frozen_param_names()))
+    z = jnp.stack([_codebook()[1], _codebook()[2]])
+    updated, ema_new = _jitted_ema(
+        restored, ema, z, {'self_idx': jnp.array([1, 2])},
+        {'gamma_sparse': 0.99, 'gamma_man': 0.99, 'gamma_bind': 0.99,
+         'gamma_self': 0.99, 'lambda_shrink': 1e-4})
+
+    np.testing.assert_array_equal(
+        np.asarray(updated['self']['C_self'][0]), core_before)
+    np.testing.assert_array_equal(
+        np.asarray(updated['self']['bias_self']), bias_before)
+    assert not np.array_equal(
+        np.asarray(updated['self']['C_self'][1:]), modes_before)
+    # Unselected modes keep their vectors; only assigned rows move.
+    np.testing.assert_array_equal(
+        np.asarray(updated['self']['C_self'][3:]), np.asarray(C[3:]))
+    assert float(np.sum(np.asarray(ema_new['self']['N'][1:]))) > 0.0
 
 
 def test_ema_state_has_a_self_branch():

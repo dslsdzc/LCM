@@ -102,24 +102,32 @@ def reset_session_state(state, M_self, d):
     return init_self_state(M_self, d)
 
 
-def self_lattice_forward(params, z, training=False, return_aux=False):
+def self_lattice_forward(params, z, training=False, return_aux=False,
+                         alpha_self=None):
     """Nearest codebook row + cosine familiarity.
 
     Args:
-        params: ``{'C_self': (M_self, d), 'bias_self': ()}``.
+        params: ``{'C_self': (M_self, d), 'bias_self': ()}``. ``bias_self`` is
+            the frozen ``cfg.alpha_self`` mirror used when ``alpha_self`` is
+            not passed.
         z: ``(B, d)`` current bottleneck vectors (a single ``(d,)`` is promoted
             to ``(1, d)``).
         training: Accepted for call-site symmetry with the other lattices. The
             forward is deterministic: retrieval is a hard argmin and STE is
             used in both modes.
         return_aux: When True, also return the cheap diagnostics
-            ``{'idx', 'dist2', 'cosine'}``. They are not inputs to any selector.
+            ``{'idx', 'dist2', 'cosine'}`` (raw cosine, may be negative).
+            They are not inputs to any selector.
+        alpha_self: The configured familiarity strength (``cfg.alpha_self``).
+            Callers pass it explicitly; when None the frozen ``params`` mirror
+            is used. It is clamped non-negative before scaling.
 
     Returns:
         ``z_self``: ``(B, d)`` selected codebook rows. The forward value is the
         exact row; the gradient is the identity in ``z`` (straight-through), so
-        commitment/encoder gradients flow through it.
-        ``self_bias``: ``(B,)`` familiarity in ``[0, max(bias_self, 0)]``.
+        commitment/encoder gradients flow through it. The selected codebook row
+        itself is stop-gradiented: EMA is the only writer of ``C_self``.
+        ``self_bias``: ``(B,)`` familiarity in ``[0, alpha_self]``.
         ``aux``: only when ``return_aux=True``.
     """
     C_self = jnp.asarray(params['C_self'])
@@ -130,28 +138,31 @@ def self_lattice_forward(params, z, training=False, return_aux=False):
 
     dist2 = jnp.sum((z[:, None, :] - C_self[None, :, :]) ** 2, axis=-1)
     idx = jnp.argmin(dist2, axis=-1)          # (B,)
-    selected = C_self[idx]                    # (B, d)
-
-    # STE: forward is the codebook row, d/dz is the identity. The codebook
-    # itself is EMA-owned, so no parameter gradient is needed here.
-    z_self = z + lax.stop_gradient(selected - z)
+    # Ruling 37: the codebook row is a stop-gradient. Forward is exactly the
+    # row; d/dz is the identity so the commitment path still trains the encoder.
+    selected = lax.stop_gradient(C_self[idx])  # (B, d)
+    z_self = selected + (z - lax.stop_gradient(z))
 
     # Cosine similarity is computed against the selected row (which equals
     # z_self forward). Clipping makes the [0, alpha_self] range structural,
     # not dependent on floating-point noise.
     z_norm = jnp.linalg.norm(z, axis=-1) + 1e-8
     c_norm = jnp.linalg.norm(selected, axis=-1) + 1e-8
-    cosine = jnp.sum(z * selected, axis=-1) / (z_norm * c_norm)
-    cosine = jnp.clip(cosine, 0.0, 1.0)
-    alpha = jnp.maximum(jnp.asarray(params['bias_self'], dtype=jnp.float32),
-                        0.0)
+    raw_cosine = jnp.sum(z * selected, axis=-1) / (z_norm * c_norm)
+    cosine = jnp.clip(raw_cosine, 0.0, 1.0)
+    if alpha_self is None:
+        alpha = jnp.asarray(params['bias_self'], dtype=jnp.float32)
+    else:
+        alpha = jnp.asarray(alpha_self, dtype=jnp.float32)
+    alpha = jnp.maximum(alpha, 0.0)
     self_bias = alpha * cosine
 
     if return_aux:
         aux = {
             'idx': idx,
             'dist2': jnp.min(dist2, axis=-1),
-            'cosine': cosine,
+            # Raw cosine (can be negative); self_bias is the clipped value.
+            'cosine': raw_cosine,
         }
         return z_self, self_bias, aux
     return z_self, self_bias

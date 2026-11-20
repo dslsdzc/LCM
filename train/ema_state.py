@@ -161,11 +161,13 @@ def ema_update_self(C, state, z, idx, gamma, step=None):
     M = C.shape[0]
     idx = jnp.asarray(idx, dtype=jnp.int32)
     C_new, N, m = _ema(C, state, z, idx, gamma)
-    # Frozen core: never write the vector, never accumulate statistics for it.
+    # Frozen core: never write the vector, never accumulate statistics for it,
+    # and do not move its usage clock (row 0 is not an EMA slot at all).
     C_new = C_new.at[0].set(C[0])
     N = N.at[0].set(0.0)
     m = m.at[0].set(0.0)
     last_used = _update_last_used(state, idx, step, M)
+    last_used = last_used.at[0].set(state['last_used'][0])
     return C_new, _rebuild_state(N, m, last_used)
 
 

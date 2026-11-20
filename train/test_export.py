@@ -135,14 +135,17 @@ def test_manifest_covers_exported_tensors(exported):
 
 
 def test_exported_self_layout_matches_c_loader(exported):
-    """R15: C_self rows + tag + bias, and config counts EMA modes only."""
-    from train.checkpoint import SELF_LAYOUT_TAG
+    """R15: C_self rows + tag + bias, and config counts modes and rows."""
+    from train.bin_format import SELF_LAYOUT_TAG
 
     cfg, params, out, _, _ = exported
     with open(os.path.join(out, "config.json")) as f:
         exported_cfg = json.load(f)
-    n_modes = exported_cfg["n_self_codes"]
-    assert n_modes == params["self"]["C_self"].shape[0] - 1
+    n_rows = exported_cfg["n_self_rows"]
+    n_modes = exported_cfg["n_self_modes"]
+    assert exported_cfg["n_self_codes"] == n_rows
+    assert n_rows == params["self"]["C_self"].shape[0]
+    assert n_modes == n_rows - 1
 
     flat = np.fromfile(os.path.join(out, "self_lattice.bin"),
                        dtype=np.float32)
@@ -153,7 +156,8 @@ def test_exported_self_layout_matches_c_loader(exported):
                                atol=1e-6)
     assert flat[-2] == SELF_LAYOUT_TAG
     np.testing.assert_allclose(float(flat[-1]),
-                               float(params["self"]["bias_self"]), atol=1e-7)
+                               max(float(cfg.alpha_self), 0.0), atol=1e-7)
+    assert exported_cfg["alpha_self"] == max(float(cfg.alpha_self), 0.0)
 
 
 def test_exported_config_carries_the_real_training_config(exported):

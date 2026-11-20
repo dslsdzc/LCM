@@ -264,9 +264,11 @@ def _ensure_r15_self(params, cfg, rng, allow_missing_self):
                  and bias.size == 1)
     if valid:
         # Drop pre-R15 leftovers if a hand-written checkpoint carries both.
+        # Ruling 34: alpha_self is the frozen config scalar, so the checkpoint
+        # mirror is refreshed from the current config rather than trained.
         params['self'] = {
             'C_self': jnp.asarray(sp['C_self']),
-            'bias_self': jnp.asarray(sp['bias_self']).reshape(()),
+            'bias_self': jnp.asarray(cfg.alpha_self, dtype=jnp.float32),
         }
         return params
 
@@ -384,8 +386,10 @@ def _ensure_r15_self_ema(ema_state, params, cfg, allow_missing_self):
     valid = (isinstance(branch, dict)
              and branch.get('N') is not None
              and branch.get('m') is not None
+             and branch.get('last_used') is not None
              and tuple(jnp.asarray(branch['N']).shape) == (M_self,)
-             and tuple(jnp.asarray(branch['m']).shape) == (M_self, d))
+             and tuple(jnp.asarray(branch['m']).shape) == (M_self, d)
+             and tuple(jnp.asarray(branch['last_used']).shape) == (M_self,))
     if valid:
         return ema_state
     if not allow_missing_self:
@@ -470,8 +474,19 @@ def init_cog_params(cfg, rng, qwen_ckpt=None, resume=None,
         params['binding'] = init_binding_params(keys[5], d, cfg.M_bind, cfg.n_bind_layers, cfg.r_max)
         params['contrast'] = init_contrast_params(keys[6], d, cfg.M_contrast, cfg.n_contrast_layers)
 
+        # R15: seed C_self[1:] from a small batch of bottleneck vectors from
+        # the freshly initialised encoder (early-sample path); the core row is
+        # a separate frozen anchor.
+        n_modes = max(1, int(cfg.n_self_codes) - 1)
+        seq = max(2, min(int(cfg.max_seq_len), 16))
+        sample_tokens = jax.random.randint(
+            jax.random.fold_in(keys[10], 101), (n_modes, seq), 0,
+            cfg.vocab_size, dtype=jnp.int32)
+        self_samples = safe_unit(encoder_forward(
+            params['encoder'], sample_tokens, cfg.n_heads))
         params['self'] = init_self_params(
-            keys[10], d, cfg.n_self_codes, alpha_self=cfg.alpha_self)
+            keys[10], d, cfg.n_self_codes, init_samples=self_samples,
+            alpha_self=cfg.alpha_self)
         self_state = init_self_state(cfg.n_self_codes, d)
 
         # Routing + fusion + per-lattice value scalars. The cognitive loop runs
@@ -1480,9 +1495,12 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
         'M_contrast': _to_np(params['contrast']['C_a'][0]['A']).shape[0],
         'n_bind_layers': len(params['binding']['key_cb']),
         'n_contrast_layers': len(params['contrast']['C_a']),
-        # R15: the C engine's M_self counts EMA mode rows and adds the frozen
-        # core row itself; C_self has 1 + M_self rows.
-        'n_self_codes': _to_np(params['self']['C_self']).shape[0] - 1,
+        # R15: n_self_codes is the training-config row count (C_self rows).
+        # The C loader reads n_self_modes (EMA rows, excluding the core) and
+        # validates n_self_rows = 1 + n_self_modes.
+        'n_self_codes': _to_np(params['self']['C_self']).shape[0],
+        'n_self_rows': _to_np(params['self']['C_self']).shape[0],
+        'n_self_modes': _to_np(params['self']['C_self']).shape[0] - 1,
 
         # Training choices, from train_cfg.
         'max_seq_len': train_cfg.max_seq_len,
@@ -1497,7 +1515,7 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
         't_dim': train_cfg.t_dim,
         'n_value_pairs': train_cfg.n_value_pairs,
         'M_danger': train_cfg.M_danger,
-        'alpha_self': float(_to_np(params['self']['bias_self'])),
+        'alpha_self': max(float(train_cfg.alpha_self), 0.0),
         'tau_route': train_cfg.tau_route,
         'tau_route_fallback': train_cfg.tau_route_fallback,
         'lambda_lfq': train_cfg.lambda_lfq,
@@ -1618,7 +1636,8 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
     manifest_tensors['value_scalars'] = _save_value_scalars(
         params, os.path.join(output_dir, "value_scalars.bin"), train_cfg)
     manifest_tensors['self_lattice'] = _save_self(
-        params, os.path.join(output_dir, "self_lattice.bin"))
+        params, os.path.join(output_dir, "self_lattice.bin"),
+        alpha_self=train_cfg.alpha_self)
     manifest_tensors['binding_proj'] = _save_binding_proj(
         params, os.path.join(output_dir, "binding_proj.bin"))
 
@@ -1742,7 +1761,7 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
 
 
 def load_cog_checkpoint(path, d_model=None, n_self_codes=64,
-                        allow_missing_self=False):
+                        allow_missing_self=False, alpha_self=None):
     """Load full cognitive training checkpoint.
 
     R15: a checkpoint without ``params['self']['C_self']`` is rejected unless
@@ -1754,6 +1773,9 @@ def load_cog_checkpoint(path, d_model=None, n_self_codes=64,
         d_model: Model dimension (required when resetting a missing C_self).
         n_self_codes: Number of self codebook rows, including the frozen core.
         allow_missing_self: Explicit opt-in to reset a pre-R15 self codebook.
+        alpha_self: Frozen config familiarity strength. When provided it
+            overrides the checkpoint mirror (Ruling 34); otherwise the saved
+            non-negative value is kept. Required in spirit when resetting.
 
     Returns:
         params, step, self_state
@@ -1772,7 +1794,12 @@ def load_cog_checkpoint(path, d_model=None, n_self_codes=64,
                 + ("" if allow_missing_self else
                    "; pass allow_missing_self=True to reset explicitly"))
         params['self'] = init_self_params(
-            jax.random.PRNGKey(13), int(d_model), int(n_self_codes))
+            jax.random.PRNGKey(13), int(d_model), int(n_self_codes),
+            alpha_self=0.05 if alpha_self is None else float(alpha_self))
+    elif alpha_self is not None:
+        params['self'] = dict(
+            params['self'],
+            bias_self=jnp.asarray(alpha_self, dtype=jnp.float32))
     self_state = ckpt.get('self_state')
     if self_state is None and d_model is not None:
         self_state = init_self_state(n_self_codes, d_model)

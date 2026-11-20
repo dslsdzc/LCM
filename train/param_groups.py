@@ -41,6 +41,9 @@ FROZEN_PATHS = frozenset({
 # Read-only constants that are stored in the params tree for shape/API
 # stability but are not parameters:
 #   * sparse.zero_vec is the LFQ origin. It must stay exactly zero.
+#   * self.bias_self is the frozen mirror of cfg.alpha_self (Ruling 34). It is
+#     serialized so the C export and JAX use the same non-negative strength, but
+#     it is never trained.
 #   * the Qwen bridge is a frozen pretrained model, not a cognitive parameter.
 # R15 removed self.core: the frozen identity anchor is C_self[0], a row inside
 # the EMA-owned C_self array. A single JAX array cannot be split across
@@ -51,6 +54,7 @@ FROZEN_PATHS = frozenset({
 # kept in a separate set so the R3 contract stays literally true.
 CONSTANT_PATHS = frozenset({
     ('sparse', 'zero_vec'),
+    ('self', 'bias_self'),
     ('qwen',),
 })
 
