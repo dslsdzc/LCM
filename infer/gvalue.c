@@ -40,6 +40,18 @@ static void hash_anchors(const float* pos, const float* neg, int n_floats,
     lcm_sha256_hex(both, sizeof(both), out);
 }
 
+/* Saved-file digest: SHA-256 over the raw C_pos/C_neg payload. This is the
+ * same byte stream the Python exporter appends to the file and records in
+ * manifest.json, so the bridge can compare it against the export digest
+ * instead of trusting self-consistency alone. */
+static void hash_source(const float* pos, const float* neg, int n_floats,
+                        char out[65]) {
+    float raw[2 * LCM_N_VALUE_PAIRS * LCM_D];
+    memcpy(raw, pos, (size_t)n_floats * sizeof(float));
+    memcpy(raw + n_floats, neg, (size_t)n_floats * sizeof(float));
+    lcm_sha256_hex(raw, (size_t)(2 * n_floats) * sizeof(float), out);
+}
+
 /* ─── Initialize global value codebook ──────────────────────────────────────
  *
  * Pre:  C_pos, C_neg hold LCM_N_VALUE_PAIRS * D floats each, D == LCM_D
@@ -68,8 +80,10 @@ void gvalue_init(gvalue_t* gv, const float* C_pos, const float* C_neg, int D) {
      * arrays with the same algorithm. */
     hash_anchors(&gv->C_pos[0][0], &gv->C_neg[0][0],
                  LCM_N_VALUE_PAIRS * D, gv->integrity_hash);
+    hash_source(C_pos, C_neg, LCM_N_VALUE_PAIRS * D, gv->source_hash);
 
     ENSURE(gv->integrity_hash[0] != '\0');
+    ENSURE(gv->source_hash[0] != '\0');
 }
 
 /* ─── Verify integrity ────────────────────────────────────────────────────── */
@@ -79,7 +93,19 @@ bool gvalue_verify(const gvalue_t* gv) {
     char cur[65];
     hash_anchors(&gv->C_pos[0][0], &gv->C_neg[0][0],
                  LCM_N_VALUE_PAIRS * gv->D, cur);
-    return strcmp(cur, gv->integrity_hash) == 0;
+    return strcmp(cur, gv->integrity_hash) == 0
+        && gv->source_hash[0] != '\0';
+}
+
+/* Compare the digest captured from the raw file payload at init with the
+ * exporter's saved digest. NULL means "no saved digest supplied"; the
+ * bridge then relies on gvalue_verify's self-consistency plus the Python
+ * file/manifest checks. */
+bool gvalue_verify_digest(const gvalue_t* gv, const char* expected_hex) {
+    REQUIRE(gv != NULL);
+    if (expected_hex == NULL) return true;
+    return strlen(expected_hex) == 64
+        && strcmp(gv->source_hash, expected_hex) == 0;
 }
 
 /* ─── Strict Three Laws safety check ────────────────────────────────────────

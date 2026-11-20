@@ -476,7 +476,13 @@ def sparse_forward(params, z, training=True, lambda_lfq=1.5, d_top=None,
         d_min = poincare_similarity(
             z_P[:, None, :], C_P[None, :, :]).squeeze(-1).min(axis=-1)
         zero_idx = jnp.zeros_like(idx)  # index of zero_vec (0 in C_search)
-        idx = jnp.where(d_min > lambda_lfq * d_top, zero_idx, idx)
+        # C's `lattice.c` treats d_top <= 0 as "HRQ did not activate" and
+        # disables LFQ; JAX always receives a tensor, so mask the comparison
+        # explicitly. Without this, d_top == 0 made every sample take the
+        # zero_vec branch while C kept the nearest code.
+        lfq_on = jnp.asarray(d_top) > 0.0
+        idx = jnp.where(lfq_on & (d_min > lambda_lfq * d_top),
+                        zero_idx, idx)
 
     o_sparse = z + lax.stop_gradient(C_search[idx] - z)  # STE
     if scores is not None:

@@ -190,8 +190,9 @@ def read_bin_v2(path, has_hash=False):
 
     A bare 24-byte v1 header is reported as old format; a partial 25..31 byte
     header is reported as a truncated v2 header. Neither is ever migrated.
-    ``has_hash`` strips the trailing 32-byte SHA-256 used by the frozen
-    gvalue/danger codebooks before checksumming.
+    ``has_hash`` verifies and strips the trailing 32-byte SHA-256 used by the
+    frozen gvalue/danger codebooks. A mismatch is a hard error; the suffix is
+    never silently discarded.
     """
     with open(path, 'rb') as f:
         hdr_bytes = f.read(HEADER_SIZE_V2)
@@ -207,10 +208,28 @@ def read_bin_v2(path, has_hash=False):
             raise ValueError(f"{OLD_FORMAT_ERROR} ({path})")
         data_bytes = f.read()
 
+    expected_sha = None
     if has_hash:
         if len(data_bytes) < 32:
             raise ValueError(f"{path}: truncated SHA-256 suffix; re-export required")
-        data_bytes = data_bytes[:-32]
+        payload = data_bytes[:-32]
+        expected_sha = data_bytes[-32:]
+        actual_sha = hashlib.sha256(payload).digest()
+        if actual_sha != expected_sha:
+            raise ValueError(
+                f"SHA-256 suffix mismatch in {path}: stored="
+                f"{expected_sha.hex()[:16]}…, actual={actual_sha.hex()[:16]}…; "
+                f"the frozen safety codebook was tampered with or truncated "
+                f"— re-export required")
+        data_bytes = payload
+    if len(data_bytes) % 4:
+        raise ValueError(
+            f"{path}: payload is {len(data_bytes)} bytes, not float32-aligned; "
+            f"the file is truncated")
+    if expected_sha is not None:
+        header_sha = expected_sha.hex()
+    else:
+        header_sha = None
 
     actual_crc = _compute_checksum(data_bytes)
     if actual_crc != stored_crc:
@@ -221,4 +240,6 @@ def read_bin_v2(path, has_hash=False):
 
     header = {'M': M, 'd': d, 'n_layers': n_layers, 'type': cb_type,
               'c': c, 'format_version': version}
+    if header_sha is not None:
+        header['sha256'] = header_sha
     return header, np.frombuffer(data_bytes, dtype=np.float32)

@@ -39,7 +39,7 @@ from nagini_contracts.contracts import (
 
 MAX_RETRIEVALS: int = 128
 MAX_STEPS: int = 32
-CONSISTENCY_THRESHOLD: float = 0.7
+CONSISTENCY_THRESHOLD: float = 0.4
 SAFETY_THRESHOLD: float = 0.05  # R7 relative-gap threshold
 DEFAULT_SAFETY_MARGIN: float = 0.5
 
@@ -79,7 +79,7 @@ def danger_assess_pure(
 
     Postconditions (contract):
       - out_block  ⇔  retrieval_count > 128
-                       ∨ value_consistency < 0.7 ∨ relative_gap > 0.05
+                       ∨ value_consistency < 0.4 ∨ relative_gap > 0.05
       - out_threat ∈ {0, 1, 2, 4}  (valid danger threat enum)
       - out_threat matches the first-triggered condition in priority order:
           c1 (resource_abuse) > c3 (deception) > c4 (pattern)

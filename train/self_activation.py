@@ -145,6 +145,10 @@ class SelfActivationState:
       Path A *unfreeze* is rejected.  A session-end freeze
       (``TEMP_UNFROZEN → DEFINED_FROZEN``) remains allowed even while danger is
       flagged because freezing is the safe direction.
+
+    R14 deferred: this class is a tested state-machine library. It is not yet
+    called by the training loop before ``C_self`` EMA writes, and C's identity
+    core is not mprotect'd; see ``docs/lattice-spec-vs-impl-audit-v3.1.md``.
     """
 
     def __init__(self, *, identity_core: Optional[Iterable[float]] = None,

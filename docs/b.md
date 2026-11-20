@@ -54,7 +54,7 @@
 | `MAX_RETRIEVALS_PER_STEP` | Maximum retrievals per step (all active lattices, R13) | 128 |
 | `max_inference_steps` | Scheduler step budget; exhaustion is graceful, not an abort (R9) | 16 |
 | `max_inference_steps_hard` | Safety hard limit; exhaustion aborts (R9) | 64 |
-| `CONSISTENCY_THRESHOLD` | Minimum value consistency threshold | 0.7 |
+| `CONSISTENCY_THRESHOLD` | Minimum value consistency threshold (`clip(cos,0,1)`) | 0.4 |
 | `entropy_threshold` | Normalized fusion weight entropy threshold `H / ln(n_active)` (R9) | 0.5 |
 | `c` | Poincaré sphere curvature | 1.0 |
 

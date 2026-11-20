@@ -226,6 +226,7 @@ def test_dangerous_vector_returns_empty(engine):
     alert = engine.alerts[0]
     assert alert['level'] == "FATAL"
     assert alert['conflict_source'] == "CONFLICT_DANGER"
+    assert alert['conflict_type'] == "THREAT_PATTERN_MATCH"
     assert alert['conflict_detail']
     assert alert['message'].startswith("[LCM SAFETY HALT]")
     assert engine.generate_text("hello", max_new=1) == ""
@@ -260,3 +261,92 @@ def test_placeholder_codebooks_rejected():
     # Distinct codebooks pass.
     lcm.validate_safety_codebooks(gv_a, gv_a + 1.0, 4,
                                   danger_a, danger_b, 2)
+
+
+def test_non_loop_path_still_enforces_safety(engine):
+    """use_loop=False must not bypass danger/gvalue via lcm_infer_step."""
+    engine._test_z = np.zeros(D, np.float32)
+    engine._test_z[0] = 1.0  # threat-aligned
+    tokens = list(engine.generate("hello", max_new=1, use_loop=False))
+    assert tokens == []
+    assert engine._last_loop_ret == CONFLICT_ABORT_TOKEN
+    assert engine.alerts and engine.alerts[-1]['level'] == "FATAL"
+
+
+def test_active_path_aborts_without_trace_or_token(engine):
+    """A -2 v3 return must stop the --active tick before get_trace/decode."""
+    engine._test_z = np.zeros(D, np.float32)
+    engine._test_z[0] = 1.0  # threat-aligned
+
+    def _no_trace():
+        raise AssertionError("get_trace() called after an aborted loop")
+
+    engine.get_trace = _no_trace
+    tokens = [2]
+    out, enc_state, last_z, burst, aborted = engine.active_step(
+        tokens, None, None, 0)
+    assert aborted is True
+    assert out == [2], "aborted active tick appended a token"
+    assert engine._last_loop_ret == CONFLICT_ABORT_TOKEN
+
+
+def test_active_path_verifier_lock_aborts_before_decode(engine):
+    class _Poller:
+        def poll(self, step):
+            return lcm.VERIFIER_LOCK
+
+    engine.verifier_poller = _Poller()
+    engine._test_z = np.zeros(D, np.float32)
+    engine._test_z[1] = 1.0  # safe path: loop returns 0, LOCK must stop it
+
+    def _no_trace():
+        raise AssertionError("get_trace() called after verifier LOCK")
+
+    engine.get_trace = _no_trace
+    tokens = [2]
+    out, _, _, _, aborted = engine.active_step(tokens, None, None, 0)
+    assert aborted is True
+    assert out == [2], "verifier LOCK still appended a token"
+
+
+def test_shared_object_lcm_dim_is_256(engine):
+    engine.lib.lcm_dim.restype = ctypes.c_int
+    assert engine.lib.lcm_dim() == D == 256
+
+
+def test_direct_danger_probe_reports_pattern_match(engine):
+    """The direct threat probe (no consistency noise) is THREAT_PATTERN_MATCH."""
+    engine._test_z = np.zeros(D, np.float32)
+    engine._test_z[0] = 1.0
+    engine.alerts.clear()
+    engine._last_loop_ret = 0
+    engine.cognitive_loop(engine._test_z, max_steps=1, use_safety=False)
+    assert engine._last_loop_ret == CONFLICT_ABORT_TOKEN
+    assert engine.last_alert['conflict_source'] == "CONFLICT_DANGER"
+    assert engine.last_alert['conflict_type'] == "THREAT_PATTERN_MATCH"
+
+
+def test_safety_codebook_zero_counts_are_rejected():
+    with pytest.raises(SystemExit, match="requires exactly 4"):
+        lcm.validate_safety_codebooks(
+            np.zeros(8), np.ones(8), 0,
+            np.zeros((1, 8)), np.ones((1, 8)), 1)
+    with pytest.raises(SystemExit, match="danger header has M=0"):
+        lcm.validate_safety_codebooks(
+            np.zeros(32), np.ones(32), 4,
+            np.zeros((0, 8)), np.zeros((0, 8)), 0)
+
+
+def test_flat_bridge_checks_saved_danger_digest(engine):
+    """The Python→C bridge passes the exported digest into danger_init."""
+    import hashlib
+
+    payload = (engine.danger_t.tobytes() + engine.danger_n.tobytes())
+    engine.danger_digest = hashlib.sha256(payload).hexdigest()
+    _, converged = engine.cognitive_loop(engine._test_z, max_steps=1)
+    assert engine._last_loop_ret == 0 and converged is True
+
+    engine.danger_digest = "0" * 64
+    engine.cognitive_loop(engine._test_z, max_steps=1)
+    assert engine._last_loop_ret == -1, \
+        "a wrong saved danger digest must be rejected before the loop"

@@ -162,10 +162,11 @@ def hrq_vq_loss(params, z, aux, cfg: LCMConfig):
         raise KeyError(
             "hrq_vq_loss requires aux['hrq_vq'] with 'cont'/'quant' lists "
             "(produced by hrq_forward)")
-    # The top continuous term is the lattice input, by definition; the stored
-    # copy is the same array, but using `z` keeps the argument meaningful and
-    # matches the fallback branch's shared input.
-    cont = [z] + list(pairs['cont'][1:])
+    # The top continuous term must live in the same post-log_map domain as
+    # the quantised top row (`log_map(c_top)`). Passing raw z put the two
+    # operands in different spaces whenever ||z|| != 1.
+    z_tan = log_map(safe_unit(z))
+    cont = [z_tan] + list(pairs['cont'][1:])
     quant = list(pairs['quant'])
     n_fine = len(params['fine'])
     if len(cont) != 1 + n_fine or len(quant) != 1 + n_fine:
@@ -215,6 +216,11 @@ def cognitive_vq_losses(params, stats, cfg: LCMConfig, ema_paths=EMA_PATHS):
         for logging. EMA-owned codebooks report a zero codebook term by design.
     """
     z = stats['z_in']
+    # R18: the manifold codebook rows are tangent-space (`log_map(exp_map(C))`
+    # below), so the continuous side of its commitment loss must be the
+    # tangent representation of the input, not the raw fused z. For
+    # log_map(exp_map(.)) this is exactly `safe_unit(z)`.
+    z_tan = log_map(safe_unit(z))
     beta = cfg.beta_vq
     parts = {}
 
@@ -261,9 +267,9 @@ def cognitive_vq_losses(params, stats, cfg: LCMConfig, ema_paths=EMA_PATHS):
         parts['manifold_codebook'] = jnp.array(0.0)
     else:
         parts['manifold_codebook'] = codebook_loss(
-            z, C_man, stats['man_idx'], beta)
+            z_tan, C_man, stats['man_idx'], beta)
     parts['manifold_commitment'] = commitment_loss(
-        z, C_man, stats['man_idx'], beta)
+        z_tan, C_man, stats['man_idx'], beta)
 
     # Binding — three sub-codebook families, each layer's own residual.
     binding_cb = jnp.array(0.0)
@@ -329,6 +335,8 @@ def compute_contrast_loss(params, z, cfg: LCMConfig, gvalue=None):
     weighting negatives by proximity to v_harm (safety-critical focus).
     """
     if gvalue is not None and cfg.alpha_val > 0:
+        # R21 deferred: training has no gvalue, so this branch only runs when
+        # a caller explicitly provides one; otherwise ordinary InfoNCE is used.
         v_harm = gvalue.C_neg[1]  # harm anchor
         return cfg.lambda_contrast * contrast_value_biased_nce_loss(
             params['contrast'], z, v_harm,

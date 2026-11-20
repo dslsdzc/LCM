@@ -28,7 +28,7 @@
 | P0-3 | Sparse 的 `d_top` 是 batch 平均的 `1-mean(sim)` | R2 | **fixed** | `hrq_forward` 返回逐样本 `(B,)` `top_sim`；`sparse_forward` 拒绝标量/1 元素 `d_top`；`d_sparse_min` 与 zero_vec 同域；`build_dag` 加 HRQ→Sparse 依赖边。`test_sparse_lfq.py`、`test_c_loop.py` 的 “Sparse d_top is exactly HRQ's Poincaré top_sim” |
 | P0-4 | C 端晶格是降维版（LowRank rank0 / Contrast 第一块 / Binding 平铺块） | R10 | **fixed** | v3 内存布局 + 全层加载（Task 7–9）；C `test_runner` 235 个 `[PASS]` 全过；`test_parity_lattices.py` 逐格对比连续输出与离散 idx |
 | P0-5 | 规范 §4.8 无 LayerNorm、§7.1 有 | R4 | **fixed** | `fuse_lattices_with_aux` 最后 `layer_norm`；`test_fusion_conformance.py`。规范文字已同步：`b.md §4.8` 补 LayerNorm 并声明 §4.8 是简化写法、§7.1 是完整写法 |
-| P0-6 | 安全链运行时基本不生效（danger 双码本相同、hash 两套、gvalue 禁用、alert 为空、abort 后继续解码） | R6/R7/R11/R13 | **fixed（结构链路）；语义安全 deferred** | C `danger_init`/`danger_verify` 共用 SHA-256；`relative_gap` 有界；`detect_any_conflict` 返回 danger/gvalue/consistency/scheduler；`CONFLICT_ABORT_TOKEN=-2`；`lcm.py` 非零即停；alert callback + `infer/alerts.log` + trace。gvalue/danger 码本现在是**互不相同的结构占位**（Task 15 修复），不是语义安全锚点。C 一致性阈值已改 0.7，`value_consistency` 映射到 [0,1]（R17） |
+| P0-6 | 安全链运行时基本不生效（danger 双码本相同、hash 两套、gvalue 禁用、alert 为空、abort 后继续解码） | R6/R7/R11/R13 | **fixed（结构链路）；语义安全 deferred** | C `danger_init`/`danger_verify` 共用 SHA-256；`relative_gap` 有界；`detect_any_conflict` 返回 danger/gvalue/consistency/scheduler；`CONFLICT_ABORT_TOKEN=-2`；`lcm.py` 非零即停；alert callback + `infer/alerts.log` + trace。gvalue/danger 码本现在是**互不相同的结构占位**（Task 15 修复），不是语义安全锚点。C 一致性阈值已重新标定为 0.4，`value_consistency = clip(cos,0,1)`（R17） |
 | P0-7 | 外部验证器与 Self 激活状态机缺失 | R14 | **fixed（本地形态）** | `train/external_verifier.py` 纯标准库独立进程 + shared memory + 文件签名；四态 + Path A/B/C；Path C 只允许 `DANGER_FLAGGED → FULL_ACTIVATION`；fail-closed LOCK 永久锁存。`test_external_verifier.py`、`test_self_activation.py`。HSM/物理隔离是非目标 |
 
 ---
@@ -65,7 +65,7 @@
 | F-4 | gvalue `pos==neg` placeholder，C 端直接禁用检查 | R6/R13 | **fixed（结构）；语义 accepted-deferred** | `make_global_value_vectors` 给出互不相同的 R6 锚点；`save_cog_checkpoint` 导出两半；`lcm.py::validate_safety_codebooks` 拒绝相等占位；`GValueCodebook.verify_integrity`。真实训练出的语义锚点留到正式重训 |
 | F-5 | LowRank/Contrast/Binding export 只取第一层/第一块 | R10 | **fixed** | manifest v2 全层导出；`test_export.py`、`test_c_load.py`、`test_parity_lattices.py` |
 | F-6 | `entropy_threshold=2.0` 使熵门几乎恒过 | R9/R17 | **fixed** | `train/config.py` 改为归一化阈值 0.5；`make_train_step` 用 `H/ln(n_active)`；C v3 同样是归一化 0.5；smoke 的 `entropy_gate.pass` 包含真实 mask，crafted peaked/uniform 与真实值都记录 |
-| F-7 | 多个默认值与规范不一致 | R17 | **fixed** | `max_inference_steps=16`、`max_retrievals_per_step=128`、`tau_contrast=0.1`、`tau_val=0.05`、`consistency_threshold=0.7`；C `LCM_CONSISTENCY_THRESHOLD=0.7`，`value_consistency∈[0,1]` |
+| F-7 | 多个默认值与规范不一致 | R17 | **fixed** | `max_inference_steps=16`、`max_retrievals_per_step=128`、`tau_contrast=0.1`、`tau_val=0.05`、`consistency_threshold=0.4`；C `LCM_CONSISTENCY_THRESHOLD=0.4`，`value_consistency=clip(cos,0,1)` |
 
 ---
 
@@ -85,15 +85,15 @@
 | R10 | C 端逐格 + schema v2 | fixed | §1 P0-4、§3 F-5、parity/C load；`train/c_load.py` 逐 tensor sha256 校验（`test_c_load.py::test_manifest_tensor_sha256_rejects_tampered_payload`）；pickle 项见 D-10 |
 | R11 | 安全子系统（d.md） | fixed（本地形态）；语义安全 accepted | §1 P0-6、`test_external_verifier.py`、smoke safety |
 | R12 | 自我意识（e.md） | fixed（causal accepted deviation） | `test_self_awareness_wiring.py`、smoke overhead/self |
-| R13 | 安全链真正生效 | fixed（结构链路）；真实语义码本 deferred | `init_danger_params` 双半、`save_cog_checkpoint`、`lcm.py` 拒占位；smoke 用**最终 checkpoint** 的 `LCMInferEngine` 跑真实 v3 loop：ret=-2、0 token、alert、trace；gvalue strict margin=0.5 probe |
-| R14 | 外部验证器 + Self 激活状态机 | fixed（本地形态） | §1 P0-7 |
+| R13 | 安全链真正生效 | fixed（结构链路）；真实语义码本 deferred | `init_danger_params` 双半、`save_cog_checkpoint`、`lcm.py` 拒占位；gvalue/danger 的 trailing SHA-256 与 manifest 逐 tensor hash 均验证，C init 后 `gvalue_verify`/`danger_verify` 再与保存 digest 比对；`gv_n=0`/`danger_M=0` 不再 fail-open；smoke 用**最终 checkpoint** 的 `LCMInferEngine` 跑真实 v3 loop：ret=-2、0 token、alert、trace；gvalue strict margin=0.5 probe。`--active` 与非 loop 路径也走同一 abort/LOCK 门 |
+| R14 | 外部验证器 + Self 激活状态机 | **partially implemented / deferred** | `train/self_activation.py` 状态机库存在且有测试；**未接入生产训练循环**，`C_self` 的 EMA 写入不受状态机门控；C 端 identity core 也**没有 mprotect**。本地形态的外部验证器已接线（§1 P0-7），完整 R14 生产执行留待后续 |
 | R15 | Self lattice 码本 NN + cosine familiarity | fixed | `test_self_lattice.py`、smoke self_bias |
 | R16 | 自我意识模块接线 + 5% | fixed（模块）；5% 实测见 smoke | `test_self_awareness_wiring.py`、`smoke_report.json.overhead` |
-| R17 | 参数默认值对齐 | fixed | §3 F-7；C 一致性阈值 0.7 |
-| R18 | 逐层 codebook/commitment loss | fixed | §2 C-12 |
+| R17 | 参数默认值对齐 | fixed | §3 F-7；C 一致性阈值 0.4（clip 域） |
+| R18 | 逐层 codebook/commitment loss | fixed | §2 C-12；HRQ top 与 manifold commitment 的连续侧均为 `log_map(safe_unit(z))`，与 quantised 侧同域；`test_safety_semantics.py` 用 ‖z‖>1 校验手算公式 |
 | R19 | Routing 训练与 hard 推理 | fixed | §2 C-13、smoke route |
 | R20 | Binding unbind | fixed | §2 C-14 |
-| R21 | Contrast 采样/温度/feature bank | fixed | `test_contrast_conformance.py`、smoke feature bank |
+| R21 | Contrast 采样/温度/feature bank | **partially implemented / deferred** | 普通 InfoNCE、负样本排除正样本、温度、feature bank 已修复并有 `test_contrast_conformance.py`、smoke 证据；**value-biased NCE 只在调用方提供 gvalue 时可用**，训练路径没有 gvalue，因此训练期间不会运行该变体（不伪造路径） |
 | R22 | value scalar 粒度 | fixed | §2 C-15 |
 
 ---
@@ -123,6 +123,10 @@
 | D-8 | `config.consistency_threshold` 与 C 常量仍可能漂移 | Python 字段未被 C 消费 | 统一配置导出时一并处理 |
 | D-9 | 10% 码本利用率未通过，且 100-batch streaming probe 也未过（HRQ 7.03%、Sparse 6.05%、LowRank 1.17%、Manifold 6.84%、Binding 0.20%、Contrast 0.68%、Self 1.56%；Route 83.3%） | 不能声称“每个码本 10% 都被覆盖”；不能声称 conformance complete | 固定单 batch 只能解释 training probe；streaming probe 仍失败说明 100 步内路由/码本高度集中。需要更多步数、B≥4 或路由探索；本次不调低阈值 |
 | D-10 | manifest 的 `params.*` pickle 项没有逐 tensor sha256（C loader 只读 `.bin`） | 训练 params 的 C 侧完整性由 pickle schema/`load_cog_state` 负责，不是 C 张量 | C 端只接受 flat float32 `.bin`；pickle 项在 `_read_tensor` 直接拒绝。若未来导出 pickle 索引，需要单独的签名层 |
+| D-11 | R21 value-biased NCE 在训练路径不可用 | 训练状态没有 gvalue，`compute_contrast_loss` 只走普通 InfoNCE | **deferred**：不伪造 gvalue。普通 InfoNCE 的采样/温度/feature bank 已 fixed；调用方显式提供 gvalue 时才运行 value-biased 变体 |
+| D-12 | R14 SelfActivationState 未接入生产训练 | `train/self_activation.py` 状态机库有测试，但 `ema_update_self` 的写入不受它门控；C identity core 未 mprotect | **deferred / accepted deviation**：本 pass 不接线；代码注释与 §4 R14 已标注 |
+| D-13 | DAG trigger 距离与检索域不同 | HRQ/contrast 的触发筛选用欧氏最小距离，真正检索在 Poincaré 域；跨 lattice 距离不可直接比较 | 已在 `infer/loops_v3.c::build_dag_v3` 注释中记录；阈值按 lattice 各自维护 |
+| D-14 | `train/causal_student_train.py` / `train/eval_lattice_storage.py` 已从 retired generic-codebook 路径移植到 `cog_loop_scan(z, params, cfg)` | 旧 `student.pkl` 若没有 `route`/`fusion` 参数会明确报错，不再静默或 `NotImplementedError`；该 standalone trainer 仍是单一 AdamW 树，不实现 R3 的 EMA/分组 | 需要旧 checkpoint 时重新训练/导出 canonical 六格参数；canonical 训练请用 `train_cog`。新 checkpoint 带 route/fusion/self/value_scalars |
 
 ---
 
@@ -146,11 +150,11 @@ python train/smoke_conformance.py --steps 100 --batch 1 --seq 64 \
 - `JAX_PLATFORMS=cpu /home/DslsDZC/LCM/be/bin/python -m pytest train/test_smoke_conformance.py train/test_parity_lattices.py train/test_c_load.py train/test_vq_losses.py train/test_binding_unbind.py train/test_sparse_lfq.py -q`
   → **63 passed in 269.94s**（mini smoke + 24 parity + 11 C loader + R18/R20/R2 coverage）。
 - `JAX_PLATFORMS=cpu /home/DslsDZC/LCM/be/bin/python -m pytest train/test_safety_hypothesis.py -q`
-  → **12 passed in 76.19s**（formal constants now 128/0.7）。
+  → **12 passed in 76.19s**（formal constants now 128/0.4）。
 - `JAX_PLATFORMS=cpu /home/DslsDZC/LCM/be/bin/python -m pytest train/test_c_loop.py -q`
   → **5 passed in 2.20s**（含真实 v3 loop 的 danger abort `-2` / 无 token 路径）。
 - `make -C infer clean && make -C infer test` → **ALL TESTS PASSED**；
-  日志含 **235** 个 `[PASS]` 检查，退出码 0。
+  日志含 **243** 个 `[PASS]` 检查，退出码 0。
 - `nm -D infer/liblcm.so | grep -E "lcm_infer_loop_v3|hrq_forward_v31"` →
   `lcm_infer_loop_v3`、`lcm_infer_loop_v3_flat`、`hrq_forward_v31` 均存在。
 - 100 步 smoke（`--steps 100 --batch 1 --seq 64 --passive-only --allow-fail`）→
@@ -191,7 +195,7 @@ grep -n "v3.1-conformance" docs/{a,b,c,d,e}.md docs/{a,b,c,d,e}_cn.md
 
 五份英文规范 + 五份中文版均带 v3.1-conformance changelog；`λ_sparse` 已拆为
 `λ_shrink`/`λ_lfq`，`β_val` 标记 deprecated，`max_steps` 拆为调度预算与安全硬限，
-`C_self` 与 `SelfActivationState` 命名已区分。C 参考测试日志仍为 **235** 个
+`C_self` 与 `SelfActivationState` 命名已区分。C 参考测试日志现为 **243** 个
 `[PASS]` 检查（不是 234）。
 
 > smoke 运行时的 HEAD 是 `c32eea9`（上一轮修复提交）；Task 15 evidence 提交是
@@ -206,7 +210,7 @@ grep -n "v3.1-conformance" docs/{a,b,c,d,e}.md docs/{a,b,c,d,e}_cn.md
 - 旧审计的 7 条 P0：**7 条 fixed**；其中 P0-6 的语义安全码本归 D-4（deferred）。
 - C-1…C-15：**15 条 fixed**；C-7 的规范文字同步、C-8/C-9/C-10 的文档歧义已在本次 Task 0 一并落文。
 - F-1…F-7：**7 条 fixed/结构 fixed**；F-6 的 JAX 归一化熵门已改，
-  F-7 的 C 一致性阈值已改 0.7。
+  F-7 的 C 一致性阈值已重新标定为 0.4（clip 域）。
 - 本次新增并修复 4 个阻断项（N-1…N-4），其中 N-2/N-3 直接影响 100 步 smoke
   能否运行与 C 端能否加载。
 - 100 步 smoke 的 10% 码本利用率未通过（D-9，streaming probe 也未过），

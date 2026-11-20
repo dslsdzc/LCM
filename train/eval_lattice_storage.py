@@ -16,6 +16,7 @@ import numpy as np
 import optax
 from tokenizers import Tokenizer
 
+from train.cog_loop import cog_loop_scan
 from train.config import LCMConfig
 from train.encoder import encoder_forward
 from train.fusion import gen_head_forward
@@ -44,15 +45,15 @@ def normalize(x):
 
 def states(params, questions, cfg):
     encoded = encoder_forward(params['encoder'], questions, cfg.n_heads)
-    warnings.warn(
-        "eval_lattice_storage's lattice path predates the canonical "
-        "six-lattice loop; cog_loop_scan now takes (z, params, cfg), not a "
-        "flat codebook list.",
-        DeprecationWarning, stacklevel=2)
-    raise NotImplementedError(
-        "This evaluator was written against the retired generic-codebook "
-        "cog_loop_scan(z, codebooks, thresholds=..., tau=...). Port it to "
-        "cog_loop_scan(encoded, params, cfg, ...) before use.")
+    if 'route' not in params or 'fusion' not in params:
+        raise ValueError(
+            "student checkpoint has no canonical route/fusion parameters; "
+            "the retired generic-codebook loop is gone. Re-train with the "
+            "current causal_student_train.init_student or export route/fusion "
+            "with the checkpoint.")
+    z_qs, _, _ = cog_loop_scan(
+        encoded, params, cfg, max_steps=cfg.max_inference_steps)
+    return encoded, z_qs[-1]
 
 
 def evaluate(params, cfg, questions, inputs, targets, masks):

@@ -851,6 +851,7 @@ def _real_safety_probe(final_dir):
                 ("C_neg", ctypes.c_float * (n_pairs * d)),
                 ("D", ctypes.c_int),
                 ("integrity_hash", ctypes.c_char * 65),
+                ("source_hash", ctypes.c_char * 65),
             ]
         lib.gvalue_init.argtypes = [
             ctypes.POINTER(_GValue), ctypes.POINTER(ctypes.c_float),

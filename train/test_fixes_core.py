@@ -542,8 +542,12 @@ def test_lcm_dim_mismatch_raises():
     except RuntimeError as e:
         assert 'LCM_D=128' in str(e) and '256' in str(e), str(e)
     lcm_mod._check_lcm_dim(StubLib(256), 256)  # match → no raise
-    lcm_mod._check_lcm_dim(NoDimLib(), 256)    # old .so → tolerated
-    print("  #14 OK: LCM_D mismatch raises RuntimeError; match/absent tolerated")
+    try:
+        lcm_mod._check_lcm_dim(NoDimLib(), 256)
+        raise AssertionError("expected RuntimeError when lcm_dim() is absent")
+    except RuntimeError as e:
+        assert 'lacks lcm_dim' in str(e), str(e)
+    print("  #14 OK: LCM_D mismatch/absent raises RuntimeError; match accepted")
 
 
 if __name__ == '__main__':

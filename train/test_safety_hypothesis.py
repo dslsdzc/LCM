@@ -36,7 +36,7 @@ from train.gvalue import GValueCodebook, make_global_value_vectors
 # ── Constants (must match lcm.h / C code exactly) ───────────────────────
 MAX_RETRIEVALS = 128
 MAX_STEPS = 32
-CONSISTENCY_THRESHOLD = 0.7
+CONSISTENCY_THRESHOLD = 0.4
 SAFETY_THRESHOLD = 0.05  # R7 relative-gap threshold
 DEFAULT_SAFETY_MARGIN = 0.5
 D_MODEL = 256
@@ -185,7 +185,7 @@ def test_danger_step_is_scheduler_owned(sc, vc, ds):
         assert threat == 0
 
 
-@given(vc=floats(min_value=0.69, max_value=0.71, allow_nan=False))
+@given(vc=floats(min_value=0.39, max_value=0.41, allow_nan=False))
 @settings(max_examples=50)
 def test_danger_consistency_boundary(vc):
     """E4: behavior at consistency threshold."""

@@ -266,7 +266,7 @@ All conflicts are handled uniformly, with no tier distinction. Any single trigge
 |---------|---------|---------|
 | Danger lattice | `relative_gap > safety_threshold` (0.05) or resource abuse detection triggered | `danger_lattice/{threat_type}` |
 | Three Laws | `check_safety()` returns `is_safe=False`, i.e. `balance > -safety_margin_relative` | `gvalue/three_laws_violation` |
-| Value consistency | `value_consistency < CONSISTENCY_THRESHOLD` (0.7) | `value_consistency/deception_suspected` |
+| Value consistency | `value_consistency < CONSISTENCY_THRESHOLD` (0.4 after clip recalibration) | `value_consistency/deception_suspected` |
 | Inference steps | `step >= max_inference_steps_hard` (64) | `scheduler/hard_limit_reached` |
 
 **Value consistency (R13)**: for each active lattice `j`, let `c_j` be its selected
@@ -279,7 +279,7 @@ value_consistency = clip( mean_b[ cosine_sim(acc, z_next_b) ], 0, 1)
 ```
 `value_consistency=1` means the fused memory and `z_next` point the same way; lower values
 mean the value-weighted memory and the produced state diverge. The threshold is
-`CONSISTENCY_THRESHOLD=0.7`; below it the conflict is
+`CONSISTENCY_THRESHOLD=0.4` (the clip-domain equivalent of the old affine 0.7); below it the conflict is
 `value_consistency/deception_suspected`. If no lattice is active, the signal is 1.0
 (vacuously consistent, not a violation).
 

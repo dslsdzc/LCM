@@ -69,7 +69,7 @@ extern "C" {
 #endif
 
 /* Derived constants */
-#define LCM_CONSISTENCY_THRESHOLD 0.7f   /* R17; value_consistency ∈ [0,1] */
+#define LCM_CONSISTENCY_THRESHOLD 0.4f   /* R17 recalibrated: clip(cos,0,1) */
 #define LCM_ENTROPY_THRESHOLD     2.0f  /* v1: unnormalised H, effectively off */
 #define LCM_ENTROPY_THRESHOLD_NORM 0.5f /* R9: v3 H(w)/ln(n_active) */
 #define LCM_CONVERGENCE_TOL       1e-3f
@@ -284,6 +284,7 @@ typedef struct {
     vec_t  C_neg[LCM_N_VALUE_PAIRS];   /* Negative value anchors (ball-cached) */
     int    D;
     char   integrity_hash[65];         /* 64 hex chars + NUL (R13 SHA-256) */
+    char   source_hash[65];            /* SHA-256 of the raw file payload */
 } gvalue_t;
 
 /* ─── Danger Lattice ─────────────────────────────────────────────────────── */
@@ -428,12 +429,14 @@ typedef struct {
 /* Initialize safety subsystems */
 void gvalue_init(gvalue_t* gv, const float* C_pos, const float* C_neg, int D);
 bool gvalue_verify(const gvalue_t* gv);
+bool gvalue_verify_digest(const gvalue_t* gv, const char* expected_hex);
 bool gvalue_check_safety(const gvalue_t* gv, const float* z,
                           float safety_margin, int* out_violated_law);
 
 void danger_init(danger_lattice_t* dl, const float* C_threats,
                  const float* C_normal, int M, int D);
 bool danger_verify(const danger_lattice_t* dl);
+bool danger_verify_digest(const danger_lattice_t* dl, const char* expected_hex);
 void danger_assess(const danger_lattice_t* dl, const float* z,
                     int step_count, int retrieval_count, int max_steps,
                     float value_consistency,

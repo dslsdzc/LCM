@@ -219,13 +219,24 @@ def _save_contrast(params, path):
 def _save_gvalue(gvalue, path, d):
     """gvalue: C_pos + C_neg + SHA-256 hash.
 
-    Placeholder: C_neg mirrors C_pos so the C engine's margin check
-    (pos > neg - margin ⇒ unsafe) never fires — real anchors are not
-    trained yet, and asymmetric placeholders abort the cognitive loop on
-    nearly every input when use_safety is on.
+    The checkpoint loader rejects C_pos == C_neg (a placeholder disables the
+    Three Laws check), so writing a copy of C_pos here would produce a file
+    this project's own inference engine refuses. Use the codebook's real
+    negative anchors; refuse loudly if they are missing or identical.
     """
     C_pos = np.asarray(gvalue.C_pos, dtype=np.float32)
-    C_neg = C_pos.copy()
+    if not hasattr(gvalue, 'C_neg'):
+        raise ValueError(
+            "gvalue object has no C_neg; R13 requires distinct positive and "
+            "negative anchors (a C_pos copy is not a value codebook)")
+    C_neg = np.asarray(gvalue.C_neg, dtype=np.float32)
+    if C_pos.shape != C_neg.shape:
+        raise ValueError(
+            f"gvalue C_pos shape {C_pos.shape} != C_neg shape {C_neg.shape}")
+    if np.array_equal(C_pos, C_neg):
+        raise ValueError(
+            "gvalue C_pos == C_neg; refusing to write a placeholder that the "
+            "inference engine rejects (re-export with real R6 anchors)")
     M_pair = C_pos.shape[0]
 
     hdr = _pack_header(M_pair, d, 1, CB_HYPERBOLIC, 1.0)
@@ -646,7 +657,7 @@ def _save_danger(params, path, M_danger, d):
 
 
 def load_checkpoint(output_dir, cfg=None, rng=None, load_opt=True,
-                    allow_missing_self=False):
+                    allow_missing_self=False, allow_missing_aux=False):
     """Load LCM checkpoint from flat binary directory.
 
     Loads encoder, decoder, all codebooks, gvalue, and optional optimizer state.
@@ -654,16 +665,21 @@ def load_checkpoint(output_dir, cfg=None, rng=None, load_opt=True,
 
     This is also the resume path for ``lcm.py --stage3 --resume``, so it has to
     be a genuine round-trip: ``fusion``, ``value_scalars``, the self lattice and
-    binding's ``A_k``/``A_v`` are restored from their own files. When those
-    files are absent (checkpoints written before round-trip saving) each one is
-    re-initialised from a fixed PRNG key and a warning is printed — that is a
-    *different model*, not a resume, and it used to happen silently.
+    binding's ``A_k``/``A_v`` are restored from their own files. When
+    ``fusion.bin`` or ``value_scalars.bin`` is absent the loader raises unless
+    ``allow_missing_aux=True``: re-initialising them is a *different model*, not
+    a resume, and used to happen silently.
 
     Args:
         output_dir: Path to checkpoint directory.
         cfg: LCMConfig (loaded from config.json if None).
         rng: JAX PRNG key.
         load_opt: Whether to load optimizer state.
+        allow_missing_self: Explicit opt-in to reset a pre-R15 self lattice.
+        allow_missing_aux: Explicit opt-in to re-initialise a missing
+            ``fusion.bin`` / ``value_scalars.bin``. The default is to raise:
+            silently re-initialising those tensors produces a different model
+            that the caller would mistake for a resume.
 
     Returns:
         (params, gvalue, opt_state, step) — params is inference-ready with
@@ -714,9 +730,14 @@ def load_checkpoint(output_dir, cfg=None, rng=None, load_opt=True,
         params['fusion'] = _load_fusion(fusion_path, cfg)
         print(f"  [CKPT] fusion.bin loaded")
     else:
-        print("  [WARN] fusion.bin missing — re-initialising fusion randomly. "
-              "This checkpoint predates round-trip saving; resume WILL NOT "
-              "reproduce the original run.")
+        if not allow_missing_aux:
+            raise ValueError(
+                f"{fusion_path} is missing; re-initialising fusion would "
+                f"silently produce a different model. Pass "
+                f"allow_missing_aux=True only for a documented pre-v2 "
+                f"checkpoint reset.")
+        print("  [WARN] fusion.bin missing — re-initialising fusion randomly "
+              "(allow_missing_aux=True). This is NOT a resume.")
         params['fusion'] = init_fusion_params(rng_fuse, cfg.n_lattices, d)
     params['gen_head'] = params.get('gen_head',
         init_gen_head_params(rng_gen, d, cfg.vocab_size))
@@ -736,7 +757,13 @@ def load_checkpoint(output_dir, cfg=None, rng=None, load_opt=True,
     if os.path.exists(vs_path):
         params['value_scalars'] = _load_value_scalars(vs_path, cfg)
     else:
-        print("  [WARN] value_scalars.bin missing — re-initialising to zeros")
+        if not allow_missing_aux:
+            raise ValueError(
+                f"{vs_path} is missing; re-initialising value scalars to "
+                f"zeros would silently disable the R22 value bias. Pass "
+                f"allow_missing_aux=True only for a documented reset.")
+        print("  [WARN] value_scalars.bin missing — re-initialising to zeros "
+              "(allow_missing_aux=True). This is NOT a resume.")
         params['value_scalars'] = init_value_scalars(cfg)
 
     # Self lattice params

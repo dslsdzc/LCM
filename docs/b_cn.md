@@ -54,7 +54,7 @@
 | `MAX_RETRIEVALS_PER_STEP` | 单步最大检索次数（本步全部激活格，R13） | 128 |
 | `max_inference_steps` | 调度步数预算；耗尽时优雅返回，不是中断（R9） | 16 |
 | `max_inference_steps_hard` | 安全硬限；耗尽时中断（R9） | 64 |
-| `CONSISTENCY_THRESHOLD` | 价值一致性最低阈值 | 0.7 |
+| `CONSISTENCY_THRESHOLD` | 价值一致性最低阈值（`clip(cos,0,1)`） | 0.4 |
 | `entropy_threshold` | 归一化融合权重熵阈值 `H / ln(n_active)`（R9） | 0.5 |
 | `c` | 庞加莱球面曲率 | 1.0 |
 

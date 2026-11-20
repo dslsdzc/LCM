@@ -160,6 +160,9 @@ int lcm_get_trace(float* trace_buf, int buf_capacity_floats);
  *
  * Returns 0 (converged or graceful budget), -1 (argument error), or
  * CONFLICT_ABORT_TOKEN (-2, safety abort; z_out must not be used).
+ * `gv_sha256` / `danger_sha256` are optional lowercase hex digests of the
+ * exported raw payloads. When supplied, init must reproduce them or the call
+ * fails with -1 (a tampered/truncated file never reaches the loop).
  * `alert_cb` (optional) receives the fully populated FATAL alert exactly once
  * on any abort.
  */
@@ -187,6 +190,7 @@ int lcm_infer_loop_v3_flat(
     const float* contrast_value_a, const float* contrast_value_b,
     const float* gv_pos, int gv_n, const float* gv_neg,
     const float* danger_t, const float* danger_n, int danger_M,
+    const char* gv_sha256, const char* danger_sha256,
     int max_steps, float conv_tol, float entropy_thresh,
     float safety_margin, float alpha_val, const char* trace_path,
     void (*alert_cb)(const alert_t*),

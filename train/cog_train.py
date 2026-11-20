@@ -1019,7 +1019,7 @@ def _replace_dead_contrast(params, contrast_bank, contrast_last_used, step, cfg)
     """Replace only dead contrast rows, preserving every live row (R18).
 
     ``C = A @ W``. For each dead row we solve ``a @ W = c_new`` (``W`` is
-    square, ``a = solve(W.T, c_new)``) and write only that row of ``A``; ``W``
+    square, ``a = pinv(W.T) @ c_new``) and write only that row of ``A``; ``W``
     and all non-dead rows are left untouched, so their effective vectors are
     bit-identical. Adam moments for the replaced rows are *not* reset; the next
     gradient steps adapt them.
@@ -1042,8 +1042,16 @@ def _replace_dead_contrast(params, contrast_bank, contrast_last_used, step, cfg)
                 W = np.asarray(cb['W'])
                 C_new, last = contrast_bank.replace_dead_contrast(
                     A @ W, last, step, cfg.bank_dead_threshold)
-                # Only the dead rows change: a = solve(W.T, c_new).
-                replacements = np.linalg.solve(W.T, C_new[dead].T).T
+                # Only the dead rows change: a = W^+ c_new. pinv handles a
+                # singular W (the old np.linalg.solve raised LinAlgError and
+                # aborted the training step); a non-finite replacement is a
+                # hard error because it would poison the codebook silently.
+                replacements = (np.linalg.pinv(W.T) @ C_new[dead].T).T
+                if not np.all(np.isfinite(replacements)):
+                    raise ValueError(
+                        f"contrast dead-row replacement produced non-finite "
+                        f"values (family={family}, layer={layer}, "
+                        f"step={step}); refusing to poison the codebook")
                 A_new = np.array(A, copy=True)
                 A_new[dead] = replacements
                 new_cb = {'A': jnp.asarray(A_new), 'W': cb['W']}

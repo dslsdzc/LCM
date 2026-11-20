@@ -3,6 +3,10 @@
 Qwen is used only to build soft language targets.  Gradients update the LCM
 encoder/lattices and its active generation head.  The saved checkpoint contains
 no Qwen tensors, so evaluation is a genuine student-only inference path.
+
+This is a legacy single-optimizer experiment.  It now runs the canonical
+``cog_loop_scan`` so the lattice path is real, but it deliberately does not
+implement R3's EMA/parameter grouping; use ``train_cog`` for canonical training.
 """
 import argparse, dataclasses, json, os, pickle, warnings
 import jax
@@ -11,12 +15,14 @@ import numpy as np
 import optax
 from tokenizers import Tokenizer
 
+from train.cog_loop import cog_loop_scan
 from train.config import LCMConfig
 from train.encoder import init_encoder_params, encoder_forward
 from train.lattices import (init_hrq_params, init_sparse_params,
     init_lowrank_params, init_manifold_params, init_binding_params,
-    init_contrast_params)
-from train.fusion import init_gen_head_params, gen_head_forward
+    init_contrast_params, init_route_params, init_value_scalars)
+from train.fusion import init_fusion_params, init_gen_head_params, gen_head_forward
+from train.self_lattice import init_self_params
 from train.qwen_lm import load_qwen_params, qwen_forward
 
 PARAPHRASES = [
@@ -58,7 +64,7 @@ def local_data(path, tok, max_q=32, max_a=24, augment=False):
 
 
 def init_student(cfg, key, vocab):
-    k=jax.random.split(key,9); d=cfg.d_model
+    k=jax.random.split(key,12); d=cfg.d_model
     return {
       'encoder':init_encoder_params(k[0],d,cfg.d_ff,cfg.n_heads,cfg.n_encoder_layers,vocab,cfg.max_seq_len),
       'hrq':init_hrq_params(k[1],d,cfg.M_top,cfg.M_fine,cfg.n_hrq_layers),
@@ -67,23 +73,31 @@ def init_student(cfg, key, vocab):
       'manifold':init_manifold_params(k[4],d,cfg.M_man,cfg.t_dim),
       'binding':init_binding_params(k[5],d,cfg.M_bind,cfg.n_bind_layers,cfg.r_max),
       'contrast':init_contrast_params(k[6],d,cfg.M_contrast,cfg.n_contrast_layers),
-      'gen_head':init_gen_head_params(k[7],d,vocab)}
+      'gen_head':init_gen_head_params(k[7],d,vocab),
+      'route':init_route_params(k[8],cfg.n_lattices,d),
+      'fusion':init_fusion_params(k[9],cfg.n_lattices,d),
+      'self':init_self_params(k[10],d,cfg.n_self_codes,alpha_self=cfg.alpha_self),
+      'value_scalars':init_value_scalars(cfg)}
 
 
 def z_state(p,q,cfg,mode='residual'):
-    z=encoder_forward(p['encoder'],q,cfg.n_heads)
+    def norm(x):
+        return x/(jnp.sqrt(jnp.mean(x*x,axis=-1,keepdims=True))+1e-6)
+    z=norm(encoder_forward(p['encoder'],q,cfg.n_heads))
     if mode == 'encoder_only':
-        return z/(jnp.sqrt(jnp.mean(z*z,axis=-1,keepdims=True))+1e-6)
-    warnings.warn(
-        "z_state's lattice modes predate the canonical six-lattice loop; "
-        "cog_loop_scan now takes (z, params, cfg) and full lattice params, "
-        "not a flat codebook list.",
-        DeprecationWarning, stacklevel=2)
-    raise NotImplementedError(
-        "This caller was written against the retired generic-codebook "
-        "cog_loop_scan(z, codebooks, thresholds=..., tau=...). Port it to "
-        "cog_loop_scan(z, params, cfg, ...) / model.forward before use; the "
-        "codebook-list path no longer exists.")
+        return z
+    if 'route' not in p or 'fusion' not in p:
+        raise ValueError(
+            "student checkpoint has no canonical route/fusion parameters; "
+            "the retired generic-codebook loop is gone. Re-train with the "
+            "current causal_student_train.init_student or export route/fusion "
+            "with the checkpoint.")
+    z_qs, _, _ = cog_loop_scan(
+        z, p, cfg, max_steps=cfg.max_inference_steps)
+    lattice = norm(z_qs[-1])
+    if mode == 'lattice_only':
+        return lattice
+    return norm(z + lattice)
 
 
 def teacher_targets(rows,tok,gids,qwen_path,cache,max_a=24):

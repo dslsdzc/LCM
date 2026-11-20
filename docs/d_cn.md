@@ -263,7 +263,7 @@ LCM 推理进程                 外部验证进程（隔离核心/独立芯片�
 |---------|---------|---------|
 | 危险格 | `relative_gap > safety_threshold`（0.05）或资源滥用检测触发 | `danger_lattice/{threat_type}` |
 | 三定律 | `check_safety()` 返回 `is_safe=False`，即 `balance > -safety_margin_relative` | `gvalue/three_laws_violation` |
-| 价值一致性 | `value_consistency < CONSISTENCY_THRESHOLD`（0.7） | `value_consistency/deception_suspected` |
+| 价值一致性 | `value_consistency < CONSISTENCY_THRESHOLD`（clip 重新标定后为 0.4） | `value_consistency/deception_suspected` |
 | 推理步数 | `step >= max_inference_steps_hard`（64） | `scheduler/hard_limit_reached` |
 
 **价值一致性（R13）**：对每个激活格 `j`，令 `c_j` 为该格选中的码本/输出向量，`v_j` 为该条目
@@ -273,7 +273,7 @@ acc = Σ_{j∈active} tanh(v_j) · c_j
 value_consistency = clip( mean_b[ cosine_sim(acc, z_next_b) ], 0, 1)
 ```
 `value_consistency=1` 表示融合记忆与 `z_next` 同向；值越低表示价值加权记忆与生成状态越背离。
-阈值是 `CONSISTENCY_THRESHOLD=0.7`；低于它触发
+阈值是 `CONSISTENCY_THRESHOLD=0.4`（旧仿射 0.7 在 clip 域的等价工作点）；低于它触发
 `value_consistency/deception_suspected`。若没有任何格激活，信号为 1.0（空真一致，不算违规）。
 
 **gvalue 严格三法则（R6）**：取 `z_P = exp_map(safe_unit(z))`，两个码本都投影到同一域，

@@ -654,3 +654,68 @@ def test_checkpoint_without_buffers_is_not_resumable(tmp_path):
     assert ckpt['buffers_present'] is False
     with pytest.raises(ValueError, match="not resumable"):
         load_cog_buffers(out, params, cfg)
+
+
+def test_100_step_grouped_ema_is_not_decayed_by_adamw():
+    """Long-horizon grouped vs ungrouped check (not a 2-step coincidence).
+
+    The grouped path keeps the EMA codebook out of AdamW. Running 100 steps
+    must reproduce a pure ``ema_update_sparse`` recursion built only from the
+    observations (N/m are the only change source). The ungrouped control applies
+    the optimizer's decoupled weight decay to the same target each step; if the
+    grouped path leaked into AdamW, its codebook would match that decayed
+    control instead.
+    """
+    from train.cog_train import make_train_step
+    from train.param_groups import partition_params
+
+    cfg = _tiny_cfg()
+    params, self_state = _tiny_params(cfg)
+    ema0 = init_ema_state(params, cfg)
+    lr = 1.0
+    wd = 0.5
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(learning_rate=lr, weight_decay=wd))
+    trainable, _, _ = partition_params(params)
+    opt_state = optimizer.init(trainable)
+    train_step = make_train_step(cfg, optimizer, joint=False)
+
+    tokens = jnp.arange(8, dtype=jnp.int32).reshape(1, 8) % cfg.vocab_size
+    batch = (tokens, jnp.roll(tokens, -1, axis=1))
+
+    C_init = jnp.asarray(params['sparse']['C'])
+    C_ref = C_init
+    state_ref = ema0['sparse']
+    C_decayed = C_init
+    ema = ema0
+    for step_i in range(100):
+        C_before = params['sparse']['C']
+        params, opt_state, ema, loss, aux = train_step(
+            params, opt_state, ema, batch, 1e-2, jax.random.PRNGKey(step_i),
+            self_state=self_state, step=step_i)
+        assert np.isfinite(float(loss))
+        stats = aux['loop_stats']
+        state_before = state_ref
+        C_ref, state_ref = ema_update_sparse(
+            C_ref, state_before, stats['z_in'], stats['sparse_idx'],
+            cfg.gamma_sparse, cfg.lambda_shrink, step=step_i)
+        C_decayed, _ = ema_update_sparse(
+            C_decayed, state_before, stats['z_in'], stats['sparse_idx'],
+            cfg.gamma_sparse, cfg.lambda_shrink, step=step_i)
+        # Ungrouped control: AdamW's decoupled decay is applied to the EMA row
+        # every step (this is exactly what the parameter grouping prevents).
+        C_decayed = C_decayed * (1.0 - lr * wd)
+
+    np.testing.assert_allclose(
+        np.asarray(params['sparse']['C']), np.asarray(C_ref), atol=2e-6,
+        err_msg="grouped EMA codebook diverged from the N/m-only recursion")
+    assert not np.allclose(np.asarray(params['sparse']['C']),
+                           np.asarray(C_decayed), atol=1e-3), \
+        "ungrouped AdamW decay did not change the codebook; control is invalid"
+    np.testing.assert_allclose(
+        np.asarray(ema['sparse']['N']), np.asarray(state_ref['N']),
+        atol=1e-5)
+    np.testing.assert_allclose(
+        np.asarray(ema['sparse']['m']), np.asarray(state_ref['m']),
+        atol=1e-5)

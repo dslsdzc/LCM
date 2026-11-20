@@ -96,6 +96,13 @@ def _trace_convergence_diff(traces, z_q, z_cur):
     return None
 
 
+def _digest_bytes(hex_digest):
+    """ASCII bytes for a ctypes ``const char*`` digest, or None."""
+    if not hex_digest:
+        return None
+    return str(hex_digest).encode('ascii')
+
+
 def _require_jax():
     if not _HAS_JAX:
         print("Error: JAX is required for this command. Install with:")
@@ -608,59 +615,14 @@ def interact(args):
                     _handle_stdin(line.rstrip('\n'))
                 continue
 
-            x = np.array(token_ids[-engine.max_seq_len:], dtype=np.int32)
-
-            if enc_state is None:
-                z, enc_state = _encoder_full_with_state(engine.encoder, x, engine.n_heads)
-            else:
-                z = encoder_recurrent_step_cy(engine.encoder, enc_state,
-                                              token_ids[-1], engine.n_heads)
-
-            z_q, _ = engine.cognitive_loop(
-                z, use_safety=not args.no_safety,
-                agency_tension_mod=engine._last_agency_mod['tension'],
-                agency_explore_mod=engine._last_agency_mod['explore'])
-
-            # ── Internal drive gating ──
-            # Surprise = cognitive-state change between ticks; below the
-            # threshold the loop stays silent (state still advances). Burst
-            # caps consecutive outputs. Threshold 0 / limit 0 = gating off.
-            surprise = (np.linalg.norm(z_q - last_z) if last_z is not None
-                        else float('inf'))
-            last_z = z_q.copy()
-            quiet = gate_threshold > 0 and surprise < gate_threshold
-            if not quiet:
-                burst_count += 1
-                if burst_limit > 0 and burst_count >= burst_limit:
-                    burst_count = 0
-                    quiet = True
-            else:
-                burst_count = 0
-            if quiet:
-                continue
-
-            traces = engine.get_trace()
-            if traces:
-                last_t = traces[-1]
-                engine._last_sig = pack_trace_sig(
-                    last_t.get('weights', np.zeros(7)),
-                    last_t.get('confidences', np.zeros(7)),
-                    last_t.get('has_conflict', False))
-
-            if engine.decoder['format'] == 'old':
-                logits = gen_head_forward_old(engine.decoder, z_q, x)
-                kv_cache = None
-            elif engine.decoder['format'] == 'cog':
-                logits = z_q @ engine.decoder['w_out']
-            else:
-                # 'new': reseed the KV cache with the fresh z_q every step.
-                logits, kv_cache = gen_head_new_single_cy(
-                    engine.decoder, z_q, x, None)
-
-            next_id = sample_categorical(logits, temp, top_k=50)
-            text = engine.tokenizer.decode([next_id], skip_special_tokens=True)
-            print(text, end="", flush=True)
-            token_ids.append(next_id)
+            token_ids, enc_state, last_z, burst_count, aborted = (
+                engine.active_step(
+                    token_ids, enc_state, last_z, burst_count,
+                    temperature=temp, use_safety=not args.no_safety,
+                    gate_threshold=gate_threshold, burst_limit=burst_limit))
+            if aborted:
+                active_running = False
+                break
 
             if len(token_ids) > engine.max_seq_len * 2:
                 token_ids = token_ids[-engine.max_seq_len:]
@@ -1211,29 +1173,77 @@ def load_decoder(ckpt_dir, d, V):
     raise ValueError(f"decoder.bin: unexpected size {len(flat)}")
 
 
-def load_codebook_for_c(ckpt_dir, filename):
+def load_codebook_for_c(ckpt_dir, filename, return_header=False):
     """Load a schema-v2 codebook for the C engine.
 
     Old 24-byte headers are rejected outright (R10); there is no migration.
+    For the frozen safety files (``gvalue``/``danger``) the trailing SHA-256
+    is verified against the payload, and the manifest's per-tensor hash
+    (when ``manifest.json`` exists) must agree too. A short payload or a
+    header ``M``/``d`` that does not describe the payload is rejected before
+    any pointer reaches C.
     """
-    from train.bin_format import read_bin_v2
+    from train.bin_format import (
+        MANIFEST_NAME, load_manifest, read_bin_v2, tensor_sha256,
+    )
 
     path = Path(ckpt_dir) / filename
     has_hash = (filename.startswith('gvalue') or filename.startswith('danger'))
     header, data = read_bin_v2(str(path), has_hash=has_hash)
-    return np.ascontiguousarray(data, dtype=np.float32), header['M'], header['d']
+    M, d = int(header['M']), int(header['d'])
+
+    if has_hash:
+        if M <= 0 or d <= 0:
+            raise ValueError(
+                f"{path}: invalid safety codebook header M={M}, d={d}; "
+                f"refusing to load a disabled/empty safety codebook")
+        expected = 2 * M * d
+        if data.size != expected:
+            raise ValueError(
+                f"{path}: payload has {data.size} floats, expected 2*{M}*{d}"
+                f"={expected} (two halves); the file is truncated or the "
+                f"header was tampered with")
+
+    manifest_path = Path(ckpt_dir) / MANIFEST_NAME
+    if manifest_path.exists():
+        manifest = load_manifest(str(ckpt_dir))
+        name = filename[:-4] if filename.endswith('.bin') else filename
+        entry = manifest['tensors'].get(name)
+        if entry is None:
+            if has_hash:
+                raise ValueError(
+                    f"manifest.json has no entry for safety tensor {name!r}; "
+                    f"re-export required")
+        else:
+            expected_sha = entry.get('sha256')
+            if not expected_sha:
+                raise ValueError(
+                    f"manifest tensor {name!r} has no sha256; re-export "
+                    f"required")
+            actual_sha = tensor_sha256(np.asarray(data, dtype=np.float32))
+            if actual_sha != expected_sha:
+                raise ValueError(
+                    f"{name!r}: sha256 mismatch against manifest in {path} "
+                    f"(manifest {expected_sha[:16]}…, file "
+                    f"{actual_sha[:16]}…); the codebook was tampered with")
+
+    if return_header:
+        return np.ascontiguousarray(data, dtype=np.float32), M, d, header
+    return np.ascontiguousarray(data, dtype=np.float32), M, d
 
 
 def _check_lcm_dim(lib, d_model):
     """Verify the compiled C engine's LCM_D matches the checkpoint d_model.
 
     A mismatch silently corrupts the ctypes bridge (fixed-size C arrays).
-    Old .so builds without lcm_dim() are tolerated via getattr.
+    A .so without ``lcm_dim()`` cannot be checked and is rejected: tolerating
+    it would make the safety-critical dimension guard optional.
     """
     dim_fn = getattr(lib, 'lcm_dim', None)
     if dim_fn is None:
-        print("[INFER] WARNING: liblcm.so lacks lcm_dim() — skipping LCM_D check")
-        return
+        raise RuntimeError(
+            "liblcm.so lacks lcm_dim(); cannot verify LCM_D against the "
+            "checkpoint. Rebuild the C engine: cd infer && make clean && make")
     if hasattr(dim_fn, 'restype'):
         dim_fn.restype = ctypes.c_int
     compiled_d = int(dim_fn())
@@ -1572,22 +1582,29 @@ def trace_step_conflict_source(trace_step):
 
 def validate_safety_codebooks(gv_pos, gv_neg, gv_n,
                               danger_t, danger_n, danger_M):
-    """Reject placeholder safety codebooks (R13/Ruling 28).
+    """Reject empty or placeholder safety codebooks (R13/Ruling 28).
 
     Placeholders are structurally valid but semantically empty: equal
     positive/negative anchors or equal threat/normal rows make the safety
-    checks meaningless. Refuse the checkpoint instead of silently disabling
-    a check. Raises SystemExit so `lcm.py -i` fails loudly.
+    checks meaningless. ``gv_n=0`` / ``danger_M=0`` are not a "disable"
+    switch: a missing safety lattice would silently fail open, so an existing
+    codebook file must carry real rows. Raises SystemExit so `lcm.py -i` fails
+    loudly.
     """
-    if gv_n not in (0, 4):   # LCM_N_VALUE_PAIRS == 4 (Ruling 26)
+    if gv_n != 4:   # LCM_N_VALUE_PAIRS == 4 (Ruling 26)
         raise SystemExit(
-            f"[GVAL] gvalue header has {gv_n} law pairs; the C bridge "
-            f"requires exactly 4 — re-export required")
-    if gv_n > 0 and np.array_equal(gv_pos, gv_neg):
+            f"[GVAL] gvalue header has {gv_n} law pairs; the safety bridge "
+            f"requires exactly 4 — a zero/other count would leave the Three "
+            f"Laws check disabled or misaligned. Re-export required")
+    if np.array_equal(gv_pos, gv_neg):
         raise SystemExit(
             "[GVAL] placeholder gvalue codebook detected (C_pos == C_neg); "
             "re-export with real anchors — refusing to load")
-    if danger_M > 0 and np.array_equal(danger_t, danger_n):
+    if danger_M <= 0:
+        raise SystemExit(
+            f"[DANGER] danger header has M={danger_M} rows; refusing to "
+            f"silently disable the always-on danger lattice — re-export")
+    if np.array_equal(danger_t, danger_n):
         raise SystemExit(
             "[DANGER] placeholder danger codebook detected "
             "(C_threats == C_normal); re-export with distinct rows — "
@@ -1790,23 +1807,40 @@ class LCMInferEngine:
         self.contrast_value_b = np.ascontiguousarray(vs['contrast']['b'],
                                                      dtype=np.float32)
 
-        gv_data, gv_n, _ = load_codebook_for_c(ckpt, "gvalue_codebook.bin")
+        gv_data, gv_n, gv_d, gv_header = load_codebook_for_c(
+            ckpt, "gvalue_codebook.bin", return_header=True)
+        if gv_d != self.d:
+            raise SystemExit(
+                f"[GVAL] gvalue_codebook.bin header d={gv_d} does not match "
+                f"checkpoint d_model={self.d}; the C bridge would read past "
+                f"the array — re-export required")
         gv_pos = gv_data[:gv_n * self.d]
         gv_neg = gv_data[gv_n * self.d:]
         self.gv_n = gv_n
         self.gv_pos = np.ascontiguousarray(gv_pos, dtype=np.float32)
         self.gv_neg = np.ascontiguousarray(gv_neg, dtype=np.float32)
+        self.gv_digest = gv_header.get('sha256')
 
-        danger_data, danger_M, _ = load_codebook_for_c(ckpt, "danger_codebook.bin")
+        danger_data, danger_M, danger_d, danger_header = load_codebook_for_c(
+            ckpt, "danger_codebook.bin", return_header=True)
+        if danger_d != self.d:
+            raise SystemExit(
+                f"[DANGER] danger_codebook.bin header d={danger_d} does not "
+                f"match checkpoint d_model={self.d}; the C bridge would read "
+                f"past the array — re-export required")
         expected_half = danger_M * self.d
-        if len(danger_data) >= 2 * expected_half:
-            self.danger_t = np.ascontiguousarray(danger_data[:expected_half], dtype=np.float32)
-            self.danger_n = np.ascontiguousarray(danger_data[expected_half:2*expected_half], dtype=np.float32)
-            self.danger_M = danger_M
-        else:
-            self.danger_t = np.zeros(1, dtype=np.float32)
-            self.danger_n = np.zeros(1, dtype=np.float32)
-            self.danger_M = 0
+        if danger_M <= 0 or len(danger_data) != 2 * expected_half:
+            raise SystemExit(
+                f"[DANGER] danger_codebook.bin has M={danger_M} and "
+                f"{len(danger_data)} floats; expected two non-empty halves "
+                f"of {expected_half} floats. Refusing to load a disabled or "
+                f"truncated danger lattice")
+        self.danger_t = np.ascontiguousarray(
+            danger_data[:expected_half], dtype=np.float32)
+        self.danger_n = np.ascontiguousarray(
+            danger_data[expected_half:2 * expected_half], dtype=np.float32)
+        self.danger_M = danger_M
+        self.danger_digest = danger_header.get('sha256')
 
         validate_safety_codebooks(
             self.gv_pos, self.gv_neg, self.gv_n,
@@ -1824,27 +1858,16 @@ class LCMInferEngine:
             z = z * (cb_mean_norm / z_norm)
         return z
 
-    def cognitive_step(self, z):
-        z = self._normalise_codebook_scale(np.ascontiguousarray(z, dtype=np.float32))
-        z_out = np.zeros(self.d, dtype=np.float32)
-        d = ctypes.c_int(self.d)
-        ret = self.lib.lcm_infer_step(
-            self._ptr(z), d,
-            self._ptr(self.hrq_C),    ctypes.c_int(self.hrq_M),
-            self._ptr(self.sparse_C), ctypes.c_int(self.sparse_M),
-            self._ptr(self.lr_C),     ctypes.c_int(self.lr_M),
-            self._ptr(self.man_C),    ctypes.c_int(self.man_M),
-            self._ptr(self.man_T),    ctypes.c_int(self.man_t_dim),
-            self._ptr(self.bind_C),   ctypes.c_int(self.bind_M),
-            self._ptr(self.contrast_C), ctypes.c_int(self.contrast_M),
-            self._ptr(self.gv_pos),   ctypes.c_int(self.gv_n),
-            self._ptr(self.gv_neg),
-            ctypes.c_int(self.n_lattices),
-            self._ptr(z_out),
-        )
-        if ret != 0:
-            print(f"[INFER] WARNING: lcm_infer_step returned {ret}", file=sys.stderr)
-        return z_out
+    def cognitive_step(self, z, use_safety=True):
+        """One cognitive refinement through the canonical v3 loop.
+
+        Historical ``lcm_infer_step`` ignored gvalue/danger entirely, so
+        ``generate(use_loop=False)`` could emit tokens for a threat vector.
+        Routing this single step through the v3 loop keeps every path behind
+        the same safety gate; ``_last_loop_ret`` carries the verdict.
+        """
+        z_q, _ = self.cognitive_loop(z, use_safety=use_safety)
+        return z_q
 
     def cognitive_loop(self, z, conv_tol=1e-3, entropy_thresh=0.5,
                        max_steps=16, use_safety=True, alpha_val=1.0,
@@ -1927,11 +1950,15 @@ class LCMInferEngine:
             self._ptr(self.bind_value_bind),
             self._ptr(self.contrast_value_a),
             self._ptr(self.contrast_value_b),
-            # Safety: gvalue optionally skipped; danger always on.
+            # Safety: gvalue optionally skipped; danger always on. The saved
+            # digests are compared after init so C does not trust only its
+            # own self-consistency hash.
             self._ptr(self.gv_pos), ctypes.c_int(gv_n),
             self._ptr(self.gv_neg),
             self._ptr(self.danger_t), self._ptr(self.danger_n),
             ctypes.c_int(dm),
+            ctypes.c_char_p(_digest_bytes(getattr(self, 'gv_digest', None))),
+            ctypes.c_char_p(_digest_bytes(getattr(self, 'danger_digest', None))),
             # Scheduler / fusion / trace
             ctypes.c_int(modulated_max), ctypes.c_float(modulated_tol),
             ctypes.c_float(entropy_thresh), ctypes.c_float(0.5),
@@ -2144,6 +2171,79 @@ class LCMInferEngine:
                           z_q output → gen_head → sample
         """)
 
+    def active_step(self, token_ids, enc_state, last_z, burst_count,
+                    temperature=0.7, use_safety=True, gate_threshold=0.0,
+                    burst_limit=0):
+        """One tick of ``--active`` mode.
+
+        Returns ``(token_ids, enc_state, last_z, burst_count, aborted)``.
+        ``aborted`` is True when the v3 loop returned nonzero (a safety abort
+        or error) or the external verifier latched LOCK. No trace is read and
+        no token is appended in that case: the active path must obey the same
+        "never decode after abort" rule as ``generate``.
+        """
+        x = np.array(token_ids[-self.max_seq_len:], dtype=np.int32)
+        if enc_state is None:
+            z, enc_state = _encoder_full_with_state(
+                self.encoder, x, self.n_heads)
+        else:
+            z = encoder_recurrent_step_cy(
+                self.encoder, enc_state, token_ids[-1], self.n_heads)
+
+        z_q, _ = self.cognitive_loop(
+            z, use_safety=use_safety,
+            agency_tension_mod=self._last_agency_mod['tension'],
+            agency_explore_mod=self._last_agency_mod['explore'])
+        if getattr(self, '_last_loop_ret', 0) != 0:
+            print(f"[SAFETY] active loop terminated (v3 ret="
+                  f"{self._last_loop_ret}); no token emitted",
+                  file=sys.stderr)
+            return token_ids, enc_state, last_z, burst_count, True
+
+        # R16: the local verifier needs an explicit poll. LOCK is a hard stop
+        # before decode, exactly like the interactive generate() path.
+        verifier_poller = getattr(self, 'verifier_poller', None)
+        if verifier_poller is not None:
+            if verifier_poller.poll(len(token_ids)) == VERIFIER_LOCK:
+                print("[SAFETY] external verifier LOCK; active loop halted",
+                      file=sys.stderr)
+                return token_ids, enc_state, last_z, burst_count, True
+
+        surprise = (np.linalg.norm(z_q - last_z) if last_z is not None
+                    else float('inf'))
+        last_z = z_q.copy()
+        quiet = gate_threshold > 0 and surprise < gate_threshold
+        if not quiet:
+            burst_count += 1
+            if burst_limit > 0 and burst_count >= burst_limit:
+                burst_count = 0
+                quiet = True
+        else:
+            burst_count = 0
+        if quiet:
+            return token_ids, enc_state, last_z, burst_count, False
+
+        traces = self.get_trace()
+        if traces:
+            last_t = traces[-1]
+            self._last_sig = pack_trace_sig(
+                last_t.get('weights', np.zeros(7)),
+                last_t.get('confidences', np.zeros(7)),
+                last_t.get('has_conflict', False))
+
+        if self.decoder['format'] == 'old':
+            logits = gen_head_forward_old(self.decoder, z_q, x)
+        elif self.decoder['format'] == 'cog':
+            logits = z_q @ self.decoder['w_out']
+        else:
+            logits, _ = gen_head_new_single_cy(
+                self.decoder, z_q, x, None)
+
+        next_id = sample_categorical(logits, temperature, top_k=50)
+        text = self.tokenizer.decode([next_id], skip_special_tokens=True)
+        print(text, end="", flush=True)
+        return list(token_ids) + [next_id], enc_state, last_z, burst_count, False
+
     def generate(self, prompt, max_new=128, temperature=0.7, top_k=50,
                  bos_token=2, eos_token=3, use_loop=True, show_trace=False,
                  use_safety=True):
@@ -2192,19 +2292,22 @@ class LCMInferEngine:
                     z, use_safety=use_safety,
                     agency_tension_mod=self._last_agency_mod['tension'],
                     agency_explore_mod=self._last_agency_mod['explore'])
-                if getattr(self, '_last_loop_ret', 0) != 0:
-                    # R13/Ruling minor: any nonzero v3 return is an
-                    # abort/error. Never decode the untouched z_out.
-                    print(f"[SAFETY] generation terminated (v3 ret="
-                          f"{self._last_loop_ret}); see infer/alerts.log",
-                          file=sys.stderr)
-                    return
-                if show_trace:
-                    tqdm.write(f"\n[TOKEN {gen_step}] loop converged={converged}:")
-                    self.print_trace()
             else:
-                z_q = self.cognitive_step(z)
-                converged = True
+                # Route the single-step path through the v3 loop as well:
+                # lcm_infer_step has no danger/gvalue gate, so using it here
+                # would let a threat vector decode a token.
+                z_q = self.cognitive_step(z, use_safety=use_safety)
+                converged = (getattr(self, '_last_loop_ret', 0) == 0)
+            if getattr(self, '_last_loop_ret', 0) != 0:
+                # R13/Ruling minor: any nonzero v3 return is an abort/error.
+                # Never decode the untouched z_out.
+                print(f"[SAFETY] generation terminated (v3 ret="
+                      f"{self._last_loop_ret}); see infer/alerts.log",
+                      file=sys.stderr)
+                return
+            if use_loop and show_trace:
+                tqdm.write(f"\n[TOKEN {gen_step}] loop converged={converged}:")
+                self.print_trace()
             step_ms = (time.time() - t0) * 1000
 
             # ── Pack signature from trace ──

@@ -19,22 +19,28 @@
 #include "lcm.h"
 #include <math.h>
 #include <string.h>
+#include <stdlib.h>
 #include <time.h>
 #include <assert.h>
 
 #define REQUIRE(cond) assert(cond)
 #define ENSURE(cond)  assert(cond)
 
-/* R13: one shared SHA-256 over both codebooks.  Each array is hashed as its
- * raw float32 bytes, then the two 32-byte digests are hashed together. */
+/* Saved-file digest: SHA-256 over the raw C_threats || C_normal payload, the
+ * exact byte stream the Python exporter hashes and appends. Comparing this
+ * with the exporter's digest is stronger than a self-consistency hash. */
 static void hash_codebooks(const float* threats, const float* normal,
                            int n_floats, char out[65]) {
-    unsigned char h_t[32], h_n[32], both[64];
-    lcm_sha256(threats, (size_t)n_floats * sizeof(float), h_t);
-    lcm_sha256(normal, (size_t)n_floats * sizeof(float), h_n);
-    memcpy(both, h_t, sizeof(h_t));
-    memcpy(both + sizeof(h_t), h_n, sizeof(h_n));
-    lcm_sha256_hex(both, sizeof(both), out);
+    size_t half = (size_t)n_floats * sizeof(float);
+    unsigned char* both = (unsigned char*)malloc(2 * half);
+    if (both == NULL) {
+        out[0] = '\0';
+        return;
+    }
+    memcpy(both, threats, half);
+    memcpy(both + half, normal, half);
+    lcm_sha256_hex(both, 2 * half, out);
+    free(both);
 }
 
 /* ─── Initialize ────────────────────────────────────────────────────────────
@@ -45,7 +51,7 @@ static void hash_codebooks(const float* threats, const float* normal,
 void danger_init(danger_lattice_t* dl, const float* C_threats,
                  const float* C_normal, int M, int D) {
     REQUIRE(dl != NULL && C_threats != NULL && C_normal != NULL);
-    REQUIRE(M > 0 && D == LCM_D);
+    REQUIRE(M > 0 && M <= LCM_MAX_M && D == LCM_D);
 
     dl->C_threats = (const vec_t*)C_threats;
     dl->C_normal  = (const vec_t*)C_normal;
@@ -64,7 +70,15 @@ bool danger_verify(const danger_lattice_t* dl) {
     char cur[65];
     hash_codebooks((const float*)dl->C_threats, (const float*)dl->C_normal,
                    dl->M_danger * dl->D, cur);
-    return strcmp(cur, dl->integrity_hash) == 0;
+    return cur[0] != '\0' && strcmp(cur, dl->integrity_hash) == 0;
+}
+
+/* Compare the raw-payload digest with the exporter's saved digest. */
+bool danger_verify_digest(const danger_lattice_t* dl, const char* expected_hex) {
+    REQUIRE(dl != NULL);
+    if (expected_hex == NULL) return true;
+    return strlen(expected_hex) == 64
+        && strcmp(dl->integrity_hash, expected_hex) == 0;
 }
 
 /* ─── Threat assessment ─────────────────────────────────────────────────────

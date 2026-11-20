@@ -451,3 +451,149 @@ def test_pre_r15_self_lattice_is_rejected(tmp_path):
     (tmp_path / 'manifest.json').write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="R15|layout tag|migrated"):
         load_lattice_memories(str(tmp_path), _cfg())
+
+
+# ── Frozen safety codebooks: file SHA, manifest SHA, shape guards ───────────
+
+def _write_safety_bin(path, M, d, pos, neg, sha=None):
+    """Write a v2 safety file: header + two float32 halves + 32-byte SHA."""
+    from train.bin_format import _compute_checksum
+
+    data = np.ascontiguousarray(pos, dtype=np.float32).tobytes()
+    data += np.ascontiguousarray(neg, dtype=np.float32).tobytes()
+    crc = _compute_checksum(data)
+    if sha is None:
+        import hashlib
+        sha = hashlib.sha256(data).digest()
+    path.write_bytes(
+        struct.pack(HEADER_FMT_V2, int(M), int(d), 1, 2, 1.0,
+                    FORMAT_VERSION, 0, crc) + data + sha)
+    return sha.hex()
+
+
+def _safety_halves(M, d, seed=0):
+    rng = np.random.default_rng(seed)
+    pos = rng.normal(size=(M, d)).astype(np.float32)
+    neg = rng.normal(size=(M, d)).astype(np.float32)
+    assert not np.array_equal(pos, neg)
+    return pos, neg
+
+
+def test_safety_codebook_valid_load_and_digest(tmp_path):
+    import lcm
+
+    pos, neg = _safety_halves(4, 8)
+    digest = _write_safety_bin(tmp_path / "gvalue_codebook.bin",
+                               4, 8, pos, neg)
+    data, M, d, header = lcm.load_codebook_for_c(
+        str(tmp_path), "gvalue_codebook.bin", return_header=True)
+    assert (M, d) == (4, 8)
+    assert data.size == 2 * M * d
+    assert header["sha256"] == digest
+    lcm.validate_safety_codebooks(
+        data[:M * d], data[M * d:], M,
+        np.zeros((1, 8)), np.ones((1, 8)), 1)
+
+
+def test_safety_codebook_rejects_tampered_trailing_sha(tmp_path):
+    import lcm
+
+    pos, neg = _safety_halves(4, 8)
+    bad = bytes(32)  # not the payload digest
+    _write_safety_bin(tmp_path / "gvalue_codebook.bin", 4, 8, pos, neg, sha=bad)
+    with pytest.raises(ValueError, match="SHA-256 suffix mismatch"):
+        lcm.load_codebook_for_c(str(tmp_path), "gvalue_codebook.bin")
+
+
+def test_safety_codebook_rejects_truncated_payload(tmp_path):
+    import lcm
+
+    pos, neg = _safety_halves(4, 8)
+    # Header claims 4x8 per half, file carries one byte fewer (unaligned).
+    full = np.concatenate([pos.ravel(), neg.ravel()]).astype(np.float32)
+    data = full.tobytes()[:-1]
+    import hashlib
+    from train.bin_format import _compute_checksum
+    path = tmp_path / "gvalue_codebook.bin"
+    path.write_bytes(
+        struct.pack(HEADER_FMT_V2, 4, 8, 1, 2, 1.0, FORMAT_VERSION, 0,
+                    _compute_checksum(data)) + data
+        + hashlib.sha256(data).digest())
+    with pytest.raises(ValueError, match="not float32-aligned"):
+        lcm.load_codebook_for_c(str(tmp_path), "gvalue_codebook.bin")
+
+    # Also a float-aligned short file: M*d header does not describe the data.
+    trunc = full[:-2]
+    data = trunc.tobytes()
+    path.write_bytes(
+        struct.pack(HEADER_FMT_V2, 4, 8, 1, 2, 1.0, FORMAT_VERSION, 0,
+                    _compute_checksum(data)) + data
+        + hashlib.sha256(data).digest())
+    with pytest.raises(ValueError, match="truncated or the header"):
+        lcm.load_codebook_for_c(str(tmp_path), "gvalue_codebook.bin")
+
+
+def test_safety_codebook_rejects_wrong_d_and_zero_M(tmp_path):
+    import lcm
+
+    pos, neg = _safety_halves(4, 8)
+    path = tmp_path / "gvalue_codebook.bin"
+    _write_safety_bin(path, 4, 4, pos, neg)  # header d=4, payload 4x8 halves
+    with pytest.raises(ValueError, match="truncated or the header"):
+        lcm.load_codebook_for_c(str(tmp_path), "gvalue_codebook.bin")
+
+    _write_safety_bin(path, 0, 8,
+                      np.zeros((0, 8)), np.zeros((0, 8)))
+    with pytest.raises(ValueError, match="invalid safety codebook header"):
+        lcm.load_codebook_for_c(str(tmp_path), "gvalue_codebook.bin")
+
+    with pytest.raises(SystemExit, match="requires exactly 4"):
+        lcm.validate_safety_codebooks(
+            np.zeros(8), np.ones(8), 0,
+            np.zeros((1, 8)), np.ones((1, 8)), 1)
+    with pytest.raises(SystemExit, match="danger header has M=0"):
+        lcm.validate_safety_codebooks(
+            np.zeros(32), np.ones(32), 4,
+            np.zeros((0, 8)), np.zeros((0, 8)), 0)
+
+
+def test_safety_codebook_verifies_manifest_sha(tmp_path):
+    import lcm
+
+    pos, neg = _safety_halves(4, 8)
+    _write_safety_bin(tmp_path / "gvalue_codebook.bin", 4, 8, pos, neg)
+    tensors = {"gvalue_codebook": np.concatenate(
+        [pos.ravel(), neg.ravel()]).astype(np.float32)}
+    save_manifest(str(tmp_path), tensors,
+                  file_map={"gvalue_codebook": ("gvalue_codebook.bin",
+                                                HEADER_SIZE_V2)})
+    lcm.load_codebook_for_c(str(tmp_path), "gvalue_codebook.bin")
+
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    manifest["tensors"]["gvalue_codebook"]["sha256"] = "0" * 64
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="sha256 mismatch against manifest"):
+        lcm.load_codebook_for_c(str(tmp_path), "gvalue_codebook.bin")
+
+
+def test_stage1_save_gvalue_roundtrips_through_inference_loader(tmp_path):
+    """The legacy Stage-1 saver must write distinct anchors, not C_pos.copy()."""
+    import lcm
+    from train.checkpoint import _save_gvalue
+    from train.gvalue import GValueCodebook, make_global_value_vectors
+
+    d = 8
+    C_pos, C_neg = make_global_value_vectors(d)
+    gv = GValueCodebook(C_pos, C_neg)
+    path = tmp_path / "gvalue_codebook.bin"
+    digest = _save_gvalue(gv, str(path), d)
+
+    data, M, loaded_d, header = lcm.load_codebook_for_c(
+        str(tmp_path), "gvalue_codebook.bin", return_header=True)
+    assert (M, loaded_d) == (4, d)
+    assert data.size == 2 * M * d
+    assert header["sha256"] == digest.hex()
+    pos = data[:M * d].reshape(M, d)
+    neg = data[M * d:].reshape(M, d)
+    assert not np.array_equal(pos, neg), "legacy saver still writes C_neg=C_pos"
+    lcm.validate_safety_codebooks(pos, neg, M, pos, neg + 1.0, M)

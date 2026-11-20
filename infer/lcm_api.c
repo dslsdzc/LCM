@@ -21,6 +21,7 @@ static int fill_memory(memory_t* mem, int d,
                        const float* contrast_C, int contrast_M,
                        int n_lattices) {
     if (!mem || d <= 0) return -1;
+    if (n_lattices <= 0 || n_lattices > LCM_MAX_LATTICES) return -1;
 
     memset(mem, 0, sizeof(memory_t));
     mem->n_lattices = n_lattices;
@@ -156,7 +157,7 @@ int lcm_infer_step(const float* z, int d,
                    const float* gv_neg,
                    int n_lattices,
                    float* z_out) {
-    if (!z || !z_out || d <= 0) return -1;
+    if (!z || !z_out || d <= 0 || d != LCM_D) return -1;
     (void)gv_pos; (void)gv_n; (void)gv_neg;
 
     /* Build memory */
@@ -207,7 +208,7 @@ int lcm_infer_step_v2(const float* z, int d,
                       const float* ln_scale,
                       const float* ln_bias,
                       float* z_out) {
-    if (!z || !z_out || d <= 0) return -1;
+    if (!z || !z_out || d <= 0 || d != LCM_D) return -1;
     if (!soft_mask || !alpha || !ln_scale || !ln_bias) return -1;
     if (n_lattices <= 0 || n_lattices > LCM_MAX_LATTICES) return -1;
     if (n_alpha < n_lattices) return -1;
@@ -329,7 +330,7 @@ int lcm_infer_loop(const float* z, int d,
                    int n_lattices,
                    float conv_tol, float entropy_thresh, int max_steps,
                    float* z_out) {
-    if (!z || !z_out || d <= 0) return -1;
+    if (!z || !z_out || d <= 0 || d != LCM_D) return -1;
 
     /* Build memory */
     memory_t mem;
@@ -361,7 +362,9 @@ int lcm_infer_loop(const float* z, int d,
     danger_lattice_t dl;
     memset(&dl, 0, sizeof(dl));
     if (danger_t && danger_n && danger_m > 0) {
+        if (danger_m > LCM_MAX_M) return -1;
         danger_init(&dl, danger_t, danger_n, danger_m, d);
+        if (!danger_verify(&dl)) return -1;
     }
 
     /* Build inference state */
@@ -459,6 +462,7 @@ int lcm_infer_loop_v3_flat(
     const float* contrast_value_a, const float* contrast_value_b,
     const float* gv_pos, int gv_n, const float* gv_neg,
     const float* danger_t, const float* danger_n, int danger_M,
+    const char* gv_sha256, const char* danger_sha256,
     int max_steps, float conv_tol, float entropy_thresh,
     float safety_margin, float alpha_val, const char* trace_path,
     void (*alert_cb)(const alert_t*),
@@ -553,6 +557,10 @@ int lcm_infer_loop_v3_flat(
         memcpy(pos_pad, gv_pos, sizeof(pos_pad));
         memcpy(neg_pad, gv_neg, sizeof(neg_pad));
         gvalue_init(&gv_local, pos_pad, neg_pad, d);
+        /* The init hash is over the raw payload; compare it with the digest
+         * the exporter saved, then verify the cached anchors are intact. */
+        if (!gvalue_verify(&gv_local)
+            || !gvalue_verify_digest(&gv_local, gv_sha256)) return -1;
         gvp = &gv_local;
     }
 
@@ -560,8 +568,10 @@ int lcm_infer_loop_v3_flat(
     memset(&dl_local, 0, sizeof(dl_local));
     const danger_lattice_t* dlp = NULL;
     if (danger_M > 0) {
-        if (!danger_t || !danger_n) return -1;
+        if (!danger_t || !danger_n || danger_M > LCM_MAX_M) return -1;
         danger_init(&dl_local, danger_t, danger_n, danger_M, d);
+        if (!danger_verify(&dl_local)
+            || !danger_verify_digest(&dl_local, danger_sha256)) return -1;
         dlp = &dl_local;
     }
 

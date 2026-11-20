@@ -72,9 +72,10 @@ class LCMConfig:
     n_value_pairs: int = 4      # Four laws → 4 pos + 4 neg
     M_danger: int = 256         # Danger codebook size
     safety_margin_relative: float = 0.5
-    # R17: aligned with infer/lcm.h LCM_CONSISTENCY_THRESHOLD=0.7. The C
-    # value_consistency is mapped to [0,1], so 0.7 means cosine >= 0.4.
-    consistency_threshold: float = 0.7
+    # R17: aligned with infer/lcm.h LCM_CONSISTENCY_THRESHOLD=0.4. The C
+    # value_consistency is clip(cosine, 0, 1); 0.4 is the operating point that
+    # the old affine 0.7 mapped to (0.5*(cos+1)=0.7 ⇒ cos=0.4).
+    consistency_threshold: float = 0.4
 
     # Routing
     tau_route: float = 0.5      # Gumbel-Softmax temperature

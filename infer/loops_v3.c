@@ -125,6 +125,13 @@ static op_node_t* dag_push(dag_t* dag, op_type_t op, int lattice_id,
     return n;
 }
 
+/* Trigger distances are a per-lattice *screening* metric, not the retrieval
+ * domain itself: HRQ/contrast actually compare in the Poincaré ball, while
+ * the dynamic threshold here uses the Euclidean minimum (or the manifold's
+ * R6-domain distance) so every lattice has one comparable scalar. Thresholds
+ * are per-lattice (trigger_theta/mean_recent_d_min), so cross-lattice
+ * distances are never compared directly; the executed op re-runs retrieval
+ * in its own domain. See docs/c.md §4.4. */
 int build_dag_v3(const float* z, lcm_memory_v3* mem, dag_t* dag) {
     if (!z || !mem || !dag) return -1;
     if (mem->D != LCM_D || mem->n_lattices <= 0
@@ -434,14 +441,18 @@ int lcm_fuse_canonical(const float* outputs, int n_lattices, int d,
 }
 
 /* ─── Value consistency (R13) ─────────────────────────────────────────────── *
- * value_consistency = cosine(Σ_j tanh(v_j)·c_j, z_next), where j ranges over
- * the active lattices' selected rows. The selected row is the nearest row of
- * the lattice's primary codebook to z_cur. If no value vector is supplied, or
- * the accumulated direction is zero, consistency is defined as 1.0 (no
- * evidence of deception) so uncalibrated checkpoints do not block inference.
+ * value_consistency = clip(cosine(Σ_j tanh(v_j)·c_j, z_next), 0, 1), where
+ * c_j is the *selected codebook row* of each active lattice (the row nearest
+ * to z_cur that produced the value scalar), not the fused lattice output.
+ * Using the output made the metric a self-comparison of z_next with itself;
+ * the selected row is the memory entry the value scalar actually annotates.
+ * If no value vector is supplied, or the accumulated direction is zero,
+ * consistency is defined as 1.0 (no evidence of deception) so uncalibrated
+ * checkpoints do not block inference.
  */
-static int v3_nearest_value(const float* z, const float* cb, int M,
-                            const float* value, float* out_v) {
+static int v3_nearest_value_row(const float* z, const float* cb, int M,
+                                const float* value, const float** out_row,
+                                float* out_v) {
     if (!cb || !value || M <= 0) return 0;
     int best = 0;
     float best_d2 = INFINITY;
@@ -449,6 +460,7 @@ static int v3_nearest_value(const float* z, const float* cb, int M,
         float d2 = v3_d2(z, cb + (size_t)j * LCM_D);
         if (d2 < best_d2) { best_d2 = d2; best = j; }
     }
+    if (out_row) *out_row = cb + (size_t)best * LCM_D;
     *out_v = value[best];
     return 1;
 }
@@ -458,22 +470,27 @@ static float v3_value_consistency_impl(const lcm_memory_v3* mem,
                                         const int* active,
                                         const float* z_cur,
                                         const float* z_next) {
+    (void)outputs;  /* kept for ABI parity; the metric uses selected rows */
     vec_t acc;
     memset(acc, 0, sizeof(acc));
     int used = 0;
 
     for (int li = 0; li < mem->n_lattices; li++) {
         if (!active || !active[li]) continue;
-        float v;
+        vec_t lr_row;
+        const float* row = NULL;
+        float v = 0.0f;
         int ok = 0;
         switch (li) {
         case LATTICE_HRQ:
-            ok = v3_nearest_value(z_cur, mem->hrq.C_top, mem->hrq.M_top,
-                                  mem->hrq.value_top, &v);
+            ok = v3_nearest_value_row(
+                z_cur, mem->hrq.C_top, mem->hrq.M_top,
+                mem->hrq.value_top, &row, &v);
             break;
         case LATTICE_SPARSE:
-            ok = v3_nearest_value(z_cur, mem->sparse.C, mem->sparse.M,
-                                  mem->sparse.value, &v);
+            ok = v3_nearest_value_row(
+                z_cur, mem->sparse.C, mem->sparse.M,
+                mem->sparse.value, &row, &v);
             break;
         case LATTICE_LOWRANK: {
             /* Layer-0 codebook rows are U_0 @ V[:, :r_0]^T. */
@@ -481,42 +498,57 @@ static float v3_value_consistency_impl(const lcm_memory_v3* mem,
             int rank = lm->ranks[0];
             int best = 0;
             float best_d2 = INFINITY;
-            for (int row = 0; row < lm->M_lr; row++) {
-                const float* u = lm->U + (size_t)row * (size_t)lm->r_max;
+            for (int r = 0; r < lm->M_lr; r++) {
+                const float* u = lm->U + (size_t)r * (size_t)lm->r_max;
                 float d2 = 0.0f;
                 for (int j = 0; j < LCM_D; j++) {
                     const float* vv = lm->V
                         + (size_t)j * (size_t)lm->r_max;
-                    float acc = 0.0f;
-                    for (int k = 0; k < rank; k++) acc += u[k] * vv[k];
-                    float t = z_cur[j] - acc;
+                    float a = 0.0f;
+                    for (int k = 0; k < rank; k++) a += u[k] * vv[k];
+                    float t = z_cur[j] - a;
                     d2 += t * t;
                 }
-                if (d2 < best_d2) { best_d2 = d2; best = row; }
+                if (d2 < best_d2) { best_d2 = d2; best = r; }
             }
-            ok = lm->value != NULL && lm->M_lr > 0;
-            v = ok ? lm->value[best] : 0.0f;
+            if (lm->value != NULL && lm->M_lr > 0) {
+                for (int j = 0; j < LCM_D; j++) {
+                    const float* u = lm->U
+                        + (size_t)best * (size_t)lm->r_max;
+                    const float* vv = lm->V
+                        + (size_t)j * (size_t)lm->r_max;
+                    float a = 0.0f;
+                    for (int k = 0; k < rank; k++) a += u[k] * vv[k];
+                    lr_row[j] = a;
+                }
+                row = lr_row;
+                v = lm->value[best];
+                ok = 1;
+            }
             break;
         }
         case LATTICE_MANIFOLD:
-            ok = v3_nearest_value(z_cur, mem->manifold.C, mem->manifold.M,
-                                  mem->manifold.value, &v);
+            ok = v3_nearest_value_row(
+                z_cur, mem->manifold.C, mem->manifold.M,
+                mem->manifold.value, &row, &v);
             break;
         case LATTICE_BINDING:
-            ok = v3_nearest_value(z_cur, mem->binding.val_cb, mem->binding.M,
-                                  mem->binding.value_val, &v);
+            ok = v3_nearest_value_row(
+                z_cur, mem->binding.val_cb, mem->binding.M,
+                mem->binding.value_val, &row, &v);
             break;
         case LATTICE_CONTRAST:
-            ok = v3_nearest_value(z_cur, mem->contrast.C_a, mem->contrast.M,
-                                  mem->contrast.value_a, &v);
+            ok = v3_nearest_value_row(
+                z_cur, mem->contrast.C_a, mem->contrast.M,
+                mem->contrast.value_a, &row, &v);
             break;
         default:
             ok = 0;
             break;
         }
-        if (!ok) continue;
+        if (!ok || row == NULL) continue;
         float g = tanhf(v);
-        for (int j = 0; j < LCM_D; j++) acc[j] += g * outputs[li][j];
+        for (int j = 0; j < LCM_D; j++) acc[j] += g * row[j];
         used = 1;
     }
 
@@ -530,10 +562,10 @@ static float v3_value_consistency_impl(const lcm_memory_v3* mem,
     if (n_acc <= 1e-16f || n_next <= 1e-16f) return 1.0f;
     float c = dot / (sqrtf(n_acc) * sqrtf(n_next));
     if (c > 1.0f) c = 1.0f;
-    if (c < -1.0f) c = -1.0f;
-    /* R17: the threshold is on [0,1], so map the cosine from [-1,1].
-     * A cosine of 0 (uncorrelated) becomes 0.5; 0.7 requires cosine >= 0.4. */
-    return 0.5f * (c + 1.0f);
+    if (c < 0.0f) c = 0.0f;
+    /* d.md §4.2: clip(cos, 0, 1). Threshold recalibrated from the old
+     * affine-equivalent 0.7 to 0.4 so a normal positive cosine can pass. */
+    return c;
 }
 
 float lcm_value_consistency_v3(const lcm_memory_v3* mem,

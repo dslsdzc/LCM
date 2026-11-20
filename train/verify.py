@@ -60,7 +60,7 @@ from z3 import *
 
 MAX_RETRIEVALS       = 128
 MAX_STEPS            = 32
-CONSISTENCY_THRESHOLD = RealVal("0.7")
+CONSISTENCY_THRESHOLD = RealVal("0.4")
 SAFETY_THRESHOLD     = RealVal("0.05")
 DEFAULT_MARGIN       = RealVal("0.5")
 N_VALUE_PAIRS        = 4
@@ -137,7 +137,7 @@ def implies(a: BoolRef, b: BoolRef) -> BoolRef:
 #
 #   Early-return priority (first match wins):
 #     1. retrieval_count > MAX_RETRIEVALS → THREAT_RESOURCE_ABUSE, score=1.0
-#     2. value_consistency < 0.3         → THREAT_DECEPTION, score=2.0-val
+#     2. value_consistency < 0.4         → THREAT_DECEPTION, score=2.0-val
 #     3. relative_gap > SAFETY_THRESHOLD → THREAT_PATTERN_MATCH, score=relative_gap
 #     4. otherwise                       → THREAT_NONE,          score=relative_gap
 #
@@ -429,7 +429,7 @@ def verify_detect_any_conflict() -> None:
     lemma("P10c", implies(And(Not(db), Not(gs)), source == CONFLICT_GVALUE),
           "¬danger_block ∧ ¬gvalue_safe ⇒ source = CONFLICT_GVALUE")
     lemma("P10d", implies(And(Not(db), gs, c3), source == CONFLICT_CONSISTENCY),
-          "¬danger_block ∧ gvalue_safe ∧ consistency<0.7 ⇒ CONFLICT_CONSISTENCY")
+          "¬danger_block ∧ gvalue_safe ∧ consistency<0.4 ⇒ CONFLICT_CONSISTENCY")
 
     # ── No conflict when all clear ───────────────────────────────────────
     lemma("P10e", implies(And(Not(db), gs, Not(c3)), Not(conflict)),
@@ -527,14 +527,14 @@ def verify_composition() -> None:
           implies(rc > MAX_RETRIEVALS, And(block_ra, threat_ra == THREAT_RESOURCE_ABUSE))),
           "THREAT_RESOURCE_ABUSE detected by danger_assess when retrieval_count > 12")
 
-    # Deception → danger_assess triggers at value_consistency < 0.3
+    # Deception → danger_assess triggers at value_consistency < 0.4
     vc_dec = Real("vc_dec")
     pre_dec = vc_dec >= 0
     block_dec, threat_dec, _ = model_danger_assess(0, 0, vc_dec, RealVal("0.0"))
     lemma("P13b",
           implies(And(pre_dec, vc_dec < CONSISTENCY_THRESHOLD),
                   And(block_dec, threat_dec == THREAT_DECEPTION)),
-          "THREAT_DECEPTION detected by danger_assess when consistency < 0.3")
+          "THREAT_DECEPTION detected by danger_assess when consistency < 0.4")
 
     # Pattern match → danger_assess triggers at relative_gap > 0.05
     ds_pm = Real("relative_gap_pm")

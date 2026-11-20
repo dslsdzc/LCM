@@ -157,6 +157,10 @@ def ema_update_self(C, state, z, idx, gamma, step=None):
     ``idx`` is not recomputed here: it is the row the forward actually selected
     (including row 0 when the core is the nearest prototype). If row 0 is
     selected, its vector and EMA statistics are left untouched.
+
+    R14 deferred: this write is **not** gated by ``SelfActivationState`` yet.
+    The state machine is a tested library, not a production interlock on the
+    EMA path; the C identity core is likewise not mprotect'd.
     """
     M = C.shape[0]
     idx = jnp.asarray(idx, dtype=jnp.int32)

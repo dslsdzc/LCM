@@ -3,6 +3,98 @@ from train.hyp import to_poincare, poincare_similarity, poincare_distance
 from train.gvalue import make_global_value_vectors, GValueCodebook
 
 
+def test_poincare_similarity_finite_at_degenerate_norms():
+    """z = 0, ‖z‖ = 1 and ‖z‖ = 2 must not produce inf/NaN.
+
+    The denominator ``(1-‖u‖²)(1-‖v‖²)`` is 0 at the boundary and negative
+    outside the ball; the max-clamp keeps the similarity finite (the value can
+    be huge, which is correct for the near-boundary limit).
+    """
+    for scale in (0.0, 1.0, 2.0):
+        z = jnp.zeros((1, 256)).at[0, 0].set(scale)
+        anchor = jnp.zeros((1, 256)).at[0, 0].set(0.5)
+        sim = poincare_similarity(z, anchor)
+        assert bool(jnp.all(jnp.isfinite(sim))), f"scale={scale}: {sim}"
+        dist = poincare_distance(z, anchor)
+        assert bool(jnp.all(jnp.isfinite(dist))), f"scale={scale}: {dist}"
+
+
+def test_r18_hrq_top_uses_log_map_domain_for_large_z():
+    """A fused z with ‖z‖ > 1 must be compared in the log_map domain.
+
+    The quantised top row is in ``log_map(c_top)`` space. Leaving the
+    continuous side as raw z would make the same loss depend on ‖z‖² instead
+    of the quantisation error.
+    """
+    from train.losses import hrq_vq_loss
+    from train.hyp import log_map, safe_unit
+
+    d = 2
+    z = jnp.array([[3.0, 0.0]])          # ‖z‖ = 3, outside the ball
+    quant = jnp.array([[0.5, 0.0]])      # already log_map(c_top)-space
+    params = {'top': {'A': jnp.zeros((1, d)), 'W': jnp.eye(d)}, 'fine': []}
+    cfg = type('C', (), {'beta_vq': 0.25})()
+    aux = {'cont': [z], 'quant': [quant]}
+    codebook, commitment = hrq_vq_loss(params, z, aux, cfg)
+
+    expected_r = log_map(safe_unit(z))
+    expected_cb = 0.25 * jnp.mean((expected_r - quant) ** 2)
+    expected_cm = expected_cb
+    assert jnp.allclose(codebook[0], expected_cb, atol=1e-6)
+    assert jnp.allclose(commitment[0], expected_cm, atol=1e-6)
+    # The old raw-z form would be 0.25 * mean(([3,0]-[.5,0])²) = 1.5625.
+    assert not jnp.allclose(commitment[0], 1.5625, atol=1e-3)
+
+
+def test_r18_manifold_commitment_uses_log_map_domain_for_large_z():
+    """The manifold commitment side is log_map(safe_unit(z)), not raw z."""
+    from train.losses import cognitive_vq_losses
+    from train.hyp import exp_map, log_map, safe_unit
+
+    d = 2
+    z = jnp.array([[3.0, 0.0]])          # ‖z‖ = 3
+    one = jnp.zeros((1, d))
+    ident = jnp.eye(d)
+    M = 1
+    params = {
+        'hrq': {'top': {'A': jnp.zeros((M, d)), 'W': ident}, 'fine': []},
+        'sparse': {'C': jnp.zeros((M, d))},
+        'lowrank': {'U': [jnp.zeros((M, 1))], 'A_V': jnp.zeros((d, 1)),
+                    'W_V': jnp.eye(1)},
+        'manifold': {'C': jnp.zeros((M, d))},
+        'binding': {
+            fam: [{'A': jnp.zeros((M, d)), 'W': ident}]
+            for fam in ('key_cb', 'val_cb', 'bind_cb')},
+        'contrast': {
+            fam: [{'A': jnp.zeros((M, d)), 'W': ident}]
+            for fam in ('C_a', 'C_b')},
+        'route': {'C_route': jnp.zeros((6, d))},
+    }
+    stats = {
+        'z_in': z,
+        'hrq_vq': {'cont': [z], 'quant': [jnp.zeros((1, d))]},
+        'sparse_idx': jnp.array([0]),
+        'lowrank_aux': {'residuals': [z], 'indices': [jnp.array([0])]},
+        'man_idx': jnp.array([0]),
+        'binding_residuals': {f: [z] for f in ('key', 'val', 'bind')},
+        'binding_indices': {f: [jnp.array([0])]
+                            for f in ('key', 'val', 'bind')},
+        'contrast_residuals': {'a': [z], 'b': [z]},
+        'contrast_indices': {'a': [jnp.array([0])],
+                             'b': [jnp.array([0])]},
+        'route_idx': jnp.array([0]),
+    }
+    cfg = type('C', (), {'beta_vq': 0.25, 'ranks': (1,)})()
+    _, parts = cognitive_vq_losses(params, stats, cfg)
+
+    z_tan = log_map(safe_unit(z))
+    C_man = log_map(exp_map(params['manifold']['C']))
+    expected = 0.25 * jnp.mean((z_tan - C_man[0]) ** 2)
+    assert jnp.allclose(parts['manifold_commitment'], expected, atol=1e-6)
+    # Raw z would be 0.25 * mean([9, 0]) = 2.25.
+    assert not jnp.allclose(parts['manifold_commitment'], 2.25, atol=1e-3)
+
+
 def _outside_ball_codebook(d=256, scale=4.0):
     """Anchors deliberately outside the Poincaré ball (norm = scale)."""
     C_pos = jnp.zeros((4, d))

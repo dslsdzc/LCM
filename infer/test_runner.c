@@ -53,6 +53,17 @@ static void test_gvalue_hash_covers_neg(void) {
     gvalue_init(&gv, &C_pos[0][0], &C_neg[0][0], LCM_D);
     CHECK(gvalue_verify(&gv), "gvalue_verify true on intact data");
 
+    /* The saved file digest is SHA-256(C_pos raw || C_neg raw). */
+    float raw[2 * LCM_N_VALUE_PAIRS * LCM_D];
+    char expected[65];
+    memcpy(raw, C_pos, sizeof(C_pos));
+    memcpy(raw + LCM_N_VALUE_PAIRS * LCM_D, C_neg, sizeof(C_neg));
+    lcm_sha256_hex(raw, sizeof(raw), expected);
+    CHECK(gvalue_verify_digest(&gv, expected),
+          "gvalue_verify_digest matches the exported payload digest");
+    CHECK(!gvalue_verify_digest(&gv, "0000000000000000000000000000000000000000000000000000000000000000"),
+          "gvalue_verify_digest rejects a wrong saved digest");
+
     /* gvalue_init deep-copies; tamper the copy inside gv, not the source */
     gv.C_neg[0][0] += 0.5f;
     CHECK(!gvalue_verify(&gv), "gvalue_verify false after C_neg tampering");
@@ -176,6 +187,16 @@ static void test_danger_neutral_no_block(void) {
     normals[1][1] = -0.4f;
     danger_init(&dl, &threats[0][0], &normals[0][0], 2, LCM_D);
     CHECK(danger_verify(&dl), "danger_verify true on intact data");
+
+    float raw_d[2 * 2 * LCM_D];
+    char expected_d[65];
+    memcpy(raw_d, threats, sizeof(threats));
+    memcpy(raw_d + 2 * LCM_D, normals, sizeof(normals));
+    lcm_sha256_hex(raw_d, sizeof(raw_d), expected_d);
+    CHECK(danger_verify_digest(&dl, expected_d),
+          "danger_verify_digest matches the exported payload digest");
+    CHECK(!danger_verify_digest(&dl, "0000000000000000000000000000000000000000000000000000000000000000"),
+          "danger_verify_digest rejects a wrong saved digest");
 
     /* z=0 is equidistant (after ball projection) from +v and -v anchors:
      * sim_threat == sim_normal ⇒ relative_gap = 0 ⇒ not blocked. */
@@ -2084,6 +2105,7 @@ static float t10_route_C7[LCM_MAX_LATTICES * LCM_D];
 static float t10_route_W7[LCM_D * LCM_MAX_LATTICES];
 static float t10_alpha7[LCM_MAX_LATTICES];
 static float t10_lr_value[T7_M];
+static float t10_hrq_value[T7_M];
 static int   t10_ranks128[128];
 static float t10_lr_U128[128 * T7_M * T7_R];
 static float t10_gv_pos[LCM_N_VALUE_PAIRS * LCM_D];
@@ -2120,6 +2142,7 @@ static void t10_prepare(void) {
     memset(t10_route_W7, 0, sizeof(t10_route_W7));
     memset(t10_alpha7, 0, sizeof(t10_alpha7));
     memset(t10_lr_value, 0, sizeof(t10_lr_value));
+    memset(t10_hrq_value, 0, sizeof(t10_hrq_value));
     memset(t10_ranks128, 0, sizeof(t10_ranks128));
     memset(t10_lr_U128, 0, sizeof(t10_lr_U128));
     for (int i = 0; i < 128; i++) t10_ranks128[i] = 2;
@@ -2411,14 +2434,17 @@ static void test_loop_v3_self_only(void) {
 
 static void test_value_consistency_nonzero(void) {
     t10_prepare();
-    t10_lr_value[0] = 0.5f;
-    t10_mem.lowrank.value = t10_lr_value;
+    t10_hrq_value[0] = 0.5f;
+    t10_mem.hrq.value_top = t10_hrq_value;
 
     vec_t outputs[LCM_MAX_LATTICES];
     memset(outputs, 0, sizeof(outputs));
-    outputs[LATTICE_LOWRANK][0] = 1.0f;
+    /* Deliberately point the fused output away from the selected row: the
+     * metric must use C_top[0] (the row the value scalar annotates), not the
+     * lattice output. If outputs[li] leaked back in, cos would be -0.6 → 0. */
+    outputs[LATTICE_HRQ][0] = -1.0f;
     int active[LCM_MAX_LATTICES] = {0};
-    active[LATTICE_LOWRANK] = 1;
+    active[LATTICE_HRQ] = 1;
 
     float z_cur[LCM_D] = {0};
     float z_next[LCM_D] = {0};
@@ -2428,16 +2454,42 @@ static void test_value_consistency_nonzero(void) {
 
     float vc = lcm_value_consistency_v3(&t10_mem, (const float*)outputs,
                                         active, z_cur, z_next);
-    CHECK(fabsf(vc - 0.8f) < 1e-5f,
-          "value consistency maps cosine 0.6 to [0,1] as 0.8 (R17)");
+    CHECK(fabsf(vc - 0.6f) < 1e-5f,
+          "value consistency uses the selected row + clip(cos,0,1)");
+    CHECK(vc > LCM_CONSISTENCY_THRESHOLD,
+          "a normal positive cosine clears the recalibrated threshold");
 
-    /* A cosine of -1 must map to 0, not stay negative. */
+    /* A cosine of -1 must clip to 0, not stay negative or affine-map to 0.5. */
     float z_neg[LCM_D] = {0};
     z_neg[0] = -1.0f;
     float vc_neg = lcm_value_consistency_v3(&t10_mem, (const float*)outputs,
                                             active, z_cur, z_neg);
     CHECK(fabsf(vc_neg - 0.0f) < 1e-5f,
-          "value consistency maps cosine -1 to 0.0");
+          "value consistency clips cosine -1 to 0.0");
+}
+
+static void test_loop_v3_positive_input_does_not_abort(void) {
+    /* Full loop: only HRQ active, its selected row is +e0 and its value is
+     * positive, so a normal input has value_consistency ≈ 1 and must return
+     * 0 rather than the consistency/deception abort. */
+    t10_prepare();
+    for (int i = 0; i < LCM_MAX_LATTICES; i++)
+        t10_mem.trigger_theta[i] = 0.0f;
+    t10_mem.trigger_theta[LATTICE_HRQ] = 1e6f;
+    t10_hrq_value[0] = 1.0f;
+    t10_mem.hrq.value_top = t10_hrq_value;
+
+    float z[LCM_D] = {0};
+    z[0] = 0.1f;
+    float z_out[LCM_D];
+    t10_reset_alerts();
+    int ret = lcm_infer_loop_v3(&t10_mem, NULL, NULL, z, z_out,
+                                2, 1e-3f, 0.5f, 0.5f, 0.0f, NULL,
+                                t10_alert_cb);
+    CHECK(ret == 0,
+          "positive/normal input passes the full v3 loop (no consistency abort)");
+    CHECK(t10_alert_count == 0,
+          "positive/normal input emits no FATAL alert");
 }
 
 static void test_retrieval_count_resource_abuse(void) {
@@ -2507,6 +2559,7 @@ static int t10_flat_call(int gv_n, const float* gv_pos, const float* gv_neg,
         NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
         gv_pos, gv_n, gv_neg,
         NULL, NULL, 0,
+        NULL, NULL,
         1, 1e-3f, 0.5f, 0.5f, 0.0f, NULL, NULL, z_out);
 }
 
@@ -2590,6 +2643,7 @@ int main(void) {
     test_loop_v3_graceful_and_hard();
     test_loop_v3_self_only();
     test_value_consistency_nonzero();
+    test_loop_v3_positive_input_does_not_abort();
     test_retrieval_count_resource_abuse();
     test_flat_gvalue_pair_count();
     test_fuse_only_zero_weight();
