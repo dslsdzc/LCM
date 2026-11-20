@@ -91,7 +91,7 @@ def test_train_py_ema_no_collapse():
                  'manifold': {'N': np.ones(M, dtype=np.float32),
                               'm': centers.copy()},
                  'binding': {}}
-    cfg = {'gamma_sparse': 0.99, 'gamma_man': 0.99, 'lambda_sparse': 1e-4}
+    cfg = {'gamma_sparse': 0.99, 'gamma_man': 0.99, 'lambda_shrink': 1e-4}
 
     def _min_code_dist(C):
         C = np.asarray(C)

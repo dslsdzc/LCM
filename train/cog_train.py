@@ -512,7 +512,7 @@ def _apply_ema_updates(ema, ema_state, stats, cfg, step):
     if 'sparse' in ema:
         C, state = ema_update_sparse(
             ema['sparse']['C'], ema_state['sparse'], stats['z_in'],
-            stats['sparse_idx'], cfg.gamma_sparse, cfg.lambda_sparse,
+            stats['sparse_idx'], cfg.gamma_sparse, cfg.lambda_shrink,
             step=step)
         new_ema['sparse'] = dict(ema['sparse'], C=C)
         new_state['sparse'] = state

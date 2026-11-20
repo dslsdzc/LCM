@@ -99,7 +99,8 @@ def main():
         print(f"cfg.alpha_val = {CFG.alpha_val}")
         print(f"cfg.beta_val  = {CFG.beta_val}")
         print(f"cfg.tau_val_signal = {CFG.tau_val_signal}")
-        print(f"cfg.lambda_sparse  = {CFG.lambda_sparse}")
+        print(f"cfg.lambda_shrink  = {CFG.lambda_shrink}")
+        print(f"cfg.lambda_lfq     = {CFG.lambda_lfq}")
         print(f"cfg.alpha_self     = {CFG.alpha_self}")
         print(f"\n{len(p)} parameter leaves the C side must be given:")
         for k in sorted(p):

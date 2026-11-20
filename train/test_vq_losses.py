@@ -89,7 +89,8 @@ def test_hrq_fine_pair_is_log_map_of_composed_state_not_tangent_residual():
 
     C_top_P = exp_map(C_top)
     c_top = C_top_P[int(top_idx[0])]
-    r0 = mobius_add(exp_map(z), -c_top)
+    # R6: HRQ's query domain is exp_map(safe_unit(z)).
+    r0 = mobius_add(exp_map(safe_unit(z)), -c_top)
     want = log_map(mobius_add(c_top, r0))       # composed-output space
     wrong = log_map(r0)                          # tangent residual
     assert jnp.allclose(pairs['cont'][1], want, atol=1e-5)

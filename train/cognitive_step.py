@@ -20,12 +20,11 @@ z, the self lattice, and the generation head remain in ``model.forward``;
 GValue is accepted through fusion but is None for now.
 """
 import jax
-import jax.numpy as jnp
 
 from train.fusion import fuse_lattices_with_aux
 from train.lattices import (
-    binding_forward, contrast_forward, hrq_forward, lowrank_forward,
-    manifold_forward, routing_gate, sparse_forward,
+    binding_forward, contrast_forward, hrq_forward, hrq_top_prototype,
+    lowrank_forward, manifold_forward, routing_gate, sparse_forward,
 )
 
 
@@ -85,15 +84,21 @@ def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
     # Return arities differ and are not uniform: lowrank_forward and
     # contrast_forward return a bare array by default and expose their per-layer
     # loss targets via return_aux=True; the other four return tuples.
+    #
+    # R1/R2 ordering: HRQ runs first because sparse's LFQ threshold is defined
+    # against HRQ's top-1 prototype (the C-5 dependency edge). ``hrq_top_sim``
+    # is already per-sample (B,).
     o_hrq, hrq_idx, hrq_top_sim, hrq_vq = hrq_forward(
         params['hrq'], z, cfg.tau_route_fallback,
-        value_scalars=vs.get('hrq'), alpha_val=alpha_val)
-    # LFQ dynamic threshold: Poincare dis-similarity to the nearest HRQ top
-    # prototype. Evaluation only.
-    d_top = None if training else (1.0 - jnp.mean(hrq_top_sim))
+        value_scalars=vs.get('hrq'), alpha_val=alpha_val,
+        value_topk=cfg.hrq_value_topk)
+    hrq_c_top = hrq_top_prototype(params['hrq'], hrq_idx)
+    # LFQ is disabled inside sparse_forward during training; d_top/c_top are
+    # still passed so the inference path and training path consume the same
+    # signature and the dependency is explicit.
     o_sparse, sparse_idx = sparse_forward(
         params['sparse'], z, training=training,
-        lambda_sparse=cfg.lambda_sparse, d_top=d_top,
+        lambda_lfq=cfg.lambda_lfq, d_top=hrq_top_sim, c_top=hrq_c_top,
         value_scalars=vs.get('sparse'), alpha_val=alpha_val)
     o_lowrank, lowrank_aux = lowrank_forward(
         params['lowrank'], z, cfg.ranks,

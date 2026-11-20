@@ -29,7 +29,7 @@ from train.lattices import (
     hrq_forward, init_simvq, init_binding_params,
     poincare_similarity, exp_map, log_map, mobius_add,
 )
-from train.hyp import log_map as hyp_log_map
+from train.hyp import log_map as hyp_log_map, safe_unit
 from train.qwen_lm import apply_rope, precompute_freqs
 from train.encoder import init_encoder_params, init_encoder_state, encoder_recurrent_step
 
@@ -76,7 +76,7 @@ def test_hrq_top_retrieval_picks_nearest():
 
     # z clearly nearest to prototype 0 → hard route, idx 0, top_sim = min sim
     z = jnp.array([[0.2, 0.0]])
-    z_P = exp_map(z)
+    z_P = exp_map(safe_unit(z))  # R6 query domain
     sims = poincare_similarity(z_P[:, None, :], C_P[None, :, :]).squeeze(-1)
     o, idx, top_sim, _ = hrq_forward(params, z, tau_fallback=0.1)
     assert int(idx[0]) == 0, f"expected nearest proto 0, got {int(idx[0])}"
@@ -95,7 +95,7 @@ def test_hrq_fallback_uses_closest_pair():
     C_P = exp_map(C_top)
 
     z = jnp.array([[0.2, 0.2]])  # equidistant from proto 0 and proto 1
-    z_P = exp_map(z)
+    z_P = exp_map(safe_unit(z))  # R6 query domain
     sims = poincare_similarity(z_P[:, None, :], C_P[None, :, :]).squeeze(-1)
     o, idx, _, _ = hrq_forward(params, z, tau_fallback=0.1)
     # argmin of (nearly) equal sims → one of the two close protos, never the far one

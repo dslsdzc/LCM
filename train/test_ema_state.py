@@ -383,7 +383,7 @@ def test_train_step_separates_ema_from_adamw_and_updates_ema():
         stats = aux['loop_stats']
         C_expected, state_expected = ema_update_sparse(
             C_before, ema_before['sparse'], stats['z_in'],
-            stats['sparse_idx'], cfg.gamma_sparse, cfg.lambda_sparse,
+            stats['sparse_idx'], cfg.gamma_sparse, cfg.lambda_shrink,
             step=step_i)
         # The EMA codebook must equal a pure EMA update of the pre-step C.
         # A large weight decay makes this sensitive: if the EMA codebook were

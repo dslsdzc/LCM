@@ -113,10 +113,11 @@ def test_lattice_output_matches_direct_call(built, name):
     vs, a = _vs(params, name), CFG.alpha_val
     if name == "hrq":
         want = hrq_forward(params['hrq'], z, CFG.tau_route_fallback,
-                           value_scalars=vs, alpha_val=a)[0]
+                           value_scalars=vs, alpha_val=a,
+                           value_topk=CFG.hrq_value_topk)[0]
     elif name == "sparse":
         want = sparse_forward(params['sparse'], z, training=True,
-                              lambda_sparse=CFG.lambda_sparse,
+                              lambda_lfq=CFG.lambda_lfq,
                               value_scalars=vs, alpha_val=a)[0]
     elif name == "lowrank":
         want = lowrank_forward(params['lowrank'], z, CFG.ranks,

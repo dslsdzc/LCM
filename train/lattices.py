@@ -10,7 +10,7 @@ from jax import lax
 import jax.nn as jnn
 
 from train.hyp import (
-    poincare_similarity, exp_map, log_map, mobius_add,
+    poincare_similarity, exp_map, log_map, mobius_add, safe_unit,
 )
 from train.config import LCMConfig
 
@@ -189,11 +189,56 @@ def init_hrq_params(rng, d, M_top, M_fine, n_layers):
     return params
 
 
-def hrq_forward(params, z, tau_fallback=0.1, value_scalars=None, alpha_val=0.0):
+def _hrq_sims(params, z):
+    """R6 domain for HRQ's top stage: ``z_P = exp_map(safe_unit(z))``.
+
+    Returns ``(z_P, C_top_P, sims)`` with ``sims`` of shape ``(B, M_top)``.
+    ``poincare_similarity`` is distance-monotone (larger = farther).
+    """
+    z_P = exp_map(safe_unit(z))
+    C_top_P = exp_map(params['top']['A'] @ params['top']['W'])
+    sims = poincare_similarity(
+        z_P[:, None, :], C_top_P[None, :, :]).squeeze(-1)
+    return z_P, C_top_P, sims
+
+
+def _topk_indices(params, z, k):
+    """Indices of the ``k`` nearest top-level prototypes, nearest first.
+
+    Test helper mirroring the first stage of ``hrq_forward`` (R1): geometric
+    top-k before any value rescoring.
+    """
+    _, _, sims = _hrq_sims(params, z)
+    k = min(int(k), int(sims.shape[-1]))
+    return jnp.argsort(sims, axis=-1)[:, :k]
+
+
+def hrq_top_prototype(params, idx):
+    """Ball prototype ``c_top*`` selected by ``hrq_forward``'s ``top_idx``.
+
+    Sparse's LFQ threshold needs ``c_top*`` as an input edge (design R2/C-5);
+    HRQ always runs first in ``six_lattice_step`` so the point is available.
+    """
+    C_top_P = exp_map(params['top']['A'] @ params['top']['W'])
+    return C_top_P[idx]
+
+
+def hrq_forward(params, z, tau_fallback=0.1, value_scalars=None, alpha_val=0.0,
+                value_topk=4, tau_proxy=1.0):
     """Hierarchical residual quantization on Poincaré ball.
 
-    1. Top-1 hard routing on top-level prototypes (fallback for uncertainty).
-    2. Möbius residual through fine layers.
+    Two-stage top routing (design R1):
+
+    1. Geometric top-k by ``poincare_similarity(z_P, C_top_P)``.
+    2. Inside the top-k only, ``score_j = sim_j - alpha_val·tanh(v_j)·scale``
+       with ``scale = sg[mean(sims)] + 1e-6``; ``argmin`` gives the final top-1.
+       A high value lowers the score and makes a prototype easier to select.
+
+    The hard forward value is the routed prototype's residual chain; the
+    backward pass goes through the top-k softmax mixture, so ``v_j`` and
+    ``C_top`` both receive gradient. Fallback is a *relative* gap
+    ``(sim_2 - sim_1) / (sim_1 + eps) < tau_fallback`` and blends the top-k with
+    ``softmax(-score)``.
 
     Returns:
         (o_hrq, top_idx, top_sim, vq_pairs). ``vq_pairs`` carries R18's
@@ -201,38 +246,52 @@ def hrq_forward(params, z, tau_fallback=0.1, value_scalars=None, alpha_val=0.0):
         with one ``(B, d)`` vector for the top layer followed by one per fine
         layer. ``cont`` is the pre-quantisation residual pointer after
         ``log_map``; ``quant`` is the selected prototype after ``log_map``.
-        The pair is materialised here so the loss never needs a second forward
-        pass.
+        ``top_sim`` is per-sample ``(B,)`` — it is Sparse's ``d_top``.
     """
-    d = z.shape[-1]
-    z_P = exp_map(z)
+    z_P, C_top_P, sims = _hrq_sims(params, z)
+    B, M_top = sims.shape
 
-    # Top-level: similarity routing
-    C_top = params['top']['A'] @ params['top']['W']
-    C_top_P = exp_map(C_top)
+    # ── Stage 1: geometric top-k (no value term) ───────────────────────────
+    k = min(int(value_topk), int(M_top))
+    topk_idx = jnp.argsort(sims, axis=-1)[:, :k]              # (B, k)
+    sims_topk = jnp.take_along_axis(sims, topk_idx, axis=-1)  # (B, k)
+    C_topk_P = C_top_P[topk_idx]                              # (B, k, d)
 
-    sims = poincare_similarity(z_P[:, None, :], C_top_P[None, :, :]).squeeze(-1)  # (B, M_top)
+    # ── Stage 2: value rescoring within the top-k ──────────────────────────
+    v = (jnp.zeros((M_top,), dtype=sims.dtype) if value_scalars is None
+         else jnp.asarray(value_scalars))
+    # Per-sample scale, detached: it only makes the value term dimensionless.
+    scale = lax.stop_gradient(jnp.mean(sims, axis=-1, keepdims=True)) + 1e-6
+    score_topk = sims_topk - alpha_val * jnp.tanh(v)[topk_idx] * scale
 
-    if value_scalars is not None and alpha_val > 0:
-        # Score in tangent space, retrieve the ball prototype.
-        c_top, top_idx, top_scores = value_biased_retrieve(
-            z, C_top, value_scalars, alpha_val, C_out=C_top_P)
+    best = jnp.argmin(score_topk, axis=-1)
+    top_idx = jnp.take_along_axis(topk_idx, best[:, None], axis=-1)[:, 0]
+    top_sim = jnp.take_along_axis(sims, top_idx[:, None], axis=-1)[:, 0]
+    c_top = C_top_P[top_idx]                                  # (B, d)
+
+    # ── STE: hard forward, top-k softmax backward (R1.3) ───────────────────
+    # The design's shorthand writes ``c_top + sg(o_soft - c_top)``, but that
+    # operand order blocks the soft path and leaves d output/d v ≡ 0. The STE
+    # that actually yields "hard value, soft gradient" is the reverse:
+    # forward = c_top (bit-for-bit up to one ulp), backward = o_soft.
+    w_proxy = jax.nn.softmax(-score_topk / tau_proxy, axis=-1)  # (B, k)
+    o_soft_topk = jnp.einsum('bk,bkd->bd', w_proxy, C_topk_P)   # (B, d)
+    c_top_route = o_soft_topk + lax.stop_gradient(c_top - o_soft_topk)
+
+    # ── Relative fallback criterion (R1.4) ────────────────────────────────
+    if M_top > 1:
+        sorted_sims = jnp.sort(sims, axis=-1)  # ascending
+        gap = ((sorted_sims[:, 1] - sorted_sims[:, 0])
+               / (sorted_sims[:, 0] + 1e-8))
     else:
-        # poincare_similarity is distance-monotone (larger = farther): nearest = argmin
-        top_idx = sims.argmin(axis=-1)
-        c_top = C_top_P[top_idx]  # (B, d)
-        top_scores = None
-
-    top_sim = jnp.take_along_axis(sims, top_idx[:, None], axis=-1).squeeze(-1)
-
-    # Check if we need fallback (top-1 / top-2 gap < threshold)
-    # Ascending: closest first; gap = second-closest minus closest
-    sorted_sims = jnp.sort(sims, axis=-1)  # ascending
-    gap = sorted_sims[:, 1] - sorted_sims[:, 0]
+        gap = jnp.zeros((B,), dtype=sims.dtype)
     use_fallback = gap < tau_fallback
 
-    # Möbius residual through the fine layers, shared by both routing branches
-    # (they were duplicated verbatim; a fix to one silently missed the other).
+    # Fallback blends only the top-k candidates, with the value-adjusted score.
+    w_fb = jax.nn.softmax(-score_topk, axis=-1)                # (B, k)
+    c_top_w = jnp.einsum('bk,bkd->bd', w_fb, C_topk_P)         # (B, d)
+
+    # ── Möbius residual through the fine layers (shared by both branches) ──
     # Also returns the per-layer output-space pairs R18 needs. The loss is in
     # the Euclidean space *after* log_map(c_top ⊕ ·), not the tangent residual:
     # the continuous pointer and the selected code both get c_top added before
@@ -248,27 +307,21 @@ def hrq_forward(params, z, tau_fallback=0.1, value_scalars=None, alpha_val=0.0):
             r = mobius_add(r, -c_fb)
         return r, cont, quant
 
-    # Hard branch: routed prototype, residual from z_P ⊖ c_top.
+    # Hard branch: routed prototype (with the soft backward proxy).
     r_hard, cont_hard, quant_hard = fine_residual(
-        mobius_add(z_P, -c_top), params['fine'], c_top)
-    # Fallback branch: softmax-weighted prototype blend.
-    weights = jax.nn.softmax(-sims, axis=-1)  # (B, M_top)
-    c_top_w = jnp.einsum('bm,md->bd', weights, C_top_P)  # weighted
+        mobius_add(z_P, -c_top_route), params['fine'], c_top_route)
+    # Fallback branch: top-k softmax-weighted prototype blend.
     r_soft, cont_soft, quant_soft = fine_residual(
         mobius_add(z_P, -c_top_w), params['fine'], c_top_w)
 
-    o_hard = log_map(mobius_add(c_top, r_hard))
+    o_hard = log_map(mobius_add(c_top_route, r_hard))
     o_soft = log_map(mobius_add(c_top_w, r_soft))
     o_hrq = jnp.where(use_fallback[:, None], o_soft, o_hard)
 
-    # Value-scalar gradient path (forward ≡ 0), added after all routing so it
-    # cannot be swallowed by an upstream stop_gradient.
-    if top_scores is not None:
-        o_hrq = o_hrq + ste_relax(top_scores, C_top_P)
-
     # Top term follows the branch that actually ran: the hard target is the
     # routed prototype, the fallback target is the softmax blend. Fine-layer
-    # pairs are selected elementwise the same way.
+    # pairs are selected elementwise the same way. Targets use the raw
+    # prototypes, not the STE copy (same forward value).
     def _pick(hard, soft):
         return jnp.where(use_fallback[:, None], soft, hard)
 
@@ -291,18 +344,51 @@ def init_sparse_params(rng, d, M_sparse):
     }
 
 
-def sparse_forward(params, z, training=True, lambda_sparse=1e-4, d_top=None,
-                   value_scalars=None, alpha_val=0.0):
-    """Sparse lattice with train/inference branching.
+def clamp_norm(C, max_norm):
+    """Scale rows with ``‖C_j‖ > max_norm`` down to ``max_norm``.
 
-    Training: searches without zero vector (pure VQ).
-    Inference: includes zero vector for LFQ binary decision.
+    R2 wraps every sparse prototype in ``exp_map`` before the hyperbolic
+    comparison; without the clamp a code far outside the ball would saturate
+    ``exp_map`` at the boundary and the similarity would blow up. Zero rows
+    (untouched EMA entries) are left exactly zero.
+    """
+    norm = jnp.linalg.norm(C, axis=-1, keepdims=True)
+    return C * jnp.minimum(1.0, max_norm / jnp.maximum(norm, 1e-12))
+
+
+def sparse_zero_similarity(z):
+    """R2: ``poincare_similarity(z_P, 0)`` in the unified R6 domain.
+
+    Equals ``2‖z_P‖²/(1-‖z_P‖²)``. It is a domain definition for the C side
+    (``zero_vec`` participates in inference retrieval); the LFQ decision itself
+    compares only the non-zero codebook, as b.md §4.2 specifies.
+    """
+    z_P = exp_map(safe_unit(z))
+    return poincare_similarity(z_P, jnp.zeros_like(z_P)).squeeze(-1)
+
+
+def sparse_forward(params, z, training=True, lambda_lfq=0.1, d_top=None,
+                   c_top=None, value_scalars=None, alpha_val=0.0):
+    """Sparse lattice with train/inference branching and LFQ.
+
+    Training: searches without the zero vector (pure VQ), no LFQ.
+    Inference: includes the zero vector in the nearest-neighbour competition and
+    may force it via LFQ.
+
+    ``d_top`` is HRQ's per-sample ``poincare_similarity(z_P, c_top*)`` of shape
+    ``(B,)``; ``c_top`` is the matching prototype. Both are required for LFQ:
+    ``c_top=None`` means HRQ did not activate, so the threshold has no defined
+    reference and must not be evaluated (design R2, C-5 dependency edge).
+    ``d_min`` is measured in the same similarity domain
+    (``exp_map(clamp_norm(C, 0.99))``), while retrieval keeps b.md §4.2's
+    Euclidean ``argmin`` (value-biased when ``alpha_val > 0``, R22).
     """
     if training:
         C_search = params['C']  # (M_sparse, d) no zero
     else:
         C_search = jnp.concatenate([params['zero_vec'], params['C']], axis=0)
 
+    scores = None
     if value_scalars is not None and alpha_val > 0:
         # Value-biased retrieval. Pad value_scalars for zero_vec in non-training
         # mode. The selection is straight-through w.r.t. value_scalars, so the
@@ -313,18 +399,19 @@ def sparse_forward(params, z, training=True, lambda_sparse=1e-4, d_top=None,
             vs = value_scalars
         scores = value_biased_scores(z, C_search, vs, alpha_val)
         idx = scores.argmax(axis=-1)
-        dist = -scores  # convert to distance-like for LFQ
     else:
-        scores = None
         dist = jnp.linalg.norm(z[:, None, :] - C_search[None, :, :], axis=-1)
         idx = dist.argmin(axis=-1)
 
-    # LFQ binary decision (inference only)
-    if not training and d_top is not None:
-        d_min = dist.min(axis=-1)
-        threshold = lambda_sparse * d_top
+    # LFQ binary decision (inference only, R2). d_min is the hyperbolic
+    # similarity to the nearest *non-zero* code, so it shares d_top's domain.
+    if (not training) and d_top is not None and c_top is not None:
+        z_P = exp_map(safe_unit(z))
+        C_P = exp_map(clamp_norm(params['C'], 0.99))
+        d_min = poincare_similarity(
+            z_P[:, None, :], C_P[None, :, :]).squeeze(-1).min(axis=-1)
         zero_idx = jnp.zeros_like(idx)  # index of zero_vec (0 in C_search)
-        idx = jnp.where(d_min > threshold, zero_idx, idx)
+        idx = jnp.where(d_min > lambda_lfq * d_top, zero_idx, idx)
 
     o_sparse = z + lax.stop_gradient(C_search[idx] - z)  # STE
     if scores is not None:

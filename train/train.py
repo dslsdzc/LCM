@@ -154,7 +154,7 @@ def _jitted_ema(params, ema_state, z, aux, cfg):
     N_s, m_s = ema_state['sparse']['N'], ema_state['sparse']['m']
     N_s_new, m_s_new, C_s_new = _per_code_ema(
         params['sparse']['C'], N_s, m_s, g_s, z)
-    lam = cfg.get('lambda_sparse', 1e-4)
+    lam = cfg.get('lambda_shrink', 1e-4)
     params['sparse']['C'] = jnp.sign(C_s_new) * jnp.clip(jnp.abs(C_s_new) - lam, 0)
 
     # Manifold — params['manifold']['C'] is TANGENT-space coordinates (the
