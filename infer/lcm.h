@@ -54,6 +54,19 @@ extern "C" {
 #define LCM_MAX_BIND_LAYERS 8    /* Stack cap for binding's per-layer HRR rows
                                   * (the spec's RVQ_3layer needs 3) */
 #endif
+/* Stack-safety caps for descriptor-sized scratch arrays. Defaults are 8× the
+ * config defaults (M=512, r_max=8, t_dim=4) and are enforced by
+ * lcm_bind_memory_v3, so a corrupt checkpoint is rejected instead of sizing
+ * unbounded stack scratch. Raise them at compile time for larger models. */
+#ifndef LCM_MAX_M
+#define LCM_MAX_M          4096  /* Max rows in any VQ codebook */
+#endif
+#ifndef LCM_MAX_RANK
+#define LCM_MAX_RANK       256   /* Max low-rank basis rank (r_max) */
+#endif
+#ifndef LCM_MAX_T_DIM
+#define LCM_MAX_T_DIM      64    /* Max manifold tangent-space dimension */
+#endif
 
 /* Derived constants */
 #define LCM_CONSISTENCY_THRESHOLD 0.3f
@@ -401,6 +414,9 @@ int  lcm_dim(void);
  *   - D must equal LCM_D (a .so built for another dimension is rejected),
  *   - 1 ≤ n_lattices ≤ LCM_MAX_LATTICES and fusion.n_lattices must match,
  *   - every required pointer is non-NULL and every layer count/rank is valid,
+ *   - lowrank ranks are strictly increasing (b.md §4.3),
+ *   - every codebook M ≤ LCM_MAX_M, r_max ≤ LCM_MAX_RANK and
+ *     t_dim ≤ LCM_MAX_T_DIM (stack-safety caps),
  *   - binding.n_layers ≤ LCM_MAX_BIND_LAYERS and binding.r_max equals
  *     lowrank.r_max (V is the shared low-rank basis).
  * Optional pointers (value scalars, EMA state) may be NULL.
@@ -505,6 +521,8 @@ void routing_gate_c(const float* z, const float* C_route, const float* W_route,
  *   C_k = U_k @ V[:, :ranks[k]]^T. Residual chain:
  *   r = z; c_k = C_k[argmin ||r - C_k||²]; out += c_k; r -= c_k.
  *   idx[k] receives layer k's selected row (caller array of n_layers ints).
+ *   b.md §4.3's rank sequence is strictly increasing; lcm_bind_memory_v3
+ *   rejects a descriptor whose ranks are not increasing.
  *
  * When alpha_val > 0 and m->value is present the selection is JAX's R22
  * value-biased score over the same residual input:
@@ -525,7 +543,9 @@ void lowrank_forward_c(const float* z, const lowrank_mem_t* m, float alpha_val,
  * idx is optional (one int). With alpha_val > 0 and m->value present the
  * retrieval follows JAX's value_biased_retrieve(z, C, ..., C_out=C_P): the
  * score is the tangent-space Euclidean one, then the selected row is pushed
- * through exp_map before the projection. No allocation.
+ * through exp_map before the projection. Task 11 alignment note: current JAX
+ * manifold_forward uses raw exp_map(z) in the default path (not R6's
+ * safe_unit); C follows R6 here. No allocation.
  */
 void manifold_forward_c(const float* z, const manifold_mem_t* m,
                         float alpha_val, float* out, int* idx);
@@ -542,7 +562,8 @@ void contrast_forward_c(const float* z, const contrast_mem_t* m,
 
 /* Binding v3 — R20 conformant forward (b.md §4.5, JAX binding_forward).
  *
- *   t = V^T z; z_k = A_k^T t; z_v = A_v^T t      (W_k=V@A_k, z_k=z@W_k^T)
+ *   u_k = A_k z; z_k = V u_k               (W_k=V@A_k, z_k=W_k z)
+ *   u_v = A_v z; z_v = V u_v               (W_v=V@A_v, z_v=W_v z)
  *   three-layer residual VQ over key_cb / val_cb  → k_q, v_q
  *   b_raw = Σ_{i,j} IFFT(norm_fft(k^(i)) ⊙ norm_fft(v^(j)))  (9 pairs)
  *   b_q   = three-layer residual VQ over bind_cb applied to b_raw

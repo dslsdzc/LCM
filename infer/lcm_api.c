@@ -50,17 +50,22 @@ static int fill_memory(memory_t* mem, int d,
 /* ─── v3 full-parameter memory binding (R10, task 7) ───────────────────── */
 
 static int v3_hrq_valid(const hrq_mem_t* m) {
-    if (!m || m->M_top <= 0 || !m->C_top) return 0;
+    if (!m || m->M_top <= 0 || m->M_top > LCM_MAX_M || !m->C_top) return 0;
     if (m->n_fine < 0 || m->M_fine < 0) return 0;
-    if (m->n_fine > 0 && (m->M_fine <= 0 || !m->C_fine)) return 0;
+    if (m->n_fine > 0 && (m->M_fine <= 0 || m->M_fine > LCM_MAX_M
+                          || !m->C_fine)) return 0;
     return 1;
 }
 
 static int v3_lowrank_valid(const lowrank_mem_t* m) {
-    if (!m || m->n_layers <= 0 || m->M_lr <= 0 || m->r_max <= 0) return 0;
+    if (!m || m->n_layers <= 0 || m->M_lr <= 0 || m->M_lr > LCM_MAX_M) return 0;
+    if (m->r_max <= 0 || m->r_max > LCM_MAX_RANK) return 0;
     if (!m->U || !m->V || !m->ranks) return 0;
-    for (int i = 0; i < m->n_layers; i++)
+    for (int i = 0; i < m->n_layers; i++) {
         if (m->ranks[i] <= 0 || m->ranks[i] > m->r_max) return 0;
+        /* b.md §4.3: the rank sequence increases to r_max. */
+        if (i > 0 && m->ranks[i] <= m->ranks[i - 1]) return 0;
+    }
     return 1;
 }
 
@@ -85,20 +90,25 @@ int lcm_bind_memory_v3(lcm_memory_v3* mem, int D, int n_lattices,
 
     if (!v3_hrq_valid(hrq)) return -1;
 
-    if (sparse->M <= 0 || !sparse->C || !sparse->zero_vec) return -1;
+    if (sparse->M <= 0 || sparse->M > LCM_MAX_M
+        || !sparse->C || !sparse->zero_vec) return -1;
 
     if (!v3_lowrank_valid(lowrank)) return -1;
 
-    if (manifold->M <= 0 || manifold->t_dim <= 0 ||
+    if (manifold->M <= 0 || manifold->M > LCM_MAX_M ||
+        manifold->t_dim <= 0 || manifold->t_dim > LCM_MAX_T_DIM ||
         !manifold->C || !manifold->T) return -1;
 
-    if (binding->M <= 0 || binding->n_layers <= 0) return -1;
+    if (binding->M <= 0 || binding->M > LCM_MAX_M
+        || binding->n_layers <= 0) return -1;
     if (binding->n_layers > LCM_MAX_BIND_LAYERS) return -1;
-    if (binding->r_max <= 0 || binding->r_max != lowrank->r_max) return -1;
+    if (binding->r_max <= 0 || binding->r_max > LCM_MAX_RANK
+        || binding->r_max != lowrank->r_max) return -1;
     if (!binding->key_cb || !binding->val_cb || !binding->bind_cb
         || !binding->A_k || !binding->A_v) return -1;
 
-    if (contrast->M <= 0 || contrast->n_layers <= 0) return -1;
+    if (contrast->M <= 0 || contrast->M > LCM_MAX_M
+        || contrast->n_layers <= 0) return -1;
     if (!contrast->C_a || !contrast->C_b) return -1;
 
     if (!fusion->route_C || !fusion->route_W || !fusion->alpha

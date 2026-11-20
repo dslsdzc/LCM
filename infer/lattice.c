@@ -9,6 +9,7 @@
  *   - indices are optional (pass NULL if not needed)
  */
 #include "lcm.h"
+#include "lattice_internal.h"
 #include <math.h>
 #include <string.h>
 #include <assert.h>
@@ -406,10 +407,11 @@ void retrieve_single(const float* z, const lattice_memory_t* mem,
   requires \valid(out + (0 .. LCM_D-1));
   requires \separated(out, z) && \separated(out, z_P) && \separated(out, T_space);
   requires M > 0 && t_dim > 0;
+  requires M <= LCM_MAX_M && t_dim <= LCM_MAX_T_DIM;
   requires value == \null || \valid_read(value + (0 .. M-1));
   requires idx_out == \null || \valid(idx_out);
   ensures  \valid(out + (0 .. LCM_D-1));
-  assigns  out[0 .. LCM_D-1], *idx_out;
+  assigns  out[0 .. LCM_D-1], idx_out == \null ? \nothing : *idx_out;
  */
 static void manifold_slide_core(const float* z, const float* z_P,
                                 const float* C, int M,
@@ -417,41 +419,28 @@ static void manifold_slide_core(const float* z, const float* z_P,
                                 const float* value, float alpha_val,
                                 float* out, int* idx_out) {
     int best = 0;
+    vec_t c_P;
 
     if (value != NULL && alpha_val > 0.0f) {
         /* JAX's value_biased_retrieve(z, C, ..., C_out=C_P): score in the
-         * tangent-space coordinates, then exp_map the selected row. */
-        float d2[M];
-        float sum = 0.0f;
-        for (int j = 0; j < M; j++) {
-            d2[j] = 0.0f;
-            const float* row = C + (size_t)j * LCM_D;
-            for (int i = 0; i < LCM_D; i++) {
-                float diff = z[i] - row[i];
-                d2[j] += diff * diff;
-            }
-            sum += d2[j];
-        }
-        float avg = sum / (float)M;
-        float best_score = -INFINITY;
-        for (int j = 0; j < M; j++) {
-            float score = -d2[j] + alpha_val * tanhf(value[j]) * avg;
-            if (score > best_score) { best_score = score; best = j; }
-        }
+         * tangent-space coordinates, then exp_map the selected row. Shared
+         * R22 formula in lattice_pick_row (tanh/mean/ties in one place). */
+        vec_t c_raw;
+        best = lattice_pick_row(z, M, value, alpha_val,
+                                lattice_cb_row, C, c_raw);
+        exp_map_c(c_raw, c_P, LCM_D, 1.0f);
     } else {
         /* Poincaré nearest prototype in the R6 domain. */
         float best_sim = INFINITY;
         for (int j = 0; j < M; j++) {
-            vec_t c_P;
-            exp_map_c(C + (size_t)j * LCM_D, c_P, LCM_D, 1.0f);
-            float sim = poincare_similarity_c(z_P, c_P, LCM_D, 1.0f);
+            vec_t c_candidate;
+            exp_map_c(C + (size_t)j * LCM_D, c_candidate, LCM_D, 1.0f);
+            float sim = poincare_similarity_c(z_P, c_candidate, LCM_D, 1.0f);
             if (sim < best_sim) { best_sim = sim; best = j; }
         }
+        /* Tangent space projection at the selected prototype. */
+        exp_map_c(C + (size_t)best * LCM_D, c_P, LCM_D, 1.0f);
     }
-
-    /* Tangent space projection at the selected prototype. */
-    vec_t c_P;
-    exp_map_c(C + (size_t)best * LCM_D, c_P, LCM_D, 1.0f);
 
     /* r = z_P - c_idx (in tangent space) */
     vec_t r, proj;
@@ -459,7 +448,7 @@ static void manifold_slide_core(const float* z, const float* z_P,
 
     /* proj = T @ T.T @ r, with T stored row-major (D, t_dim). */
     const float* T_j = T_space + (size_t)best * LCM_D * t_dim;
-    float t_proj[t_dim];
+    float t_proj[LCM_MAX_T_DIM];
     memset(t_proj, 0, (size_t)t_dim * sizeof(float));
     for (int k = 0; k < t_dim; k++) {
         for (int i = 0; i < LCM_D; i++)
@@ -479,10 +468,28 @@ static void manifold_slide_core(const float* z, const float* z_P,
     if (idx_out) *idx_out = best;
 }
 
+/*@
+  requires \valid_read(z + (0 .. LCM_D-1));
+  requires \valid_read(mem) && \valid_read(mem->C);
+  requires \valid_read(T_space + (0 .. mem->M * LCM_D * t_dim - 1));
+  requires \valid(out + (0 .. LCM_D-1));
+  requires \separated(out, z) && \separated(out, T_space);
+  requires mem->M > 0 && t_dim > 0;
+  requires mem->M <= LCM_MAX_M && t_dim <= LCM_MAX_T_DIM;
+  requires \forall integer j; 0 <= j < mem->M ==> \valid_read(mem->C[j] + (0 .. LCM_D-1));
+  ensures  \valid(out + (0 .. LCM_D-1));
+  assigns  out[0 .. LCM_D-1];
+ */
 void slide_manifold(const float* z, const lattice_memory_t* mem,
                      const float* T_space, int t_dim, float* out) {
     assert(mem != NULL && T_space != NULL && out != NULL);
     assert(mem->M > 0 && t_dim > 0);
+    if (!z || !mem || !mem->C || !T_space || !out
+        || mem->M <= 0 || mem->M > LCM_MAX_M
+        || t_dim <= 0 || t_dim > LCM_MAX_T_DIM) {
+        if (out) memset(out, 0, sizeof(vec_t));
+        return;
+    }
 
     /* R6 domain: every hyperbolic comparison uses exp_map(safe_unit(z)). */
     vec_t z_u, z_P;
@@ -496,7 +503,8 @@ void slide_manifold(const float* z, const lattice_memory_t* mem,
 void manifold_forward_c(const float* z, const manifold_mem_t* m,
                         float alpha_val, float* out, int* idx) {
     if (!out) return;
-    if (!z || !m || !m->C || !m->T || m->M <= 0 || m->t_dim <= 0) {
+    if (!z || !m || !m->C || !m->T || m->M <= 0 || m->M > LCM_MAX_M
+        || m->t_dim <= 0 || m->t_dim > LCM_MAX_T_DIM) {
         memset(out, 0, sizeof(vec_t));
         if (idx) *idx = 0;
         return;

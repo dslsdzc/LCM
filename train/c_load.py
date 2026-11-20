@@ -85,7 +85,7 @@ def load_lattice_memories(ckpt_dir, cfg):
         hrq_top, hrq_fine, sparse_C, sparse_zero,
         lowrank_U, lowrank_V, lowrank_ranks,
         manifold_C, manifold_T,
-        bind_key, bind_val, bind_bind, bind_A_k, bind_A_v,
+        bind_key, bind_val, bind_bind, bind_A_k, bind_A_v, binding_r_max,
         contrast_a, contrast_b,
         route_C, route_W,
         fusion_alpha, fusion_ln_scale, fusion_ln_bias,
@@ -149,10 +149,20 @@ def load_lattice_memories(ckpt_dir, cfg):
         n_hint = int(cfg.get('n_lr_layers', 0))
         if n_hint <= 0:
             raise ValueError("config.json has neither ranks nor n_lr_layers")
-        ranks = [r_max] * n_hint
+        if n_hint > 1:
+            # The ragged U_k file split cannot be reconstructed from n_layers
+            # alone; b.md §4.3 also requires a strictly increasing sequence.
+            raise ValueError(
+                "config.json is missing 'ranks'; cannot infer the strictly "
+                "increasing rank sequence (re-export required)")
+        ranks = [r_max]
     # ranks determines the file split. n_lr_layers is metadata and may be
     # stale (e.g. _small_cfg keeps the default 3 with ranks=(2,4)).
     ranks = [int(r) for r in ranks]
+    for k in range(1, len(ranks)):
+        if ranks[k] <= ranks[k - 1]:
+            raise ValueError(
+                f"ranks must be strictly increasing (b.md §4.3); got {ranks}")
     n_lr = len(ranks)
     lowrank = _read_tensor(ckpt_dir, manifest, 'lowrank_codebook').ravel()
     lowrank_U = np.zeros((n_lr, M_lr, r_max), dtype=np.float32)
@@ -309,6 +319,9 @@ def load_lattice_memories(ckpt_dir, cfg):
         'bind_bind': bind_bind,
         'bind_A_k': bind_A_k,
         'bind_A_v': bind_A_v,
+        # binding_mem_t.r_max: the shared low-rank basis V is [d, r_max] and
+        # A_k/A_v are [r_max, d]. Task 10 must copy this into the C struct.
+        'binding_r_max': int(lowrank_V.shape[1]),
         'contrast_a': contrast_a,
         'contrast_b': contrast_b,
         'route_C': route_C,

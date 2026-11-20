@@ -1647,6 +1647,9 @@ class LCMInferEngine:
         self.bind_bind = mem['bind_bind']
         self.bind_A_k = mem['bind_A_k']
         self.bind_A_v = mem['bind_A_v']
+        # binding_mem_t.r_max (the shared low-rank V column count). Kept here
+        # so Task 10 can populate the C struct without re-deriving it.
+        self.bind_r_max = int(mem.get('binding_r_max', self.lr_V.shape[1]))
         self.bind_C = np.ascontiguousarray(self.bind_bind[0].ravel())
 
         self.contrast_M = mem['contrast_a'].shape[1]

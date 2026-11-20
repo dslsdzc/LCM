@@ -301,6 +301,20 @@ def test_lowrank_two_ranks_ignores_stale_n_lr_layers(tmp_path):
                                   exp['lowrank_U'][1, :, :4])
 
 
+def test_lowrank_ranks_must_be_strictly_increasing(tmp_path):
+    """b.md §4.3: the rank sequence increases to r_max."""
+    ranks = (4, 1)
+    _build_fixture(tmp_path, ranks=ranks)
+    cfg = _cfg()
+    cfg['ranks'] = list(ranks)
+    try:
+        load_lattice_memories(str(tmp_path), cfg)
+    except ValueError as exc:
+        assert 'strictly increasing' in str(exc)
+    else:
+        raise AssertionError("non-increasing ranks were accepted")
+
+
 def test_loads_binding_and_contrast_all_layers(tmp_path):
     exp = _build_fixture(tmp_path)
     mem = load_lattice_memories(str(tmp_path), _cfg())
@@ -322,6 +336,8 @@ def test_loads_binding_and_contrast_all_layers(tmp_path):
 
     np.testing.assert_array_equal(mem['bind_A_k'], exp['bind_A_k'])
     np.testing.assert_array_equal(mem['bind_A_v'], exp['bind_A_v'])
+    # Task 9: binding_mem_t.r_max = the shared low-rank V column count.
+    assert mem['binding_r_max'] == R_MAX
 
 
 def test_loads_hrq_sparse_manifold_route_fusion_self(tmp_path):

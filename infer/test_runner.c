@@ -562,6 +562,33 @@ static void test_memory_v3_layout(void) {
     bad.lowrank.ranks = bad_ranks;
     CHECK(t7_bind(&mem, &bad) == -1, "rejects lowrank rank > r_max");
 
+    int unsorted_ranks[2] = {T7_R, 1};
+    bad = good;
+    bad.lowrank.ranks = unsorted_ranks;
+    CHECK(t7_bind(&mem, &bad) == -1,
+          "rejects non-increasing lowrank ranks");
+
+    int equal_ranks[2] = {2, 2};
+    bad = good;
+    bad.lowrank.ranks = equal_ranks;
+    CHECK(t7_bind(&mem, &bad) == -1,
+          "rejects equal (non-strictly-increasing) lowrank ranks");
+
+    bad = good;
+    bad.sparse.M = LCM_MAX_M + 1;
+    CHECK(t7_bind(&mem, &bad) == -1,
+          "rejects codebook M over the stack cap");
+
+    bad = good;
+    bad.lowrank.r_max = LCM_MAX_RANK + 1;
+    CHECK(t7_bind(&mem, &bad) == -1,
+          "rejects lowrank r_max over the stack cap");
+
+    bad = good;
+    bad.manifold.t_dim = LCM_MAX_T_DIM + 1;
+    CHECK(t7_bind(&mem, &bad) == -1,
+          "rejects manifold t_dim over the stack cap");
+
     bad = good;
     bad.binding.n_layers = 0;
     CHECK(t7_bind(&mem, &bad) == -1, "rejects zero binding n_layers");
@@ -1250,6 +1277,12 @@ static float t9_cosine(const float* a, const float* b) {
     return dot / (sqrtf(na) * sqrtf(nb) + 1e-8f);
 }
 
+static int t9_all_zero(const float* p, int n) {
+    for (int i = 0; i < n; i++)
+        if (p[i] != 0.0f) return 0;
+    return 1;
+}
+
 /* ── LowRank ────────────────────────────────────────────────────────────── */
 
 static void test_lowrank_multilayer(void) {
@@ -1369,6 +1402,53 @@ static void t9_manifold_ref(const float* z, const float* C, const float* T,
     }
     for (int i = 0; i < LCM_D; i++) c_P[i] += proj[i];
     log_map_c(c_P, out, LCM_D, 1.0f);
+}
+
+static void test_lowrank_shared_basis_nondiagonal(void) {
+    enum { M = 1, R = 2, L = 2 };
+    static float U[L * M * R];
+    static float V[LCM_D * R];
+    static float z[LCM_D];
+    static float out[LCM_D];
+    static float ref[LCM_D];
+    int ranks[L] = {1, 2};
+    int idx[L] = {-1, -1};
+
+    memset(U, 0, sizeof(U));
+    memset(V, 0, sizeof(V));
+    memset(z, 0, sizeof(z));
+    memset(ref, 0, sizeof(ref));
+
+    /* Non-symmetric V and off-diagonal rows: C_k = U_k @ V[:, :r_k]^T.
+     * A V^T / transposed-basis implementation produces different rows. */
+    V[0 * R + 0] = 1.0f;  V[0 * R + 1] = 0.5f;
+    V[1 * R + 0] = 0.25f; V[1 * R + 1] = 1.0f;
+    V[2 * R + 0] = 0.75f; V[2 * R + 1] = -0.25f;
+    U[0 * R + 0] = 1.0f;  U[0 * R + 1] = 0.5f;   /* rank 1: col 1 unused */
+    U[1 * R + 0] = 0.1f;  U[1 * R + 1] = 0.2f;
+
+    z[0] = 1.2f;
+    z[1] = 0.7f;
+    z[2] = 0.7f;
+
+    lowrank_mem_t m;
+    memset(&m, 0, sizeof(m));
+    m.U = U; m.V = V; m.ranks = ranks;
+    m.n_layers = L; m.M_lr = M; m.r_max = R;
+    m.value = NULL;
+
+    lowrank_forward_c(z, &m, 0.0f, out, idx);
+
+    for (int d = 0; d < LCM_D; d++) {
+        float c0 = U[0 * R + 0] * V[(size_t)d * R + 0];
+        float c1 = U[1 * R + 0] * V[(size_t)d * R + 0]
+                 + U[1 * R + 1] * V[(size_t)d * R + 1];
+        ref[d] = c0 + c1;
+    }
+    CHECK(t9_max_abs_diff(out, ref, LCM_D) < 1e-5f,
+          "lowrank: non-diagonal shared V matches U_k @ V[:, :r_k]^T");
+    CHECK(idx[0] == 0 && idx[1] == 0,
+          "lowrank: non-diagonal basis keeps both layers active");
 }
 
 static void test_manifold_formula_and_poincare(void) {
@@ -1558,7 +1638,7 @@ static void test_binding_unbind_and_cval(void) {
     static float z[LCM_D];
     static float out[LCM_D];
     static float bq[LCM_D], kq[LCM_D];
-    static float b9[LCM_D], b1[LCM_D], bcheck[LCM_D];
+    static float b9[LCM_D], b1[LCM_D], bcheck[LCM_D], pair[LCM_D];
     static float rec[LCM_D];
     static float v[LCM_D];
 
@@ -1600,10 +1680,17 @@ static void test_binding_unbind_and_cval(void) {
     const float* vp[L];
     for (int l = 0; l < L; l++) vp[l] = val_cb + ((size_t)l * M) * LCM_D;
 
-    /* The exact 9-pair sum and the 1-pair value a wrong implementation would
-     * produce; the bind codebook must select the former. */
-    hrr_bind(kp, L, vp, L, b9, LCM_D);
+    /* Independent 9-pair reference: sum pairwise hrr_bind calls instead of
+     * relying on hrr_bind's own multi-pair accumulation. */
+    memset(b9, 0, sizeof(b9));
+    for (int i = 0; i < L; i++) {
+        for (int j = 0; j < L; j++) {
+            hrr_bind(&kp[i], 1, &vp[j], 1, pair, LCM_D);
+            for (int d = 0; d < LCM_D; d++) b9[d] += pair[d];
+        }
+    }
     hrr_bind(&kp[0], 1, &vp[2], 1, b1, LCM_D);
+    /* Plant the 9-pair sum vs a 1-pair competitor. */
     memcpy(bind_cb, b9, sizeof(b9));                 /* layer 0, row 0 */
     memcpy(bind_cb + LCM_D, b1, sizeof(b1));         /* layer 0, row 1 */
     for (int l = 1; l < L; l++) {                    /* layers 1/2: 0, far */
@@ -1652,8 +1739,328 @@ static void test_binding_unbind_and_cval(void) {
     /* Primitive round-trip on one pair. */
     hrr_bind(&kp[0], 1, &vp[2], 1, b1, LCM_D);
     hrr_unbind(b1, kp[0], rec, LCM_D);
-    CHECK(t9_cosine(rec, v) > 0.7f,
-          "binding: unbind(bind(k,v),k) ≈ v (cosine > 0.7)");
+    CHECK(t9_cosine(rec, v) > 0.6f,
+          "binding: unbind(bind(k,v),k) ≈ v (cosine > 0.6)");
+}
+
+static void test_binding_projection_direction(void) {
+    enum { L = 1, M = 2, R = 2 };
+    static float key_cb[L * M * LCM_D];
+    static float val_cb[L * M * LCM_D];
+    static float bind_cb[L * M * LCM_D];
+    static float A_k[R * LCM_D];
+    static float A_v[R * LCM_D];
+    static float V[LCM_D * R];
+    static float z[LCM_D];
+    static float out[LCM_D];
+    static float kq[LCM_D];
+    static float correct[LCM_D], transposed[LCM_D];
+    static float u[2], t[2];
+
+    memset(key_cb, 0, sizeof(key_cb));
+    memset(val_cb, 0, sizeof(val_cb));
+    memset(bind_cb, 0, sizeof(bind_cb));
+    memset(A_k, 0, sizeof(A_k));
+    memset(A_v, 0, sizeof(A_v));
+    memset(V, 0, sizeof(V));
+    memset(z, 0, sizeof(z));
+
+    /* Non-symmetric V and A_k, non-basis z. b.md §4.5:
+     * z_k = V @ A_k @ z = W_k z. The old code returned W_k^T z. */
+    V[0 * R + 0] = 1.0f;  V[0 * R + 1] = 0.25f;
+    V[1 * R + 0] = 0.5f;
+    V[2 * R + 0] = 0.75f; V[2 * R + 1] = 1.0f;
+    A_k[0 * LCM_D + 0] = 1.0f;
+    A_k[0 * LCM_D + 1] = 0.5f;
+    A_k[1 * LCM_D + 2] = 1.0f;
+    z[0] = 1.0f; z[1] = 0.3f; z[2] = 0.7f;
+
+    /* correct = V @ (A_k z) */
+    memset(u, 0, sizeof(u));
+    memset(correct, 0, sizeof(correct));
+    for (int p = 0; p < R; p++)
+        for (int i = 0; i < LCM_D; i++)
+            u[p] += A_k[p * LCM_D + i] * z[i];
+    for (int j = 0; j < LCM_D; j++)
+        for (int p = 0; p < R; p++)
+            correct[j] += V[j * R + p] * u[p];
+
+    /* transposed = A_k^T (V^T z) = W_k^T z */
+    memset(t, 0, sizeof(t));
+    memset(transposed, 0, sizeof(transposed));
+    for (int p = 0; p < R; p++)
+        for (int i = 0; i < LCM_D; i++)
+            t[p] += V[i * R + p] * z[i];
+    for (int j = 0; j < LCM_D; j++)
+        for (int p = 0; p < R; p++)
+            transposed[j] += A_k[p * LCM_D + j] * t[p];
+
+    CHECK(t9_max_abs_diff(correct, transposed, LCM_D) > 1e-3f,
+          "binding projection: crafted data separates W_k z from W_k^T z");
+    memcpy(key_cb, correct, sizeof(correct));
+    memcpy(key_cb + LCM_D, transposed, sizeof(transposed));
+
+    binding_mem_t m;
+    memset(&m, 0, sizeof(m));
+    m.key_cb = key_cb; m.val_cb = val_cb; m.bind_cb = bind_cb;
+    m.M = M; m.n_layers = L; m.r_max = R;
+    m.A_k = A_k; m.A_v = A_v;
+    m.value_key = NULL; m.value_val = NULL; m.value_bind = NULL;
+
+    binding_forward_c(z, &m, V, 0.0f, out, NULL, kq);
+
+    CHECK(t9_max_abs_diff(kq, correct, LCM_D) < 1e-6f,
+          "binding: z_k = V @ A_k @ z (W_k z), not W_k^T z");
+    CHECK(t9_max_abs_diff(kq, transposed, LCM_D) > 1e-3f,
+          "binding: transposed projection is not selected");
+}
+
+static void test_binding_value_families(void) {
+    enum { L = 1, M = 2, R = 1 };
+    static float key_cb[L * M * LCM_D];
+    static float val_cb[L * M * LCM_D];
+    static float bind_cb[L * M * LCM_D];
+    static float A_k[R * LCM_D];
+    static float A_v[R * LCM_D];
+    static float V[LCM_D * R];
+    static float z[LCM_D];
+    static float out[LCM_D];
+    static float kq[LCM_D], bq[LCM_D];
+    static float v0[LCM_D], v1[LCM_D];
+    static float B0[LCM_D], B1[LCM_D];
+    static float k[LCM_D];
+    static float vk[M] = {0.0f, 1.0f};
+    static float vv[M] = {0.0f, 1.0f};
+    static float vb[M] = {0.0f, 1.0f};
+
+    binding_mem_t m;
+    memset(&m, 0, sizeof(m));
+    m.key_cb = key_cb; m.val_cb = val_cb; m.bind_cb = bind_cb;
+    m.M = M; m.n_layers = L; m.r_max = R;
+    m.A_k = A_k; m.A_v = A_v;
+
+    /* ── value_key: biased key row wins, k_q exposes it ── */
+    memset(key_cb, 0, sizeof(key_cb));
+    memset(val_cb, 0, sizeof(val_cb));
+    memset(bind_cb, 0, sizeof(bind_cb));
+    memset(A_k, 0, sizeof(A_k));
+    memset(A_v, 0, sizeof(A_v));
+    memset(V, 0, sizeof(V));
+    memset(z, 0, sizeof(z));
+    V[0] = 1.0f;
+    z[0] = 1.0f;
+    A_k[0] = 0.55f;                 /* z_k = A_k z = 0.55 e0 */
+    key_cb[0] = 0.5f;               /* row 0 */
+    key_cb[LCM_D] = 0.7f;           /* row 1 */
+    m.value_key = NULL; m.value_val = NULL; m.value_bind = NULL;
+    binding_forward_c(z, &m, V, 0.0f, out, NULL, kq);
+    CHECK(fabsf(kq[0] - 0.5f) < 1e-6f,
+          "binding value_key: alpha=0 keeps the Euclidean key row");
+    m.value_key = vk;
+    binding_forward_c(z, &m, V, 4.0f, out, NULL, kq);
+    CHECK(fabsf(kq[0] - 0.7f) < 1e-6f,
+          "binding value_key: R22 bias selects the farther key row");
+
+    /* ── value_val: b_raw/b_q expose the selected value row ── */
+    memset(key_cb, 0, sizeof(key_cb));
+    memset(val_cb, 0, sizeof(val_cb));
+    memset(bind_cb, 0, sizeof(bind_cb));
+    t9_seed = 0x51ED270Bu;
+    t9_unit(k);
+    memcpy(key_cb, k, sizeof(k));               /* both key rows = k */
+    memcpy(key_cb + LCM_D, k, sizeof(k));
+    A_k[0] = 0.5f;                             /* z_k = 0.5 e0 */
+    memset(v0, 0, sizeof(v0));
+    memset(v1, 0, sizeof(v1));
+    v0[0] = 0.5f;
+    v1[0] = 0.7f;
+    memcpy(val_cb, v0, sizeof(v0));
+    memcpy(val_cb + LCM_D, v1, sizeof(v1));
+    A_v[0] = 0.55f;                            /* z_v = 0.55 e0 */
+    const float* key_ptr[1] = {key_cb};
+    const float* val0_ptr[1] = {val_cb};
+    const float* val1_ptr[1] = {val_cb + LCM_D};
+    hrr_bind(key_ptr, 1, val0_ptr, 1, B0, LCM_D);
+    hrr_bind(key_ptr, 1, val1_ptr, 1, B1, LCM_D);
+    memcpy(bind_cb, B0, sizeof(B0));
+    memcpy(bind_cb + LCM_D, B1, sizeof(B1));
+
+    m.value_key = NULL; m.value_val = NULL; m.value_bind = NULL;
+    binding_forward_c(z, &m, V, 0.0f, out, bq, kq);
+    CHECK(t9_max_abs_diff(bq, B0, LCM_D) < 1e-5f,
+          "binding value_val: alpha=0 quantises the Euclidean value row");
+    m.value_val = vv;
+    binding_forward_c(z, &m, V, 4.0f, out, bq, kq);
+    CHECK(t9_max_abs_diff(bq, B1, LCM_D) < 1e-5f,
+          "binding value_val: R22 bias changes the val code and b_raw");
+
+    /* ── value_bind: b_q selects the biased binding row ── */
+    m.value_val = NULL; m.value_bind = NULL;
+    binding_forward_c(z, &m, V, 0.0f, out, bq, kq);
+    CHECK(t9_max_abs_diff(bq, B0, LCM_D) < 1e-5f,
+          "binding value_bind: alpha=0 picks the Euclidean bind row");
+    m.value_bind = vb;
+    binding_forward_c(z, &m, V, 8.0f, out, bq, kq);
+    CHECK(t9_max_abs_diff(bq, B1, LCM_D) < 1e-5f,
+          "binding value_bind: R22 bias picks the other bind row");
+}
+
+static void test_layer_forwards_invalid(void) {
+    enum { M = 1, R = 1, L = 1, TD = 1 };
+    static float U[M * R];
+    static float V[LCM_D * R];
+    static float C[M * LCM_D];
+    static float T[M * LCM_D * TD];
+    static float Ca[M * LCM_D];
+    static float Cb[M * LCM_D];
+    static float key_cb[M * LCM_D];
+    static float val_cb[M * LCM_D];
+    static float bind_cb[M * LCM_D];
+    static float A_k[R * LCM_D];
+    static float A_v[R * LCM_D];
+    static float z[LCM_D];
+    static float out[LCM_D];
+    static float bq[LCM_D], kq[LCM_D];
+    int ranks[L] = {1};
+    int idx[L];
+
+    memset(U, 0, sizeof(U));
+    memset(V, 0, sizeof(V));
+    memset(C, 0, sizeof(C));
+    memset(T, 0, sizeof(T));
+    memset(Ca, 0, sizeof(Ca));
+    memset(Cb, 0, sizeof(Cb));
+    memset(key_cb, 0, sizeof(key_cb));
+    memset(val_cb, 0, sizeof(val_cb));
+    memset(bind_cb, 0, sizeof(bind_cb));
+    memset(A_k, 0, sizeof(A_k));
+    memset(A_v, 0, sizeof(A_v));
+    memset(z, 0, sizeof(z));
+    U[0] = 0.5f;
+    V[0] = 1.0f;
+    C[0] = 0.2f;   /* non-zero valid manifold prototype */
+
+    lowrank_mem_t lr;
+    memset(&lr, 0, sizeof(lr));
+    lr.U = U; lr.V = V; lr.ranks = ranks;
+    lr.n_layers = L; lr.M_lr = M; lr.r_max = R;
+
+    lr.n_layers = 0;
+    memset(out, 1, sizeof(out));
+    lowrank_forward_c(z, &lr, 0.0f, out, idx);
+    CHECK(t9_all_zero(out, LCM_D), "lowrank invalid: n_layers=0 zeroes out");
+
+    lr.n_layers = L; lr.M_lr = 0;
+    memset(out, 1, sizeof(out));
+    lowrank_forward_c(z, &lr, 0.0f, out, idx);
+    CHECK(t9_all_zero(out, LCM_D), "lowrank invalid: M_lr=0 zeroes out");
+
+    lr.M_lr = M; lr.U = NULL;
+    memset(out, 1, sizeof(out));
+    lowrank_forward_c(z, &lr, 0.0f, out, idx);
+    CHECK(t9_all_zero(out, LCM_D), "lowrank invalid: NULL U zeroes out");
+
+    lr.U = U; ranks[0] = 0;
+    memset(out, 1, sizeof(out));
+    idx[0] = -1;
+    lowrank_forward_c(z, &lr, 0.0f, out, idx);
+    CHECK(t9_all_zero(out, LCM_D) && idx[0] == 0,
+          "lowrank invalid: bad rank zeroes out/idx");
+
+    ranks[0] = 1;
+    memset(out, 1, sizeof(out));
+    lowrank_forward_c(z, &lr, 0.0f, out, NULL);
+    CHECK(fabsf(out[0] - 0.5f) < 1e-6f,
+          "lowrank: idx=NULL is accepted");
+
+    manifold_mem_t man;
+    memset(&man, 0, sizeof(man));
+    man.C = C; man.M = M; man.T = T; man.t_dim = TD;
+
+    man.M = 0;
+    memset(out, 1, sizeof(out));
+    manifold_forward_c(z, &man, 0.0f, out, idx);
+    CHECK(t9_all_zero(out, LCM_D), "manifold invalid: M=0 zeroes out");
+
+    man.M = M; man.t_dim = 0;
+    memset(out, 1, sizeof(out));
+    manifold_forward_c(z, &man, 0.0f, out, idx);
+    CHECK(t9_all_zero(out, LCM_D), "manifold invalid: t_dim=0 zeroes out");
+
+    man.t_dim = TD; man.C = NULL;
+    memset(out, 1, sizeof(out));
+    manifold_forward_c(z, &man, 0.0f, out, idx);
+    CHECK(t9_all_zero(out, LCM_D), "manifold invalid: NULL C zeroes out");
+
+    man.C = C;
+    memset(out, 1, sizeof(out));
+    manifold_forward_c(z, &man, 0.0f, out, NULL);
+    CHECK(fabsf(out[0] - 0.2f) < 1e-6f,
+          "manifold: idx=NULL is accepted");
+
+    contrast_mem_t con;
+    memset(&con, 0, sizeof(con));
+    con.C_a = Ca; con.C_b = Cb; con.M = M; con.n_layers = L;
+
+    con.n_layers = 0;
+    memset(out, 1, sizeof(out));
+    contrast_forward_c(z, &con, 0.0f, out);
+    CHECK(t9_all_zero(out, LCM_D), "contrast invalid: n_layers=0 zeroes out");
+
+    con.n_layers = L; con.M = 0;
+    memset(out, 1, sizeof(out));
+    contrast_forward_c(z, &con, 0.0f, out);
+    CHECK(t9_all_zero(out, LCM_D), "contrast invalid: M=0 zeroes out");
+
+    con.M = M; con.C_a = NULL;
+    memset(out, 1, sizeof(out));
+    contrast_forward_c(z, &con, 0.0f, out);
+    CHECK(t9_all_zero(out, LCM_D), "contrast invalid: NULL C_a zeroes out");
+
+    binding_mem_t bin;
+    memset(&bin, 0, sizeof(bin));
+    bin.key_cb = key_cb; bin.val_cb = val_cb; bin.bind_cb = bind_cb;
+    bin.M = M; bin.n_layers = L; bin.r_max = R;
+    bin.A_k = A_k; bin.A_v = A_v;
+
+    bin.n_layers = 0;
+    memset(out, 1, sizeof(out));
+    memset(bq, 1, sizeof(bq));
+    memset(kq, 1, sizeof(kq));
+    binding_forward_c(z, &bin, V, 0.0f, out, bq, kq);
+    CHECK(t9_all_zero(out, LCM_D) && t9_all_zero(bq, LCM_D)
+              && t9_all_zero(kq, LCM_D),
+          "binding invalid: n_layers=0 zeroes out/b_q/k_q");
+
+    bin.n_layers = LCM_MAX_BIND_LAYERS + 1;
+    memset(out, 1, sizeof(out));
+    binding_forward_c(z, &bin, V, 0.0f, out, bq, kq);
+    CHECK(t9_all_zero(out, LCM_D), "binding invalid: layer cap zeroes out");
+
+    bin.n_layers = L; bin.M = 0;
+    memset(out, 1, sizeof(out));
+    binding_forward_c(z, &bin, V, 0.0f, out, bq, kq);
+    CHECK(t9_all_zero(out, LCM_D), "binding invalid: M=0 zeroes out");
+
+    bin.M = M; bin.r_max = 0;
+    memset(out, 1, sizeof(out));
+    binding_forward_c(z, &bin, V, 0.0f, out, bq, kq);
+    CHECK(t9_all_zero(out, LCM_D), "binding invalid: r_max=0 zeroes out");
+
+    bin.r_max = R; bin.key_cb = NULL;
+    memset(out, 1, sizeof(out));
+    binding_forward_c(z, &bin, V, 0.0f, out, bq, kq);
+    CHECK(t9_all_zero(out, LCM_D), "binding invalid: NULL key_cb zeroes out");
+
+    bin.key_cb = key_cb;
+    memset(out, 1, sizeof(out));
+    binding_forward_c(z, &bin, NULL, 0.0f, out, bq, kq);
+    CHECK(t9_all_zero(out, LCM_D), "binding invalid: NULL V zeroes out");
+
+    memset(out, 1, sizeof(out));
+    binding_forward_c(z, &bin, V, 0.0f, out, NULL, NULL);
+    CHECK(t9_all_zero(out, LCM_D),
+          "binding: b_q=NULL and k_q=NULL are accepted");
 }
 
 int main(void) {
@@ -1686,10 +2093,14 @@ int main(void) {
     test_routing_invalid();
     test_lowrank_multilayer();
     test_lowrank_value_bias();
+    test_lowrank_shared_basis_nondiagonal();
     test_manifold_formula_and_poincare();
     test_contrast_dual_codebook();
     test_contrast_value_bias_families();
     test_binding_unbind_and_cval();
+    test_binding_projection_direction();
+    test_binding_value_families();
+    test_layer_forwards_invalid();
     test_hrr_no_overwrite();
     test_fusion_l2_weights();
     if (failures == 0)

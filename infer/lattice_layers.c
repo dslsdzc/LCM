@@ -6,28 +6,35 @@
  * slide_manifold because the two share the tangent-space core).
  *
  * No heap allocation, no JSON, no global mutable state: every temporary is a
- * fixed-size vec_t or a C99 stack VLA. All arrays are caller-owned.
+ * fixed-size vec_t or a capped stack array. All arrays are caller-owned.
  */
 #include "lcm.h"
+#include "lattice_internal.h"
+#include <assert.h>
 #include <math.h>
 #include <string.h>
 
 /* ─── Shared residual-VQ pick ───────────────────────────────────────────────
  *
- * JAX's value_biased_scores over one residual input:
+ * One implementation of JAX's value_biased_scores over a residual input:
  *   score_j = -||r - C_j||² + alpha_val·tanh(v_j)·mean_j(||r - C_j||²)
  * with argmax (first occurrence on ties). Without an active value vector this
- * is the plain Euclidean argmin. c_out (optional) receives the selected row.
+ * is the plain Euclidean argmin. See lattice_internal.h.
  */
-static int pick_row(const float* r, const float* cb, int M,
-                    const float* value, float alpha_val, float* c_out) {
+int lattice_pick_row(const float* r, int M, const float* value,
+                     float alpha_val, lattice_row_fn row_fn, const void* ctx,
+                     float* c_out) {
+    assert(r != NULL && row_fn != NULL);
+    assert(M > 0 && M <= LCM_MAX_M);
+
     int best = 0;
+    vec_t row;
 
     if (value != NULL && alpha_val > 0.0f) {
-        float d2[M];
+        float d2[LCM_MAX_M];
         float sum = 0.0f;
         for (int j = 0; j < M; j++) {
-            const float* row = cb + (size_t)j * LCM_D;
+            row_fn(ctx, j, row);
             d2[j] = 0.0f;
             for (int i = 0; i < LCM_D; i++) {
                 float diff = r[i] - row[i];
@@ -44,7 +51,7 @@ static int pick_row(const float* r, const float* cb, int M,
     } else {
         float best_d2 = INFINITY;
         for (int j = 0; j < M; j++) {
-            const float* row = cb + (size_t)j * LCM_D;
+            row_fn(ctx, j, row);
             float d2 = 0.0f;
             for (int i = 0; i < LCM_D; i++) {
                 float diff = r[i] - row[i];
@@ -54,8 +61,13 @@ static int pick_row(const float* r, const float* cb, int M,
         }
     }
 
-    if (c_out) memcpy(c_out, cb + (size_t)best * LCM_D, sizeof(vec_t));
+    if (c_out) row_fn(ctx, best, c_out);
     return best;
+}
+
+void lattice_cb_row(const void* ctx, int row, float* out) {
+    const float* cb = (const float*)ctx;
+    memcpy(out, cb + (size_t)row * LCM_D, sizeof(vec_t));
 }
 
 /* ─── LowRank: incremental-rank VQ with one shared basis (b.md §4.3) ─────── */
@@ -74,11 +86,23 @@ static void lowrank_row(const lowrank_mem_t* m, int layer, int rank, int row,
     }
 }
 
+typedef struct {
+    const lowrank_mem_t* m;
+    int layer;
+    int rank;
+} lowrank_row_ctx_t;
+
+static void lowrank_row_cb(const void* ctx, int row, float* out) {
+    const lowrank_row_ctx_t* c = (const lowrank_row_ctx_t*)ctx;
+    lowrank_row(c->m, c->layer, c->rank, row, out);
+}
+
 void lowrank_forward_c(const float* z, const lowrank_mem_t* m, float alpha_val,
                        float* out, int* idx) {
     if (!out) return;
     if (!z || !m || !m->U || !m->V || !m->ranks || m->n_layers <= 0
-        || m->M_lr <= 0 || m->r_max <= 0) {
+        || m->M_lr <= 0 || m->M_lr > LCM_MAX_M
+        || m->r_max <= 0 || m->r_max > LCM_MAX_RANK) {
         memset(out, 0, sizeof(vec_t));
         if (idx && m && m->n_layers > 0)
             memset(idx, 0, (size_t)m->n_layers * sizeof(int));
@@ -98,41 +122,9 @@ void lowrank_forward_c(const float* z, const lowrank_mem_t* m, float alpha_val,
 
     for (int l = 0; l < m->n_layers; l++) {
         int rank = m->ranks[l];
-        int best = 0;
-
-        if (m->value != NULL && alpha_val > 0.0f) {
-            float d2[m->M_lr];
-            float sum = 0.0f;
-            for (int j = 0; j < m->M_lr; j++) {
-                lowrank_row(m, l, rank, j, c);
-                d2[j] = 0.0f;
-                for (int i = 0; i < LCM_D; i++) {
-                    float diff = r[i] - c[i];
-                    d2[j] += diff * diff;
-                }
-                sum += d2[j];
-            }
-            float avg = sum / (float)m->M_lr;
-            float best_score = -INFINITY;
-            for (int j = 0; j < m->M_lr; j++) {
-                float score = -d2[j]
-                    + alpha_val * tanhf(m->value[j]) * avg;
-                if (score > best_score) { best_score = score; best = j; }
-            }
-            lowrank_row(m, l, rank, best, c);
-        } else {
-            float best_d2 = INFINITY;
-            for (int j = 0; j < m->M_lr; j++) {
-                lowrank_row(m, l, rank, j, c);
-                float d2 = 0.0f;
-                for (int i = 0; i < LCM_D; i++) {
-                    float diff = r[i] - c[i];
-                    d2 += diff * diff;
-                }
-                if (d2 < best_d2) { best_d2 = d2; best = j; }
-            }
-            lowrank_row(m, l, rank, best, c);
-        }
+        lowrank_row_ctx_t row_ctx = {m, l, rank};
+        int best = lattice_pick_row(r, m->M_lr, m->value, alpha_val,
+                                    lowrank_row_cb, &row_ctx, c);
 
         if (idx) idx[l] = best;
         for (int i = 0; i < LCM_D; i++) {
@@ -149,7 +141,8 @@ void lowrank_forward_c(const float* z, const lowrank_mem_t* m, float alpha_val,
 void contrast_forward_c(const float* z, const contrast_mem_t* m,
                         float alpha_val, float* out) {
     if (!out) return;
-    if (!z || !m || !m->C_a || !m->C_b || m->M <= 0 || m->n_layers <= 0) {
+    if (!z || !m || !m->C_a || !m->C_b || m->M <= 0
+        || m->M > LCM_MAX_M || m->n_layers <= 0) {
         memset(out, 0, sizeof(vec_t));
         return;
     }
@@ -163,7 +156,8 @@ void contrast_forward_c(const float* z, const contrast_mem_t* m,
     for (int l = 0; l < m->n_layers; l++) {
         const float* cba = m->C_a
             + (size_t)l * (size_t)m->M * LCM_D;
-        pick_row(ra, cba, m->M, m->value_a, alpha_val, c);
+        lattice_pick_row(ra, m->M, m->value_a, alpha_val,
+                         lattice_cb_row, cba, c);
         for (int i = 0; i < LCM_D; i++) {
             oa[i] += c[i];
             ra[i] -= c[i];
@@ -171,7 +165,8 @@ void contrast_forward_c(const float* z, const contrast_mem_t* m,
 
         const float* cbb = m->C_b
             + (size_t)l * (size_t)m->M * LCM_D;
-        pick_row(rb, cbb, m->M, m->value_b, alpha_val, c);
+        lattice_pick_row(rb, m->M, m->value_b, alpha_val,
+                         lattice_cb_row, cbb, c);
         for (int i = 0; i < LCM_D; i++) {
             ob[i] += c[i];
             rb[i] -= c[i];
@@ -188,30 +183,34 @@ void binding_forward_c(const float* z, const binding_mem_t* m, const float* V,
                        float alpha_val, float* out, float* b_q, float* k_q) {
     if (!out) return;
     if (!z || !m || !V || !m->key_cb || !m->val_cb || !m->bind_cb
-        || !m->A_k || !m->A_v || m->M <= 0 || m->n_layers <= 0
-        || m->n_layers > LCM_MAX_BIND_LAYERS || m->r_max <= 0) {
+        || !m->A_k || !m->A_v || m->M <= 0 || m->M > LCM_MAX_M
+        || m->n_layers <= 0 || m->n_layers > LCM_MAX_BIND_LAYERS
+        || m->r_max <= 0 || m->r_max > LCM_MAX_RANK) {
         memset(out, 0, sizeof(vec_t));
         if (b_q) memset(b_q, 0, sizeof(vec_t));
         if (k_q) memset(k_q, 0, sizeof(vec_t));
         return;
     }
 
-    /* Projections: t = V^T z; z_k = A_k^T t; z_v = A_v^T t. This is
-     * algebraically W_k = V @ A_k followed by z @ W_k^T, without ever
-     * materialising the D×D W matrices. */
-    float t[m->r_max];
+    /* u_k = A_k z; z_k = V u_k = W_k z (b.md §4.5, W_k = V @ A_k).
+     * Same for A_v with an independent u_v. This is the projection order the
+     * JAX forward uses (z @ W_k^T == W_k z for one query). */
+    float u_k[LCM_MAX_RANK], u_v[LCM_MAX_RANK];
     vec_t zk, zv;
     for (int p = 0; p < m->r_max; p++) {
-        t[p] = 0.0f;
-        for (int i = 0; i < LCM_D; i++)
-            t[p] += z[i] * V[(size_t)i * (size_t)m->r_max + (size_t)p];
+        u_k[p] = 0.0f;
+        u_v[p] = 0.0f;
+        for (int i = 0; i < LCM_D; i++) {
+            u_k[p] += m->A_k[(size_t)p * LCM_D + (size_t)i] * z[i];
+            u_v[p] += m->A_v[(size_t)p * LCM_D + (size_t)i] * z[i];
+        }
     }
     for (int j = 0; j < LCM_D; j++) {
         zk[j] = 0.0f;
         zv[j] = 0.0f;
         for (int p = 0; p < m->r_max; p++) {
-            zk[j] += m->A_k[(size_t)p * LCM_D + (size_t)j] * t[p];
-            zv[j] += m->A_v[(size_t)p * LCM_D + (size_t)j] * t[p];
+            zk[j] += V[(size_t)j * (size_t)m->r_max + (size_t)p] * u_k[p];
+            zv[j] += V[(size_t)j * (size_t)m->r_max + (size_t)p] * u_v[p];
         }
     }
 
@@ -227,7 +226,8 @@ void binding_forward_c(const float* z, const binding_mem_t* m, const float* V,
     for (int l = 0; l < m->n_layers; l++) {
         const float* cb = m->key_cb
             + (size_t)l * (size_t)m->M * LCM_D;
-        pick_row(r, cb, m->M, m->value_key, alpha_val, c);
+        lattice_pick_row(r, m->M, m->value_key, alpha_val,
+                         lattice_cb_row, cb, c);
         kp[l] = key_rows + (size_t)l * LCM_D;
         memcpy(key_rows + (size_t)l * LCM_D, c, sizeof(vec_t));
         for (int i = 0; i < LCM_D; i++) {
@@ -240,7 +240,8 @@ void binding_forward_c(const float* z, const binding_mem_t* m, const float* V,
     for (int l = 0; l < m->n_layers; l++) {
         const float* cb = m->val_cb
             + (size_t)l * (size_t)m->M * LCM_D;
-        pick_row(r, cb, m->M, m->value_val, alpha_val, c);
+        lattice_pick_row(r, m->M, m->value_val, alpha_val,
+                         lattice_cb_row, cb, c);
         vp[l] = val_rows + (size_t)l * LCM_D;
         memcpy(val_rows + (size_t)l * LCM_D, c, sizeof(vec_t));
         for (int i = 0; i < LCM_D; i++) r[i] -= c[i];
@@ -258,7 +259,8 @@ void binding_forward_c(const float* z, const binding_mem_t* m, const float* V,
     for (int l = 0; l < m->n_layers; l++) {
         const float* cb = m->bind_cb
             + (size_t)l * (size_t)m->M * LCM_D;
-        pick_row(r, cb, m->M, m->value_bind, alpha_val, c);
+        lattice_pick_row(r, m->M, m->value_bind, alpha_val,
+                         lattice_cb_row, cb, c);
         for (int i = 0; i < LCM_D; i++) {
             bq_acc[i] += c[i];
             r[i] -= c[i];

@@ -53,7 +53,7 @@ liblcm.a: $(OBJS)
 liblcm.so: $(OBJS)
 	$(CC) -shared $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
 
-%.o: %.c lcm.h lcm_api.h
+%.o: %.c lcm.h lcm_api.h lattice_internal.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # ── Test target ──────────────────────────────────────────────────────────────
