@@ -48,7 +48,7 @@ extern "C" {
 #define LCM_MAX_RETRIEVALS 12    /* Max retrievals per step */
 #endif
 #ifndef LCM_HRQ_MAX_TOPK
-#define LCM_HRQ_MAX_TOPK   32    /* Stack cap for R1's value-rescoring top-k */
+#define LCM_HRQ_MAX_TOPK   1024  /* Stack cap for R1's value-rescoring top-k */
 #endif
 
 /* Derived constants */
@@ -428,9 +428,10 @@ void  mobius_add_c(const float* u, const float* v, float* out, int D, float c);
 void lcm_sha256(const void* data, size_t len, unsigned char out[32]);
 void lcm_sha256_hex(const void* data, size_t len, char out[65]);
 
-/* HRQ: hierarchical residual quantization on the Poincare ball.
- * Mirrors train/lattices.py::hrq_forward for the value_scalars == 0 case.
- * top_C is (M_top, D); fine_C is (n_fine * M_fine, D). Both raw, not ball-mapped. */
+/* HRQ v2 bridge wrapper: value_scalars == 0 and k = min(M_top, 4) (the
+ * hrq_value_topk default). D must equal LCM_D; top_C is (M_top, D), fine_C is
+ * (n_fine * M_fine, D), both raw/not ball-mapped. New code should call
+ * hrq_forward_v31 so the top-k and value scalars are explicit. */
 int hrq_forward_c(const float* z, int D,
                   const float* top_C, int M_top,
                   const float* fine_C, int M_fine, int n_fine,
@@ -448,8 +449,10 @@ int hrq_forward_c(const float* z, int D,
  *      m->value_fine when alpha_val > 0, shared across layers); the output is
  *      log_map(c_top ⊕ r), with c_top replaced by the blend on fallback.
  *
- * k = min(value_topk, M_top) must be ≤ LCM_HRQ_MAX_TOPK. idx/top_sim are
- * optional. Returns 0 on success, -1 on bad arguments. No allocation.
+ * k = min(value_topk, M_top, LCM_HRQ_MAX_TOPK). A valid config with a larger
+ * value_topk is clamped to the stack cap (default 1024, config default 4),
+ * never rejected. value_topk <= 0 is invalid. idx/top_sim are optional.
+ * Returns 0 on success, -1 on bad arguments. No allocation.
  */
 int hrq_forward_v31(const float* z, const hrq_mem_t* m, float alpha_val,
                     int value_topk, float tau_fallback,
@@ -457,9 +460,13 @@ int hrq_forward_v31(const float* z, const hrq_mem_t* m, float alpha_val,
 
 /* Sparse v3.1 — R2 conformant forward (training/inference split + LFQ).
  *
- * Training searches C only (idx is a C row). Inference searches
- * [zero_vec, C] in Euclidean space (idx 0 = zero_vec, j+1 = C[j]).
- * LFQ fires only when !training && d_top > 0 (the > 0 guard is the
+ * Training searches C only (idx is a C row). Inference searches [zero_vec, C]
+ * (idx 0 = zero_vec, j+1 = C[j]). Retrieval is Euclidean argmin when
+ * alpha_val <= 0 or m->value == NULL. When alpha_val > 0 and m->value is
+ * present it is JAX's value-biased score over the same search set:
+ *   score_j = -‖z - C_j‖² + alpha_val·tanh(v_j)·mean(‖z - C‖²),
+ * with v = 0 for the inference zero_vec candidate; idx = argmax(score).
+ * LFQ still fires only when !training && d_top > 0 (the > 0 guard is the
  * "HRQ did not activate" signal, since C has no c_top pointer) and
  * d_sparse_min > lambda_lfq·d_top, where d_sparse_min is measured over the
  * non-zero codebook in the R2 domain:
@@ -469,15 +476,18 @@ int hrq_forward_v31(const float* z, const hrq_mem_t* m, float alpha_val,
  * the output is a copy of m->zero_vec and idx = 0. No allocation.
  */
 int sparse_forward_c(const float* z, const sparse_mem_t* m, float lambda_lfq,
-                     float d_top, int training, float* out, int* idx);
+                     float alpha_val, float d_top, int training,
+                     float* out, int* idx);
 
 /* Routing gate — R19 inference path.
  *
  * idx = argmin_j ‖z - C_route[j]‖²; z_route = C_route[idx];
  * logits = W_route^T z_route with W_route stored [D][n_lattices];
  * soft_mask = one_hot(argmax(logits)) with no Gumbel noise (deterministic).
- * soft_mask has n_lattices entries. Invalid arguments are ignored (the
- * output buffer is left untouched).
+ * soft_mask has n_lattices entries. n_lattices must be in
+ * [1, LCM_MAX_LATTICES]. On invalid arguments soft_mask is cleared (up to
+ * LCM_MAX_LATTICES entries) and the function returns; a NULL soft_mask or
+ * n_lattices <= 0 is ignored because the buffer size is unknown.
  */
 void routing_gate_c(const float* z, const float* C_route, const float* W_route,
                     int n_lattices, float* soft_mask);

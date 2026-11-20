@@ -622,6 +622,15 @@ static hrq_mem_t t8_hrq_mem(const float* v_top, const float* v_fine) {
     return m;
 }
 
+static float t8_max_abs_diff(const float* a, const float* b) {
+    float worst = 0.0f;
+    for (int i = 0; i < LCM_D; i++) {
+        float d = fabsf(a[i] - b[i]);
+        if (d > worst) worst = d;
+    }
+    return worst;
+}
+
 static void test_hrq_v31_poincare_top1(void) {
     static const float angles[T8_HRQ_M] = {0.0f, 1.0f, 2.0f, 3.0f};
     for (int j = 0; j < T8_HRQ_M; j++)
@@ -657,8 +666,60 @@ static void test_hrq_v31_poincare_top1(void) {
           "alpha_val=0 with v=0 keeps the geometric top-1");
 }
 
+static void test_hrq_v31_poincare_vs_euclidean(void) {
+    /* Query r=0.9 on e0. C0 is radial at r=0.4 (Euclidean 0.50 away);
+     * C1 is r=0.95 at angle 0.5 (Euclidean 0.460, but its ball radius is
+     * nearly z_P's and the angular term dominates). The two metrics must
+     * disagree, and C must follow Poincaré. */
+    static float top2[2 * LCM_D];
+    t8_dir(top2, 0.0f, 0.4f);
+    t8_dir(top2 + (size_t)LCM_D, 0.5f, 0.95f);
+    t8_zero(t8_fine, T8_FINE_M * LCM_D);
+
+    float z[LCM_D];
+    t8_dir(z, 0.0f, 0.9f);
+
+    int e_idx = 0;
+    float e_best = INFINITY;
+    for (int j = 0; j < 2; j++) {
+        float d2 = 0.0f;
+        for (int i = 0; i < LCM_D; i++) {
+            float diff = z[i] - top2[(size_t)j * LCM_D + i];
+            d2 += diff * diff;
+        }
+        if (d2 < e_best) { e_best = d2; e_idx = j; }
+    }
+    int p_idx = 0;
+    float p_best = INFINITY;
+    for (int j = 0; j < 2; j++) {
+        float s = t8_hrq_sim(z, top2 + (size_t)j * LCM_D);
+        if (s < p_best) { p_best = s; p_idx = j; }
+    }
+    CHECK(e_idx == 1, "euclidean reference argmin is prototype 1");
+    CHECK(p_idx == 0, "poincare reference argmin is prototype 0");
+
+    hrq_mem_t m;
+    memset(&m, 0, sizeof(m));
+    m.C_top = top2;
+    m.M_top = 2;
+    m.C_fine = NULL;
+    m.M_fine = 0;
+    m.n_fine = 0;
+
+    float out[LCM_D];
+    int idx = -1;
+    float top_sim = -1.0f;
+    CHECK(hrq_forward_v31(z, &m, 0.0f, 2, 0.1f, out, &idx, &top_sim) == 0
+              && idx == 0,
+          "hrq v31 follows the Poincare argmin (not Euclidean)");
+    CHECK(fabsf(top_sim - p_best) < 1e-4f,
+          "poincare-vs-euclidean: top_sim is the Poincare sim");
+}
+
 static void test_hrq_v31_value_topk(void) {
-    static const float angles[T8_HRQ_M] = {0.0f, 0.05f, 1.5f, 2.5f};
+    /* Prototype 2 is geometrically third but close: with k=4 its value would
+     * win, with k=2 it is outside the candidate set. */
+    static const float angles[T8_HRQ_M] = {0.0f, 0.05f, 0.1f, 2.5f};
     for (int j = 0; j < T8_HRQ_M; j++)
         t8_dir(t8_top + (size_t)j * LCM_D, angles[j], 1.0f);
     t8_zero(t8_fine, T8_FINE_M * LCM_D);
@@ -685,13 +746,20 @@ static void test_hrq_v31_value_topk(void) {
               && idx == 0,
           "value_topk=1 cannot move the top-1");
 
-    /* Value mass on prototypes outside top-k is inert. */
-    float v2[T8_HRQ_M] = {0.0f, 0.0f, 1.0f, 1.0f};
+    /* A high value on prototype 2 is inert at k=2 ... */
+    float v2[T8_HRQ_M] = {0.0f, 0.0f, 1.0f, 0.0f};
     m.value_top = v2;
     idx = -1;
     CHECK(hrq_forward_v31(z, &m, 1.0f, 2, 0.1f, out, &idx, NULL) == 0
               && idx == 0,
-          "value outside top-k does not change top-1");
+          "value outside top-k=2 does not change top-1");
+
+    /* ... but the same value wins once k=4 admits prototype 2. This proves
+     * the assertion above is not passing because value is ignored. */
+    idx = -1;
+    CHECK(hrq_forward_v31(z, &m, 1.0f, 4, 0.1f, out, &idx, NULL) == 0
+              && idx == 2,
+          "same value selects prototype 2 when top-k admits it");
 
     /* alpha_val=0 disables rescoring even inside top-k. */
     m.value_top = v1;
@@ -702,98 +770,318 @@ static void test_hrq_v31_value_topk(void) {
 }
 
 static void test_hrq_v31_relative_gap(void) {
-    /* Fine prototypes along ±e1. The fine selection (and therefore out[1])
-     * differs between the hard top-1 and the fallback blend. */
-    t8_dir(t8_fine + (size_t)0 * LCM_D, T8_PI / 2.0f, 1.0f);   /* +e1 */
-    t8_dir(t8_fine + (size_t)1 * LCM_D, -T8_PI / 2.0f, 1.0f);  /* -e1 */
+    /* Fine prototypes at -0.75 and 0.0. Hard and fallback route different
+     * fine winners (hard residual points ~-0.57/-0.93; the blend residual
+     * points ~0), so the two branch outputs are distinguishable by >1e-3. */
+    t8_dir(t8_fine + (size_t)0 * LCM_D, -0.75f, 1.0f);
+    t8_dir(t8_fine + (size_t)1 * LCM_D, 0.0f, 1.0f);
+
+    float z[LCM_D];
+    t8_dir(z, 0.0f, 1.0f);
+    hrq_mem_t m = t8_hrq_mem(NULL, NULL);
+    float out_def[LCM_D], out_hard[LCM_D], out_soft[LCM_D];
+    int idx = -1;
+
+    /* Case A: sim1≈1.90, sim2≈2.04. Absolute gap 0.14 > tau, but the
+     * relative gap 0.074 < tau ⇒ must fallback. Old absolute-gap logic
+     * would classify this as hard. */
+    t8_dir(t8_top + (size_t)0 * LCM_D, 0.78f, 1.0f);
+    t8_dir(t8_top + (size_t)1 * LCM_D, -0.81f, 1.0f);
+    t8_dir(t8_top + (size_t)2 * LCM_D, T8_PI, 1.0f);
+    t8_dir(t8_top + (size_t)3 * LCM_D, T8_PI, 1.0f);
+    float s0 = t8_hrq_sim(z, t8_top);
+    float s1 = t8_hrq_sim(z, t8_top + (size_t)1 * LCM_D);
+    CHECK(s1 - s0 > 0.1f,
+          "gap A: absolute difference exceeds tau");
+    CHECK((s1 - s0) / s0 < 0.1f,
+          "gap A: relative difference is below tau");
+
+    CHECK(hrq_forward_v31(z, &m, 1.0f, 2, 0.1f, out_def, &idx, NULL) == 0,
+          "gap A: default call succeeds");
+    CHECK(idx == 0, "gap A: idx stays the geometric top-1");
+    CHECK(hrq_forward_v31(z, &m, 1.0f, 2, 0.0f, out_hard, NULL, NULL) == 0,
+          "gap A: forced-hard call succeeds");
+    CHECK(hrq_forward_v31(z, &m, 1.0f, 2, 1e9f, out_soft, NULL, NULL) == 0,
+          "gap A: forced-fallback call succeeds");
+    CHECK(t8_max_abs_diff(out_hard, out_soft) > 1e-3f,
+          "gap A: hard and fallback outputs are distinguishable");
+    CHECK(t8_max_abs_diff(out_def, out_soft) < 1e-6f,
+          "gap A: relative gap < tau selects the fallback output");
+    CHECK(t8_max_abs_diff(out_def, out_hard) > 1e-3f,
+          "gap A: fallback output differs from the hard top-1 output");
+
+    /* Case B: sim1≈0.50, sim2≈0.56. Absolute gap 0.06 < tau, but the
+     * relative gap 0.12 > tau ⇒ must hard. Old absolute-gap logic would
+     * classify this as fallback. */
+    t8_dir(t8_top + (size_t)0 * LCM_D, 0.195f, 1.0f);
+    t8_dir(t8_top + (size_t)1 * LCM_D, -0.2138f, 1.0f);
+    t8_dir(t8_top + (size_t)2 * LCM_D, T8_PI, 1.0f);
+    t8_dir(t8_top + (size_t)3 * LCM_D, T8_PI, 1.0f);
+    s0 = t8_hrq_sim(z, t8_top);
+    s1 = t8_hrq_sim(z, t8_top + (size_t)1 * LCM_D);
+    CHECK(s1 - s0 < 0.1f,
+          "gap B: absolute difference is below tau");
+    CHECK((s1 - s0) / s0 > 0.1f,
+          "gap B: relative difference exceeds tau");
+
+    idx = -1;
+    CHECK(hrq_forward_v31(z, &m, 1.0f, 2, 0.1f, out_def, &idx, NULL) == 0,
+          "gap B: default call succeeds");
+    CHECK(idx == 0, "gap B: idx stays the geometric top-1");
+    CHECK(hrq_forward_v31(z, &m, 1.0f, 2, 0.0f, out_hard, NULL, NULL) == 0,
+          "gap B: forced-hard call succeeds");
+    CHECK(hrq_forward_v31(z, &m, 1.0f, 2, 1e9f, out_soft, NULL, NULL) == 0,
+          "gap B: forced-fallback call succeeds");
+    CHECK(t8_max_abs_diff(out_hard, out_soft) > 1e-3f,
+          "gap B: hard and fallback outputs are distinguishable");
+    CHECK(t8_max_abs_diff(out_def, out_hard) < 1e-6f,
+          "gap B: relative gap > tau selects the hard output");
+    CHECK(t8_max_abs_diff(out_def, out_soft) > 1e-3f,
+          "gap B: hard output differs from the fallback output");
+}
+
+static void test_hrq_v31_tie_break(void) {
+    /* Two bit-identical prototypes: stable top-k/argmin must keep the first
+     * occurrence (JAX argsort/argmin first-seen order). */
+    t8_zero(t8_top, T8_HRQ_M * LCM_D);
+    t8_dir(t8_top, 0.0f, 0.7f);
+    memcpy(t8_top + (size_t)LCM_D, t8_top, sizeof(float) * LCM_D);
+    t8_dir(t8_top + (size_t)2 * LCM_D, 1.5f, 0.7f);
+    t8_dir(t8_top + (size_t)3 * LCM_D, 2.5f, 0.7f);
+    t8_zero(t8_fine, T8_FINE_M * LCM_D);
+
+    float z[LCM_D];
+    t8_dir(z, 0.0f, 1.0f);
+    hrq_mem_t m = t8_hrq_mem(NULL, NULL);
+    m.n_fine = 0;
+
+    float out[LCM_D];
+    int idx = -1;
+    CHECK(hrq_forward_v31(z, &m, 1.0f, 3, 0.1f, out, &idx, NULL) == 0
+              && idx == 0,
+          "tie: k=3 keeps the first of two equal prototypes");
+    idx = -1;
+    CHECK(hrq_forward_v31(z, &m, 1.0f, 2, 0.1f, out, &idx, NULL) == 0
+              && idx == 0,
+          "tie: k=2 keeps the first of two equal prototypes");
+}
+
+static void test_hrq_v31_value_fine(void) {
+    /* M_top == 1 (fallback blend == c_top). The fine layer is symmetric
+     * around the residual, so v=0 ties and picks row 0 (+0.5); a positive
+     * value on row 1 must flip the winner (R22 shared fine vector). */
+    static float top1[LCM_D];
+    t8_dir(top1, 0.0f, 0.4f);
+    t8_dir(t8_fine + (size_t)0 * LCM_D, 0.5f, 1.0f);
+    t8_dir(t8_fine + (size_t)1 * LCM_D, -0.5f, 1.0f);
+    t8_zero(t8_top, T8_HRQ_M * LCM_D);   /* unused beyond M_top == 1 */
 
     float z[LCM_D];
     t8_dir(z, 0.0f, 1.0f);
     float out[LCM_D];
     int idx = -1;
 
-    /* Fallback: prototypes ±0.1 are symmetric about z ⇒ gap == 0 < τ. The
-     * blend is radial, so the fine layer keeps prototype 0 (+e1) and the
-     * output points along -e1. */
-    t8_dir(t8_top + (size_t)0 * LCM_D, 0.1f, 1.0f);
-    t8_dir(t8_top + (size_t)1 * LCM_D, -0.1f, 1.0f);
-    t8_dir(t8_top + (size_t)2 * LCM_D, 2.0f, 1.0f);
-    t8_dir(t8_top + (size_t)3 * LCM_D, -2.0f, 1.0f);
+    hrq_mem_t m;
+    memset(&m, 0, sizeof(m));
+    m.C_top = top1;
+    m.M_top = 1;
+    m.C_fine = t8_fine;
+    m.M_fine = T8_FINE_M;
+    m.n_fine = 1;
+    m.value_top = NULL;
+    m.value_fine = NULL;
+
+    CHECK(hrq_forward_v31(z, &m, 2.0f, 1, 0.1f, out, &idx, NULL) == 0
+              && idx == 0,
+          "value_fine: baseline call succeeds");
+    CHECK(out[1] < -0.1f,
+          "value_fine: v=0 tie picks fine row 0 (+0.5)");
+
+    float v_fine[T8_FINE_M] = {0.0f, 1.0f};
+    m.value_fine = v_fine;
+    idx = -1;
+    CHECK(hrq_forward_v31(z, &m, 2.0f, 1, 0.1f, out, &idx, NULL) == 0
+              && idx == 0,
+          "value_fine: top-1 is unchanged");
+    CHECK(out[1] > 0.1f,
+          "value_fine: high value on row 1 flips the fine winner");
+}
+
+static void test_hrq_v31_boundaries(void) {
+    t8_zero(t8_top, T8_HRQ_M * LCM_D);
+    t8_dir(t8_top, 0.0f, 1.0f);
+    t8_dir(t8_top + (size_t)LCM_D, 1.0f, 1.0f);
+    t8_zero(t8_fine, T8_FINE_M * LCM_D);
+
+    float z[LCM_D];
+    t8_dir(z, 0.2f, 1.0f);
+    float out[LCM_D];
+    int idx = -1;
 
     hrq_mem_t m = t8_hrq_mem(NULL, NULL);
-    CHECK(hrq_forward_v31(z, &m, 1.0f, 2, 0.1f, out, &idx, NULL) == 0,
-          "relative gap: fallback call succeeds");
-    CHECK(idx == 0, "relative gap: fallback keeps the geometric top-1 in idx");
-    CHECK(out[1] < -0.05f,
-          "relative gap 0 < tau -> fallback blend (fine picks +e1)");
+    m.M_top = 2;
+    m.n_fine = 0;
 
-    /* Hard: prototype 0 is alone near z (gap ≈ 185 > τ), so the fine layer
-     * sees -e1 and the output points along +e1. */
-    t8_dir(t8_top + (size_t)0 * LCM_D, 0.1f, 1.0f);
-    t8_dir(t8_top + (size_t)1 * LCM_D, -1.5f, 1.0f);
-    t8_dir(t8_top + (size_t)2 * LCM_D, 2.3f, 1.0f);
-    t8_dir(t8_top + (size_t)3 * LCM_D, 2.9f, 1.0f);
-    idx = -1;
-    CHECK(hrq_forward_v31(z, &m, 1.0f, 2, 0.1f, out, &idx, NULL) == 0,
-          "relative gap: hard call succeeds");
-    CHECK(idx == 0, "relative gap: hard route selects prototype 0");
-    CHECK(out[1] > 0.05f,
-          "relative gap >> tau -> hard route (fine picks -e1)");
+    CHECK(hrq_forward_v31(z, &m, 1.0f, LCM_HRQ_MAX_TOPK + 1, 0.1f,
+                          out, &idx, NULL) == 0 && idx == 0,
+          "hrq: value_topk > cap is clamped, not rejected");
+    int finite = 1;
+    for (int i = 0; i < LCM_D; i++) if (!isfinite(out[i])) finite = 0;
+    CHECK(finite, "hrq: n_fine=0 produces a finite output");
+
+    m.M_top = 0;
+    CHECK(hrq_forward_v31(z, &m, 1.0f, 2, 0.1f, out, &idx, NULL) == -1,
+          "hrq: M_top=0 is rejected");
+
+    m.M_top = 2;
+    m.n_fine = 1;
+    m.C_fine = NULL;
+    CHECK(hrq_forward_v31(z, &m, 1.0f, 2, 0.1f, out, &idx, NULL) == -1,
+          "hrq: n_fine>0 without C_fine is rejected");
+
+    m.n_fine = 0;
+    m.C_fine = t8_fine;
+    CHECK(hrq_forward_v31(z, &m, 1.0f, 0, 0.1f, out, &idx, NULL) == -1,
+          "hrq: value_topk<=0 is rejected");
+}
+
+/* Shared sparse setup: C0=+0.7e0, C1=+0.7e1, C2=-0.7e2; zero_vec has a
+ * sentinel in e3 so the LFQ copy is observable. */
+static void t8_sparse_setup(sparse_mem_t* m) {
+    t8_zero(t8_sparse_C, T8_SPARSE_M * LCM_D);
+    t8_zero(t8_sparse_zero, LCM_D);
+    t8_sparse_zero[3] = 0.25f;
+    t8_sparse_C[0] = 0.7f;
+    t8_sparse_C[(size_t)1 * LCM_D + 1] = 0.7f;
+    t8_sparse_C[(size_t)2 * LCM_D + 2] = -0.7f;
+
+    memset(m, 0, sizeof(*m));
+    m->C = t8_sparse_C;
+    m->M = T8_SPARSE_M;
+    m->zero_vec = t8_sparse_zero;
 }
 
 static void test_sparse_lfq(void) {
-    t8_zero(t8_sparse_C, T8_SPARSE_M * LCM_D);
-    t8_zero(t8_sparse_zero, LCM_D);
-    t8_sparse_zero[2] = 0.25f;   /* sentinel: LFQ must copy zero_vec verbatim */
-
-    t8_sparse_C[0] = 0.7f;                              /* C0 = +0.7 e0 */
-    t8_sparse_C[(size_t)1 * LCM_D + 1] = -0.7f;         /* C1 = -0.7 e1 */
-    t8_sparse_C[(size_t)2 * LCM_D + 2] = 0.7f;          /* C2 = +0.7 e2 */
-
     sparse_mem_t m;
-    memset(&m, 0, sizeof(m));
-    m.C = t8_sparse_C;
-    m.M = T8_SPARSE_M;
-    m.zero_vec = t8_sparse_zero;
+    t8_sparse_setup(&m);
 
     float z[LCM_D];
     t8_zero(z, LCM_D);
-    z[0] = 0.7f;                 /* Euclidean-nearest code is C0 */
+    z[0] = 0.6f;                 /* offset from C0, nearest code is C0 */
     float out[LCM_D];
     int idx = -1;
 
     /* d_min ≈ 0.185 < 1.5·0.2: keep the non-zero code. */
-    CHECK(sparse_forward_c(z, &m, 1.5f, 0.2f, 0, out, &idx) == 0 && idx == 1,
+    CHECK(sparse_forward_c(z, &m, 1.5f, 0.0f, 0.2f, 0, out, &idx) == 0
+              && idx == 1,
           "sparse: d_min < lambda*d_top -> non-zero idx (1 = C[0])");
     CHECK(fabsf(out[0] - 0.7f) < 1e-6f,
           "sparse: non-zero output is the retrieved C row");
 
     /* Same input/codebook, smaller d_top: d_min > 1.5·0.05 -> zero_vec. */
     idx = -1;
-    CHECK(sparse_forward_c(z, &m, 1.5f, 0.05f, 0, out, &idx) == 0 && idx == 0,
+    CHECK(sparse_forward_c(z, &m, 1.5f, 0.0f, 0.05f, 0, out, &idx) == 0
+              && idx == 0,
           "sparse: d_min > lambda*d_top at 1.5 -> zero idx 0");
-    CHECK(out[2] == 0.25f && out[0] == 0.0f && out[1] == 0.0f,
+    CHECK(out[3] == 0.25f && out[0] == 0.0f && out[1] == 0.0f
+              && out[2] == 0.0f,
           "sparse: LFQ emits zero_vec verbatim");
 
-    /* Training disables LFQ: retrieval is over C only, idx is 0-based. */
+    /* Training disables LFQ at a d_top that fires in inference. */
     idx = -1;
-    CHECK(sparse_forward_c(z, &m, 1.5f, 0.0f, 1, out, &idx) == 0 && idx == 0,
-          "sparse: training=1 disables LFQ (0-based C index)");
+    CHECK(sparse_forward_c(z, &m, 1.5f, 0.0f, 0.05f, 1, out, &idx) == 0
+              && idx == 0,
+          "sparse: training=1 disables LFQ at a firing d_top");
     CHECK(fabsf(out[0] - 0.7f) < 1e-6f,
           "sparse: training output is the retrieved C row");
 
     /* d_top <= 0 is the "HRQ did not activate" signal. */
     idx = -1;
-    CHECK(sparse_forward_c(z, &m, 1.5f, 0.0f, 0, out, &idx) == 0 && idx == 1,
+    CHECK(sparse_forward_c(z, &m, 1.5f, 0.0f, 0.0f, 0, out, &idx) == 0
+              && idx == 1,
           "sparse: d_top<=0 disables LFQ");
     idx = -1;
-    CHECK(sparse_forward_c(z, &m, 1.5f, -0.5f, 0, out, &idx) == 0 && idx == 1,
+    CHECK(sparse_forward_c(z, &m, 1.5f, 0.0f, -0.5f, 0, out, &idx) == 0
+              && idx == 1,
           "sparse: negative d_top disables LFQ");
 
     /* A large lambda_lfq lifts the threshold above d_min. */
     idx = -1;
-    CHECK(sparse_forward_c(z, &m, 100.0f, 0.05f, 0, out, &idx) == 0 && idx == 1,
+    CHECK(sparse_forward_c(z, &m, 100.0f, 0.0f, 0.05f, 0, out, &idx) == 0
+              && idx == 1,
           "sparse: lambda_lfq scales the LFQ threshold");
+
+    /* zero_vec can win the Euclidean argmin on its own; when LFQ is off the
+     * joint retrieval result must be kept (JAX inference parity). */
+    float z0[LCM_D];
+    t8_zero(z0, LCM_D);
+    z0[0] = 0.05f;
+    idx = -1;
+    CHECK(sparse_forward_c(z0, &m, 1.5f, 0.0f, 0.5f, 0, out, &idx) == 0
+              && idx == 0,
+          "sparse: zero_vec Euclidean winner kept when LFQ is off");
+    CHECK(out[3] == 0.25f && out[0] == 0.0f,
+          "sparse: zero-argmin output is zero_vec");
+}
+
+static void test_sparse_value_bias(void) {
+    sparse_mem_t m;
+    t8_sparse_setup(&m);
+    float v[T8_SPARSE_M] = {-1.0f, 1.0f, 0.0f};
+    m.value = v;
+
+    float z[LCM_D];
+    t8_zero(z, LCM_D);
+    z[0] = 0.6f;
+    float out[LCM_D];
+    int idx = -1;
+
+    /* Euclidean winner is C0 (idx 1). Value rescoring over
+     * [zero, C0, C1, C2] with alpha=2 makes C1 (idx 2) the argmax. */
+    CHECK(sparse_forward_c(z, &m, 1.5f, 0.0f, 0.2f, 0, out, &idx) == 0
+              && idx == 1,
+          "sparse value: alpha=0 keeps the Euclidean winner");
+    idx = -1;
+    CHECK(sparse_forward_c(z, &m, 1.5f, 2.0f, 0.2f, 0, out, &idx) == 0
+              && idx == 2,
+          "sparse value: alpha>0 overrides Euclidean with C1 (idx 2)");
+    CHECK(fabsf(out[1] - 0.7f) < 1e-6f && out[0] == 0.0f,
+          "sparse value: biased output is C1");
+
+    /* Training uses C only (no zero_vec, 0-based idx). */
+    idx = -1;
+    CHECK(sparse_forward_c(z, &m, 1.5f, 2.0f, 0.0f, 1, out, &idx) == 0
+              && idx == 1,
+          "sparse value: training picks C1 (0-based idx 1)");
+    CHECK(fabsf(out[1] - 0.7f) < 1e-6f,
+          "sparse value: training output is C1");
+
+    /* LFQ remains independent of the value path. */
+    idx = -1;
+    CHECK(sparse_forward_c(z, &m, 1.5f, 2.0f, 0.05f, 0, out, &idx) == 0
+              && idx == 0,
+          "sparse value: LFQ still overrides a value-biased idx");
+}
+
+static void test_sparse_boundaries(void) {
+    sparse_mem_t m;
+    t8_sparse_setup(&m);
+    float z[LCM_D];
+    t8_zero(z, LCM_D);
+    float out[LCM_D];
+    int idx = -1;
+
+    m.M = 0;
+    CHECK(sparse_forward_c(z, &m, 1.5f, 0.0f, 0.0f, 0, out, &idx) == -1,
+          "sparse: M=0 is rejected");
+    m.M = T8_SPARSE_M;
+    m.C = NULL;
+    CHECK(sparse_forward_c(z, &m, 1.5f, 0.0f, 0.0f, 0, out, &idx) == -1,
+          "sparse: NULL C is rejected");
+    m.C = t8_sparse_C;
+    m.zero_vec = NULL;
+    CHECK(sparse_forward_c(z, &m, 1.5f, 0.0f, 0.0f, 0, out, &idx) == -1,
+          "sparse: inference without zero_vec is rejected");
 }
 
 static void test_routing_hard(void) {
@@ -803,22 +1091,25 @@ static void test_routing_hard(void) {
     t8_route_C[(size_t)1 * LCM_D + 1] = 0.5f;   /* C1 = 0.5 e1 */
     t8_route_C[(size_t)2 * LCM_D + 2] = 0.5f;   /* C2 = 0.5 e2 */
 
-    /* z near C1 => z_route = 0.5 e1, logits[j] = 0.5·W[1][j]. */
+    /* z_route must be C_route[idx], not z: with z=(0.03,0.47,0.02) the raw
+     * logits are {3.47, 0, -2.06} (argmax 0) while C1=(0,0.5,0) gives
+     * {0.5, 0, 1.0} (argmax 2). */
     t8_route_W[(size_t)1 * T8_NLAT + 0] = 1.0f;
     t8_route_W[(size_t)1 * T8_NLAT + 1] = 0.0f;
     t8_route_W[(size_t)1 * T8_NLAT + 2] = 2.0f;   /* argmax = 2 */
-    /* z near C0 => z_route = 0.5 e0, logits[j] = 0.5·W[0][j]. */
-    t8_route_W[0 * T8_NLAT + 0] = 5.0f;           /* argmax = 0 */
-    t8_route_W[0 * T8_NLAT + 1] = 1.0f;
-    t8_route_W[0 * T8_NLAT + 2] = 2.0f;
+    t8_route_W[0 * T8_NLAT + 0] = 100.0f;         /* wrong-z path: argmax 0 */
+    t8_route_W[0 * T8_NLAT + 1] = 0.0f;
+    t8_route_W[0 * T8_NLAT + 2] = -100.0f;
 
     float z[LCM_D];
     t8_zero(z, LCM_D);
-    z[1] = 0.5f;
+    z[0] = 0.03f;
+    z[1] = 0.47f;
+    z[2] = 0.02f;                 /* nearest row is still C1 */
     float mask[T8_NLAT];
     routing_gate_c(z, t8_route_C, t8_route_W, T8_NLAT, mask);
     CHECK(mask[0] == 0.0f && mask[1] == 0.0f && mask[2] == 1.0f,
-          "routing hard: one-hot argmax logits (index 2)");
+          "routing hard: one-hot argmax of C_route[idx] (index 2)");
 
     float mask2[T8_NLAT];
     routing_gate_c(z, t8_route_C, t8_route_W, T8_NLAT, mask2);
@@ -826,10 +1117,33 @@ static void test_routing_hard(void) {
           "routing hard: deterministic across calls (no Gumbel noise)");
 
     t8_zero(z, LCM_D);
-    z[0] = 0.5f;
+    z[0] = 0.47f;
+    z[1] = 0.03f;
+    z[2] = 0.02f;                 /* nearest row is C0 */
     routing_gate_c(z, t8_route_C, t8_route_W, T8_NLAT, mask);
     CHECK(mask[0] == 1.0f && mask[1] == 0.0f && mask[2] == 0.0f,
           "routing hard: nearest C row changes the argmax (index 0)");
+}
+
+static void test_routing_invalid(void) {
+    float z[LCM_D];
+    t8_zero(z, LCM_D);
+    z[1] = 0.5f;
+
+    /* n_lattices > LCM_MAX_LATTICES must be rejected and the output cleared
+     * (up to the cap) instead of reading past C_route. */
+    float mask[LCM_MAX_LATTICES + 1];
+    for (int i = 0; i <= LCM_MAX_LATTICES; i++) mask[i] = 1.0f;
+    routing_gate_c(z, t8_route_C, t8_route_W, LCM_MAX_LATTICES + 1, mask);
+    int cleared = 1;
+    for (int i = 0; i < LCM_MAX_LATTICES; i++)
+        if (mask[i] != 0.0f) cleared = 0;
+    CHECK(cleared, "routing invalid: n_lattices > cap is rejected and cleared");
+
+    /* NULL mask and n_lattices <= 0 must not crash. */
+    routing_gate_c(z, t8_route_C, t8_route_W, T8_NLAT, NULL);
+    routing_gate_c(z, t8_route_C, t8_route_W, 0, mask);
+    CHECK(1, "routing invalid: NULL mask / n<=0 do not crash");
 }
 
 static void test_hrr_no_overwrite(void) {
@@ -896,10 +1210,17 @@ int main(void) {
     test_bridge_uses_projected_anchors();
     test_memory_v3_layout();
     test_hrq_v31_poincare_top1();
+    test_hrq_v31_poincare_vs_euclidean();
     test_hrq_v31_value_topk();
     test_hrq_v31_relative_gap();
+    test_hrq_v31_tie_break();
+    test_hrq_v31_value_fine();
+    test_hrq_v31_boundaries();
     test_sparse_lfq();
+    test_sparse_value_bias();
+    test_sparse_boundaries();
     test_routing_hard();
+    test_routing_invalid();
     test_hrr_no_overwrite();
     test_fusion_l2_weights();
     if (failures == 0)

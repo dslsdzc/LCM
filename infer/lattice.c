@@ -94,7 +94,7 @@ static void hrq_fine_pick(const hrq_mem_t* m, int l, const float* r,
         scale = sum / (float)m->M_fine + 1e-6f;
     }
 
-    float best = 1e20f;
+    float best = INFINITY;
     int best_j = 0;
     for (int j = 0; j < m->M_fine; j++) {
         exp_map_c(layer + (size_t)j * LCM_D, c_p, LCM_D, 1.0f);
@@ -135,7 +135,7 @@ int hrq_forward_v31(const float* z, const hrq_mem_t* m, float alpha_val,
     if (value_topk <= 0) return -1;
 
     int k = value_topk < m->M_top ? value_topk : m->M_top;
-    if (k > LCM_HRQ_MAX_TOPK) return -1;
+    if (k > LCM_HRQ_MAX_TOPK) k = LCM_HRQ_MAX_TOPK;
 
     vec_t z_u, z_P, c_p, c_top, c_top_w, acc;
     safe_unit_c(z, z_u, LCM_D, 1e-8f);
@@ -147,7 +147,7 @@ int hrq_forward_v31(const float* z, const hrq_mem_t* m, float alpha_val,
     float k_sim[LCM_HRQ_MAX_TOPK];
     float k_score[LCM_HRQ_MAX_TOPK];
     int n_top = 0;
-    float min1 = 1e20f, min2 = 1e20f, sum_sim = 0.0f;
+    float min1 = INFINITY, min2 = INFINITY, sum_sim = 0.0f;
 
     for (int j = 0; j < m->M_top; j++) {
         exp_map_c(m->C_top + (size_t)j * LCM_D, c_p, LCM_D, 1.0f);
@@ -157,7 +157,7 @@ int hrq_forward_v31(const float* z, const hrq_mem_t* m, float alpha_val,
         else if (s < min2) { min2 = s; }
         hrq_topk_insert(k_idx, k_sim, k, &n_top, j, s);
     }
-    if (n_top != k) return -1;
+    assert(n_top == k);
 
     /* Stage 2: value rescoring inside the top-k only. */
     float scale = sum_sim / (float)m->M_top + 1e-6f;
@@ -201,7 +201,8 @@ int hrq_forward_v31(const float* z, const hrq_mem_t* m, float alpha_val,
     return 0;
 }
 
-/* Thin wrapper for the v2 bridge: v = 0, k = config default 4. */
+/* Thin wrapper for the v2 bridge: D must be LCM_D, v = 0, k = 4 (the
+ * hrq_value_topk default) or M_top when smaller. */
 int hrq_forward_c(const float* z, int D,
                   const float* top_C, int M_top,
                   const float* fine_C, int M_fine, int n_fine,
@@ -221,26 +222,59 @@ int hrq_forward_c(const float* z, int D,
 /* ─── Sparse: training/inference split + LFQ (R2) ────────────────────────── */
 
 int sparse_forward_c(const float* z, const sparse_mem_t* m, float lambda_lfq,
-                     float d_top, int training, float* out, int* idx) {
+                     float alpha_val, float d_top, int training,
+                     float* out, int* idx) {
     if (!z || !m || !m->C || m->M <= 0 || !out) return -1;
     if (!training && !m->zero_vec) return -1;
 
-    /* Euclidean retrieval (b.md §4.2). Inference prepends zero_vec, so its
-     * index space is 0 = zero_vec, j+1 = C[j]; training is C-only. */
+    /* Retrieval (b.md §4.2). Inference prepends zero_vec, so its index space
+     * is 0 = zero_vec, j+1 = C[j]; training is C-only. With a value vector
+     * and alpha_val > 0 this is JAX's value-biased argmax instead. */
     int n_search = training ? m->M : m->M + 1;
     int offset = training ? 0 : 1;
     int best = 0;
-    float best_d2 = 1e20f;
-    for (int j = 0; j < n_search; j++) {
-        const float* row = (j == 0 && offset == 1)
-                               ? m->zero_vec
-                               : m->C + (size_t)(j - offset) * LCM_D;
-        float d2 = 0.0f;
-        for (int i = 0; i < LCM_D; i++) {
-            float diff = z[i] - row[i];
-            d2 += diff * diff;
+
+    if (alpha_val > 0.0f && m->value != NULL) {
+        float sum_d2 = 0.0f;
+        for (int j = 0; j < n_search; j++) {
+            const float* row = (j == 0 && offset == 1)
+                                   ? m->zero_vec
+                                   : m->C + (size_t)(j - offset) * LCM_D;
+            for (int i = 0; i < LCM_D; i++) {
+                float diff = z[i] - row[i];
+                sum_d2 += diff * diff;
+            }
         }
-        if (d2 < best_d2) { best_d2 = d2; best = j; }
+        float avg_d2 = sum_d2 / (float)n_search;
+
+        /* score = -dist² + alpha·tanh(v)·avg_dist²; zero_vec has v = 0. */
+        float best_score = -INFINITY;
+        for (int j = 0; j < n_search; j++) {
+            const float* row = (j == 0 && offset == 1)
+                                   ? m->zero_vec
+                                   : m->C + (size_t)(j - offset) * LCM_D;
+            float d2 = 0.0f;
+            for (int i = 0; i < LCM_D; i++) {
+                float diff = z[i] - row[i];
+                d2 += diff * diff;
+            }
+            float v = (j == 0 && offset == 1) ? 0.0f : m->value[j - offset];
+            float score = -d2 + alpha_val * tanhf(v) * avg_d2;
+            if (score > best_score) { best_score = score; best = j; }
+        }
+    } else {
+        float best_d2 = INFINITY;
+        for (int j = 0; j < n_search; j++) {
+            const float* row = (j == 0 && offset == 1)
+                                   ? m->zero_vec
+                                   : m->C + (size_t)(j - offset) * LCM_D;
+            float d2 = 0.0f;
+            for (int i = 0; i < LCM_D; i++) {
+                float diff = z[i] - row[i];
+                d2 += diff * diff;
+            }
+            if (d2 < best_d2) { best_d2 = d2; best = j; }
+        }
     }
 
     /* LFQ (inference only, R2/C-5). d_top <= 0 means HRQ did not activate,
@@ -250,7 +284,7 @@ int sparse_forward_c(const float* z, const sparse_mem_t* m, float lambda_lfq,
         safe_unit_c(z, z_u, LCM_D, 1e-8f);
         exp_map_c(z_u, z_P, LCM_D, 1.0f);
 
-        float d_min = 1e20f;
+        float d_min = INFINITY;
         for (int j = 0; j < m->M; j++) {
             const float* row = m->C + (size_t)j * LCM_D;
             float norm2 = 0.0f;
@@ -279,10 +313,19 @@ int sparse_forward_c(const float* z, const sparse_mem_t* m, float lambda_lfq,
 
 void routing_gate_c(const float* z, const float* C_route, const float* W_route,
                     int n_lattices, float* soft_mask) {
-    if (!z || !C_route || !W_route || !soft_mask || n_lattices <= 0) return;
+    if (!soft_mask) return;
+    if (!z || !C_route || !W_route || n_lattices <= 0
+        || n_lattices > LCM_MAX_LATTICES) {
+        if (n_lattices > 0) {
+            int n = n_lattices < LCM_MAX_LATTICES
+                        ? n_lattices : LCM_MAX_LATTICES;
+            memset(soft_mask, 0, (size_t)n * sizeof(float));
+        }
+        return;
+    }
 
     int best_c = 0;
-    float best_d2 = 1e20f;
+    float best_d2 = INFINITY;
     for (int j = 0; j < n_lattices; j++) {
         const float* row = C_route + (size_t)j * LCM_D;
         float d2 = 0.0f;
@@ -296,7 +339,7 @@ void routing_gate_c(const float* z, const float* C_route, const float* W_route,
     /* logits = W_route^T z_route, W_route is [D][n_lattices]. */
     const float* z_route = C_route + (size_t)best_c * LCM_D;
     int best_l = 0;
-    float best_logit = -1e20f;
+    float best_logit = -INFINITY;
     for (int l = 0; l < n_lattices; l++) {
         float logit = 0.0f;
         for (int i = 0; i < LCM_D; i++)
