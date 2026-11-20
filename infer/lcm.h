@@ -50,6 +50,10 @@ extern "C" {
 #ifndef LCM_HRQ_MAX_TOPK
 #define LCM_HRQ_MAX_TOPK   1024  /* Stack cap for R1's value-rescoring top-k */
 #endif
+#ifndef LCM_MAX_BIND_LAYERS
+#define LCM_MAX_BIND_LAYERS 8    /* Stack cap for binding's per-layer HRR rows
+                                  * (the spec's RVQ_3layer needs 3) */
+#endif
 
 /* Derived constants */
 #define LCM_CONSISTENCY_THRESHOLD 0.3f
@@ -197,10 +201,11 @@ typedef struct {
 
 typedef struct {
     const float* key_cb;     /* [n_layers][M][D] */
-    const float* val_cb;     /* [n_layers][M][D] */
+    const float* val_cb;     /* [n_layers][M][D] (the concatenated C_val) */
     const float* bind_cb;    /* [n_layers][M][D] */
     int          M;
-    int          n_layers;
+    int          n_layers;   /* ≤ LCM_MAX_BIND_LAYERS */
+    int          r_max;      /* shared low-rank basis rank; A_k/A_v are [r_max][D] */
     const float* A_k;        /* [r_max][D] HRR key projection */
     const float* A_v;        /* [r_max][D] HRR value projection */
     const float* value_key;  /* [M], optional */
@@ -395,7 +400,9 @@ int  lcm_dim(void);
  * Copies the seven per-lattice descriptors and validates them:
  *   - D must equal LCM_D (a .so built for another dimension is rejected),
  *   - 1 ≤ n_lattices ≤ LCM_MAX_LATTICES and fusion.n_lattices must match,
- *   - every required pointer is non-NULL and every layer count/rank is valid.
+ *   - every required pointer is non-NULL and every layer count/rank is valid,
+ *   - binding.n_layers ≤ LCM_MAX_BIND_LAYERS and binding.r_max equals
+ *     lowrank.r_max (V is the shared low-rank basis).
  * Optional pointers (value scalars, EMA state) may be NULL.
  *
  * No allocation, no JSON, no file I/O. Returns 0 on success, -1 on a bad
@@ -491,6 +498,64 @@ int sparse_forward_c(const float* z, const sparse_mem_t* m, float lambda_lfq,
  */
 void routing_gate_c(const float* z, const float* C_route, const float* W_route,
                     int n_lattices, float* soft_mask);
+
+/* LowRank v3 — R10 conformant forward (b.md §4.3, JAX lowrank_forward).
+ *
+ *   V is the shared basis [D][r_max]; layer k's codebook is
+ *   C_k = U_k @ V[:, :ranks[k]]^T. Residual chain:
+ *   r = z; c_k = C_k[argmin ||r - C_k||²]; out += c_k; r -= c_k.
+ *   idx[k] receives layer k's selected row (caller array of n_layers ints).
+ *
+ * When alpha_val > 0 and m->value is present the selection is JAX's R22
+ * value-biased score over the same residual input:
+ *   score_j = -||r - C_k[j]||² + alpha_val·tanh(v_j)·mean_j(||r - C_k[j]||²),
+ *   idx = argmax(score) (first occurrence on ties). value is shared by all rank
+ * layers. Invalid descriptors zero out/idx (void signature). No allocation
+ * beyond fixed-size stack scratch.
+ */
+void lowrank_forward_c(const float* z, const lowrank_mem_t* m, float alpha_val,
+                       float* out, int* idx);
+
+/* Manifold v3 — R10 conformant forward (b.md §4.4).
+ *
+ *   z_P = exp_map(safe_unit(z))                      (R6 domain)
+ *   idx = argmin_j poincare_similarity(z_P, exp_map(C[j]))
+ *   r = z_P - exp_map(C[idx]); proj = T_idx @ T_idx^T @ r
+ *   out = log_map(exp_map(C[idx]) + proj)
+ * idx is optional (one int). With alpha_val > 0 and m->value present the
+ * retrieval follows JAX's value_biased_retrieve(z, C, ..., C_out=C_P): the
+ * score is the tangent-space Euclidean one, then the selected row is pushed
+ * through exp_map before the projection. No allocation.
+ */
+void manifold_forward_c(const float* z, const manifold_mem_t* m,
+                        float alpha_val, float* out, int* idx);
+
+/* Contrast v3 — R10 conformant forward (b.md §4.6).
+ *
+ * Two independent residual VQ chains from z over C_a and C_b:
+ *   o_a = Σ_k a_k, o_b = Σ_k b_k, out = (o_a + o_b)/2.
+ * Each family has its own R22 vector (value_a/value_b, shared across its
+ * layers) applied when alpha_val > 0. Invalid descriptors zero out.
+ */
+void contrast_forward_c(const float* z, const contrast_mem_t* m,
+                        float alpha_val, float* out);
+
+/* Binding v3 — R20 conformant forward (b.md §4.5, JAX binding_forward).
+ *
+ *   t = V^T z; z_k = A_k^T t; z_v = A_v^T t      (W_k=V@A_k, z_k=z@W_k^T)
+ *   three-layer residual VQ over key_cb / val_cb  → k_q, v_q
+ *   b_raw = Σ_{i,j} IFFT(norm_fft(k^(i)) ⊙ norm_fft(v^(j)))  (9 pairs)
+ *   b_q   = three-layer residual VQ over bind_cb applied to b_raw
+ *   v_out = nearest row of C_val (= every val_cb layer concatenated)
+ *           to IFFT(conj(norm_fft(k_q)) ⊙ norm_fft(b_q))
+ *   out = v_out
+ *
+ * b_q and k_q are optional outputs (may be NULL) for commitments/EMA/tests.
+ * m->r_max must match the shared V's column count; binding requires D to be a
+ * power of two (the HRR FFT). Invalid descriptors zero out/optional outputs.
+ */
+void binding_forward_c(const float* z, const binding_mem_t* m, const float* V,
+                       float alpha_val, float* out, float* b_q, float* k_q);
 
 /* Lattice retrieval operations */
 void retrieve_single(const float* z, const lattice_memory_t* mem,

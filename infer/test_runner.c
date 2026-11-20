@@ -414,6 +414,7 @@ static void t7_fill(t7_desc_t* d) {
     d->binding.key_cb = t7_bind_key; d->binding.val_cb = t7_bind_val;
     d->binding.bind_cb = t7_bind_bind;
     d->binding.M = T7_M; d->binding.n_layers = T7_NL;
+    d->binding.r_max = T7_R;
     d->binding.A_k = t7_A_k; d->binding.A_v = t7_A_v;
     d->binding.value_key = NULL; d->binding.value_val = NULL;
     d->binding.value_bind = NULL;
@@ -513,6 +514,8 @@ static void test_memory_v3_layout(void) {
               && mem.binding.A_k[0] == 121.0f
               && mem.binding.A_v[0] == 131.0f,
           "binding projections preserved");
+    CHECK(mem.binding.r_max == T7_R,
+          "binding r_max preserved (shared V column count)");
     CHECK(mem.fusion.route_W[0] == 171.0f
               && mem.fusion.alpha[T7_NLAT - 1] == 181.0f
               && mem.fusion.ln_scale[0] == 191.0f
@@ -562,6 +565,19 @@ static void test_memory_v3_layout(void) {
     bad = good;
     bad.binding.n_layers = 0;
     CHECK(t7_bind(&mem, &bad) == -1, "rejects zero binding n_layers");
+
+    bad = good;
+    bad.binding.n_layers = LCM_MAX_BIND_LAYERS + 1;
+    CHECK(t7_bind(&mem, &bad) == -1, "rejects binding n_layers over the cap");
+
+    bad = good;
+    bad.binding.r_max = 0;
+    CHECK(t7_bind(&mem, &bad) == -1, "rejects zero binding r_max");
+
+    bad = good;
+    bad.binding.r_max = T7_R + 1;
+    CHECK(t7_bind(&mem, &bad) == -1,
+          "rejects binding r_max != lowrank r_max (shared V)");
 
     bad = good;
     bad.fusion.alpha = NULL;
@@ -1193,6 +1209,453 @@ static void test_fusion_l2_weights(void) {
           "fusion fixed point ≈ 2.22 (L2 reciprocal weights)");
 }
 
+/* ── v3.1 LowRank / Manifold / Contrast / Binding forwards (task 9) ─────── */
+
+static unsigned int t9_seed;
+
+static float t9_rand(void) {
+    t9_seed = t9_seed * 1664525u + 1013904223u;
+    return (float)((t9_seed >> 8) & 0xFFFFu) / 32768.0f - 1.0f;
+}
+
+/* Deterministic pseudo-random unit vector (HRR recovery is magnitude-blind, so
+ * the codebook rows themselves must be unit-norm for NN retrieval to be
+ * meaningful). */
+static void t9_unit(float* v) {
+    float n2 = 0.0f;
+    for (int i = 0; i < LCM_D; i++) {
+        v[i] = t9_rand();
+        n2 += v[i] * v[i];
+    }
+    float inv = 1.0f / sqrtf(n2);
+    for (int i = 0; i < LCM_D; i++) v[i] *= inv;
+}
+
+static float t9_max_abs_diff(const float* a, const float* b, int n) {
+    float m = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float d = fabsf(a[i] - b[i]);
+        if (d > m) m = d;
+    }
+    return m;
+}
+
+static float t9_cosine(const float* a, const float* b) {
+    float dot = 0.0f, na = 0.0f, nb = 0.0f;
+    for (int i = 0; i < LCM_D; i++) {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    return dot / (sqrtf(na) * sqrtf(nb) + 1e-8f);
+}
+
+/* ── LowRank ────────────────────────────────────────────────────────────── */
+
+static void test_lowrank_multilayer(void) {
+    enum { M = 2, R = 3, L = 3 };
+    static float U[L * M * R];
+    static float V[LCM_D * R];
+    static float z[LCM_D];
+    static float out[LCM_D];
+    int ranks[L] = {1, 2, 3};
+    int idx[L];
+
+    memset(U, 0, sizeof(U));
+    memset(V, 0, sizeof(V));
+    memset(z, 0, sizeof(z));
+
+    /* Shared basis: V = diag(2, 1, 1) in the first three coordinates. */
+    V[0 * R + 0] = 2.0f;
+    V[1 * R + 1] = 1.0f;
+    V[2 * R + 2] = 1.0f;
+
+    /* C_k = U_k @ V[:, :r_k]^T.
+     * layer 0 (rank 1): rows [1.0,0,0], [1.4,0,0]
+     * layer 1 (rank 2): rows [0.1,0.35,0], [1.0,0.3,0]
+     * layer 2 (rank 3): rows [1.0,0.5,0.5], [0,0.05,0] */
+    U[(0 * M + 0) * R + 0] = 0.5f;
+    U[(0 * M + 0) * R + 1] = 9.0f;   /* outside rank 1: must be ignored */
+    U[(0 * M + 1) * R + 0] = 0.7f;
+    U[(0 * M + 1) * R + 2] = 9.0f;   /* outside rank 1: must be ignored */
+    U[(1 * M + 0) * R + 0] = 0.05f;
+    U[(1 * M + 0) * R + 1] = 0.35f;
+    U[(1 * M + 0) * R + 2] = 9.0f;   /* outside rank 2: must be ignored */
+    U[(1 * M + 1) * R + 0] = 0.5f;
+    U[(1 * M + 1) * R + 1] = 0.3f;
+    U[(2 * M + 0) * R + 0] = 0.5f;
+    U[(2 * M + 0) * R + 1] = 0.5f;
+    U[(2 * M + 0) * R + 2] = 0.5f;
+    U[(2 * M + 1) * R + 1] = 0.05f;
+
+    lowrank_mem_t m;
+    memset(&m, 0, sizeof(m));
+    m.U = U; m.V = V; m.ranks = ranks;
+    m.n_layers = L; m.M_lr = M; m.r_max = R;
+    m.value = NULL;
+
+    z[0] = 1.1f;
+    z[1] = 0.4f;
+    lowrank_forward_c(z, &m, 0.0f, out, idx);
+
+    /* Residual chain: r0=z → row 0 (d²=0.01 vs 0.09);
+     * r1=[0.1,0.4] → layer-1 row 0 (0.0025 vs 0.82);
+     * r2=[0,0.05,0] → layer-2 row 1 (exact).  If a layer skipped the
+     * subtraction, layer 1 would pick row 1 instead. */
+    CHECK(idx[0] == 0 && idx[1] == 0 && idx[2] == 1,
+          "lowrank: per-layer residual-chain indices [0,0,1]");
+    CHECK(fabsf(out[0] - 1.1f) < 1e-5f && fabsf(out[1] - 0.4f) < 1e-5f,
+          "lowrank: out = Σ c_k over all three layers (shared V)");
+    CHECK(fabsf(out[2]) < 1e-6f && fabsf(out[3]) < 1e-6f,
+          "lowrank: rank-prefix codebooks do not leak extra U columns");
+}
+
+static void test_lowrank_value_bias(void) {
+    enum { M = 2, R = 1, L = 1 };
+    static float U[M * R];
+    static float V[LCM_D * R];
+    static float z[LCM_D];
+    static float out[LCM_D];
+    static float val[M] = {0.0f, 1.0f};
+    int ranks[L] = {1};
+    int idx = -1;
+
+    memset(U, 0, sizeof(U));
+    memset(V, 0, sizeof(V));
+    memset(z, 0, sizeof(z));
+    V[0] = 1.0f;
+    U[0] = 0.5f;
+    U[1] = 0.7f;
+    z[0] = 0.55f;
+
+    lowrank_mem_t m;
+    memset(&m, 0, sizeof(m));
+    m.U = U; m.V = V; m.ranks = ranks;
+    m.n_layers = L; m.M_lr = M; m.r_max = R;
+    m.value = val;
+
+    lowrank_forward_c(z, &m, 0.0f, out, &idx);
+    CHECK(idx == 0 && fabsf(out[0] - 0.5f) < 1e-6f,
+          "lowrank: alpha_val=0 keeps the Euclidean winner");
+
+    /* avg d² = 0.0125; with alpha=4 row 1 scores
+     * -0.0225 + 4·tanh(1)·0.0125 ≈ +0.0156, beating row 0's -0.0025. */
+    lowrank_forward_c(z, &m, 4.0f, out, &idx);
+    CHECK(idx == 1 && fabsf(out[0] - 0.7f) < 1e-6f,
+          "lowrank: R22 value bias picks the slightly farther row");
+}
+
+/* ── Manifold ───────────────────────────────────────────────────────────── */
+
+/* Direct b.md §4.4 reference for a fixed selected row. */
+static void t9_manifold_ref(const float* z, const float* C, const float* T,
+                            int idx, int t_dim, float* out) {
+    float z_u[LCM_D], z_P[LCM_D], c_P[LCM_D], r[LCM_D], proj[LCM_D];
+    safe_unit_c(z, z_u, LCM_D, 1e-8f);
+    exp_map_c(z_u, z_P, LCM_D, 1.0f);
+    exp_map_c(C + (size_t)idx * LCM_D, c_P, LCM_D, 1.0f);
+
+    for (int i = 0; i < LCM_D; i++) r[i] = z_P[i] - c_P[i];
+
+    const float* T_j = T + (size_t)idx * LCM_D * t_dim;
+    float tp[8];
+    for (int k = 0; k < t_dim; k++) {
+        tp[k] = 0.0f;
+        for (int i = 0; i < LCM_D; i++) tp[k] += T_j[i * t_dim + k] * r[i];
+    }
+    for (int i = 0; i < LCM_D; i++) {
+        proj[i] = 0.0f;
+        for (int k = 0; k < t_dim; k++) proj[i] += T_j[i * t_dim + k] * tp[k];
+    }
+    for (int i = 0; i < LCM_D; i++) c_P[i] += proj[i];
+    log_map_c(c_P, out, LCM_D, 1.0f);
+}
+
+static void test_manifold_formula_and_poincare(void) {
+    enum { M = 2, TD = 2 };
+    static float C[M * LCM_D];
+    static float T[M * LCM_D * TD];
+    static float z[LCM_D];
+    static float out[LCM_D];
+    static float ref[LCM_D];
+    static float val[M];
+    int idx = -1;
+
+    memset(C, 0, sizeof(C));
+    memset(T, 0, sizeof(T));
+    memset(z, 0, sizeof(z));
+
+    /* C0 radial at 0.4; C1 at 0.95, angle 0.5. The query is 0.9 e0.
+     * Raw Euclidean prefers C1 (0.212 vs 0.250); Poincaré prefers C0
+     * (sim 0.811 vs 1.456). */
+    C[0 * LCM_D + 0] = 0.4f;
+    C[1 * LCM_D + 0] = 0.95f * cosf(0.5f);
+    C[1 * LCM_D + 1] = 0.95f * sinf(0.5f);
+    for (int j = 0; j < M; j++) {
+        T[(j * LCM_D + 0) * TD + 0] = 1.0f;
+        T[(j * LCM_D + 1) * TD + 1] = 1.0f;
+    }
+    z[0] = 0.9f;
+
+    manifold_mem_t m;
+    memset(&m, 0, sizeof(m));
+    m.C = C; m.M = M; m.T = T; m.t_dim = TD; m.value = NULL;
+
+    manifold_forward_c(z, &m, 0.0f, out, &idx);
+    t9_manifold_ref(z, C, T, 0, TD, ref);
+
+    CHECK(idx == 0, "manifold: Poincaré retrieval picks C0");
+    CHECK(t9_max_abs_diff(out, ref, LCM_D) < 1e-5f,
+          "manifold: out matches log_map(c + T Tᵀ(z_P - c)) reference");
+
+    /* The same data's raw Euclidean argmin is C1 — proves the retrieval
+     * really uses poincare_similarity, not ||z-C||². */
+    float d0 = 0.0f, d1 = 0.0f;
+    for (int i = 0; i < LCM_D; i++) {
+        float a = z[i] - C[i];
+        float b = z[i] - C[LCM_D + i];
+        d0 += a * a;
+        d1 += b * b;
+    }
+    CHECK(d1 < d0 && idx != 1,
+          "manifold: Poincaré retrieval differs from Euclidean");
+
+    /* R22 value path (JAX value_biased_retrieve): tangent-space Euclidean
+     * score, then the selected row is exp_mapped. v={0,1}, alpha=2 flips
+     * the winner to C1. */
+    val[0] = 0.0f; val[1] = 1.0f;
+    m.value = val;
+    manifold_forward_c(z, &m, 2.0f, out, &idx);
+    t9_manifold_ref(z, C, T, 1, TD, ref);
+    CHECK(idx == 1 && t9_max_abs_diff(out, ref, LCM_D) < 1e-5f,
+          "manifold: value bias selects C1 and follows the same projection");
+}
+
+/* ── Contrast ───────────────────────────────────────────────────────────── */
+
+/* Independent residual-VQ reference for one family. */
+static void t9_contrast_chain(const float* z, const float* C, int n_layers,
+                              int M, const float* value, float alpha_val,
+                              float* out) {
+    float r[LCM_D];
+    memcpy(r, z, sizeof(r));
+    memset(out, 0, sizeof(float) * LCM_D);
+
+    for (int l = 0; l < n_layers; l++) {
+        const float* cb = C + (size_t)l * M * LCM_D;
+        float d2[8];
+        float sum = 0.0f;
+        for (int j = 0; j < M; j++) {
+            d2[j] = 0.0f;
+            for (int i = 0; i < LCM_D; i++) {
+                float diff = r[i] - cb[(size_t)j * LCM_D + i];
+                d2[j] += diff * diff;
+            }
+            sum += d2[j];
+        }
+        int best = 0;
+        if (value && alpha_val > 0.0f) {
+            float avg = sum / (float)M;
+            float best_score = -INFINITY;
+            for (int j = 0; j < M; j++) {
+                float score = -d2[j]
+                    + alpha_val * tanhf(value[j]) * avg;
+                if (score > best_score) { best_score = score; best = j; }
+            }
+        } else {
+            float best_d2 = INFINITY;
+            for (int j = 0; j < M; j++)
+                if (d2[j] < best_d2) { best_d2 = d2[j]; best = j; }
+        }
+        for (int i = 0; i < LCM_D; i++) {
+            out[i] += cb[(size_t)best * LCM_D + i];
+            r[i] -= cb[(size_t)best * LCM_D + i];
+        }
+    }
+}
+
+static void test_contrast_dual_codebook(void) {
+    enum { M = 2, L = 2 };
+    static float Ca[L * M * LCM_D];
+    static float Cb[L * M * LCM_D];
+    static float z[LCM_D];
+    static float out[LCM_D];
+    static float oa[LCM_D], ob[LCM_D], ref[LCM_D];
+
+    memset(Ca, 0, sizeof(Ca));
+    memset(Cb, 0, sizeof(Cb));
+    memset(z, 0, sizeof(z));
+
+    /* Layer 0 removes 0.1e0 / 0.3e2; layer 1 then picks 0.2e1 / 0.4e3. */
+    Ca[(0 * M + 0) * LCM_D + 0] = 0.1f;
+    Ca[(0 * M + 1) * LCM_D + 0] = 0.11f;
+    Ca[(1 * M + 0) * LCM_D + 1] = 0.2f;
+    Ca[(1 * M + 1) * LCM_D + 2] = 0.21f;
+    Cb[(0 * M + 0) * LCM_D + 2] = 0.3f;
+    Cb[(0 * M + 1) * LCM_D + 2] = 0.31f;
+    Cb[(1 * M + 0) * LCM_D + 3] = 0.4f;
+    Cb[(1 * M + 1) * LCM_D + 3] = 0.41f;
+    z[0] = 0.02f;
+
+    contrast_mem_t m;
+    memset(&m, 0, sizeof(m));
+    m.C_a = Ca; m.C_b = Cb; m.M = M; m.n_layers = L;
+    m.value_a = NULL; m.value_b = NULL;
+
+    contrast_forward_c(z, &m, 0.0f, out);
+
+    t9_contrast_chain(z, Ca, L, M, NULL, 0.0f, oa);
+    t9_contrast_chain(z, Cb, L, M, NULL, 0.0f, ob);
+    for (int i = 0; i < LCM_D; i++) ref[i] = (oa[i] + ob[i]) * 0.5f;
+
+    CHECK(t9_max_abs_diff(out, ref, LCM_D) < 1e-6f,
+          "contrast: out == (o_a + o_b)/2");
+    CHECK(fabsf(out[0] - 0.05f) < 1e-6f && fabsf(out[1] - 0.1f) < 1e-6f
+              && fabsf(out[2] - 0.15f) < 1e-6f
+              && fabsf(out[3] - 0.2f) < 1e-6f,
+          "contrast: both codebooks and both layers contribute");
+}
+
+static void test_contrast_value_bias_families(void) {
+    enum { M = 2, L = 1 };
+    static float Ca[M * LCM_D];
+    static float Cb[M * LCM_D];
+    static float z[LCM_D];
+    static float out[LCM_D];
+    static float va[M] = {0.0f, 1.0f};
+
+    memset(Ca, 0, sizeof(Ca));
+    memset(Cb, 0, sizeof(Cb));
+    memset(z, 0, sizeof(z));
+    Ca[0] = 0.5f; Ca[1 * LCM_D + 0] = 0.7f;
+    Cb[0] = 0.5f; Cb[1 * LCM_D + 0] = 0.7f;
+    z[0] = 0.55f;
+
+    contrast_mem_t m;
+    memset(&m, 0, sizeof(m));
+    m.C_a = Ca; m.C_b = Cb; m.M = M; m.n_layers = L;
+    m.value_a = va; m.value_b = NULL;
+
+    contrast_forward_c(z, &m, 0.0f, out);
+    CHECK(fabsf(out[0] - 0.5f) < 1e-6f,
+          "contrast: alpha_val=0 uses both Euclidean winners");
+
+    contrast_forward_c(z, &m, 4.0f, out);
+    CHECK(fabsf(out[0] - 0.6f) < 1e-6f,
+          "contrast: value_a bias flips only family a");
+}
+
+/* ── Binding ────────────────────────────────────────────────────────────── */
+
+static void test_binding_unbind_and_cval(void) {
+    enum { L = 3, M = 2 };
+    static float key_cb[L * M * LCM_D];
+    static float val_cb[L * M * LCM_D];
+    static float bind_cb[L * M * LCM_D];
+    static float A_k[LCM_D];
+    static float A_v[LCM_D];
+    static float V[LCM_D];
+    static float z[LCM_D];
+    static float out[LCM_D];
+    static float bq[LCM_D], kq[LCM_D];
+    static float b9[LCM_D], b1[LCM_D], bcheck[LCM_D];
+    static float rec[LCM_D];
+    static float v[LCM_D];
+
+    memset(key_cb, 0, sizeof(key_cb));
+    memset(val_cb, 0, sizeof(val_cb));
+    memset(bind_cb, 0, sizeof(bind_cb));
+    memset(A_k, 0, sizeof(A_k));
+    memset(A_v, 0, sizeof(A_v));
+    memset(V, 0, sizeof(V));
+    memset(z, 0, sizeof(z));
+
+    /* Every family has M rows per layer (binding_mem_t has one M). Rows 1 are
+     * far away, so the residual chains select row 0 in every layer. */
+    t9_seed = 0x9E3779B9u;
+    const float* kp[L];
+    for (int l = 0; l < L; l++) {
+        float* k0 = key_cb + ((size_t)l * M) * LCM_D;
+        float* k1 = k0 + LCM_D;
+        t9_unit(k0);
+        memcpy(k1, k0, sizeof(vec_t));
+        k1[0] += 100.0f;
+        kp[l] = k0;
+    }
+
+    t9_unit(v);
+    for (int l = 0; l < L; l++) {
+        float* v0 = val_cb + ((size_t)l * M) * LCM_D;
+        float* v1 = v0 + LCM_D;
+        if (l == L - 1) memcpy(v0, v, sizeof(vec_t));
+        memcpy(v1, v0, sizeof(vec_t));
+        v1[0] += 100.0f;
+    }
+    memcpy(A_k, kp[0], sizeof(A_k));  /* z_k = k0 (V=e0, A_k row 0) */
+    memcpy(A_v, v, sizeof(A_v));
+
+    V[0] = 1.0f;   /* V is [D][1]; V^T z = z[0] */
+    z[0] = 1.0f;
+
+    const float* vp[L];
+    for (int l = 0; l < L; l++) vp[l] = val_cb + ((size_t)l * M) * LCM_D;
+
+    /* The exact 9-pair sum and the 1-pair value a wrong implementation would
+     * produce; the bind codebook must select the former. */
+    hrr_bind(kp, L, vp, L, b9, LCM_D);
+    hrr_bind(&kp[0], 1, &vp[2], 1, b1, LCM_D);
+    memcpy(bind_cb, b9, sizeof(b9));                 /* layer 0, row 0 */
+    memcpy(bind_cb + LCM_D, b1, sizeof(b1));         /* layer 0, row 1 */
+    for (int l = 1; l < L; l++) {                    /* layers 1/2: 0, far */
+        float* r1 = bind_cb + ((size_t)l * M + 1) * LCM_D;
+        r1[0] = 100.0f;
+    }
+
+    binding_mem_t m;
+    memset(&m, 0, sizeof(m));
+    m.key_cb = key_cb; m.val_cb = val_cb; m.bind_cb = bind_cb;
+    m.M = M; m.n_layers = L; m.r_max = 1;
+    m.A_k = A_k; m.A_v = A_v;
+    m.value_key = NULL; m.value_val = NULL; m.value_bind = NULL;
+
+    binding_forward_c(z, &m, V, 0.0f, out, bq, kq);
+
+    /* k_q = k0+k1+k2; b_q = b_raw (bind layer 0), then zero bind rows. */
+    memset(bcheck, 0, sizeof(bcheck));
+    for (int l = 0; l < L; l++)
+        for (int i = 0; i < LCM_D; i++) bcheck[i] += kp[l][i];
+    CHECK(t9_max_abs_diff(kq, bcheck, LCM_D) < 1e-6f,
+          "binding: k_q = Σ key-layer quantised rows");
+    CHECK(t9_max_abs_diff(bq, b9, LCM_D) < 1e-5f,
+          "binding: b_q = 9-pair cross-layer HRR sum (not 1 pair)");
+
+    /* NN over the concatenated C_val must land on layer 2's row 0 = v. */
+    hrr_unbind(b9, kq, rec, LCM_D);
+    int best = -1;
+    float best_d2 = INFINITY;
+    for (int l = 0; l < L; l++) {
+        for (int j = 0; j < M; j++) {
+            const float* row = val_cb + ((size_t)l * M + j) * LCM_D;
+            float d2 = 0.0f;
+            for (int i = 0; i < LCM_D; i++) {
+                float diff = rec[i] - row[i];
+                d2 += diff * diff;
+            }
+            if (d2 < best_d2) { best_d2 = d2; best = l * M + j; }
+        }
+    }
+    CHECK(best == (L - 1) * M,
+          "binding: C_val concatenation searches every val_cb layer");
+    CHECK(t9_max_abs_diff(out, v, LCM_D) < 1e-6f,
+          "binding: unbind reads back v from the value codebook");
+
+    /* Primitive round-trip on one pair. */
+    hrr_bind(&kp[0], 1, &vp[2], 1, b1, LCM_D);
+    hrr_unbind(b1, kp[0], rec, LCM_D);
+    CHECK(t9_cosine(rec, v) > 0.7f,
+          "binding: unbind(bind(k,v),k) ≈ v (cosine > 0.7)");
+}
+
 int main(void) {
     printf("LCM engine tests (LCM_D=%d):\n", LCM_D);
     test_lcm_dim();
@@ -1221,6 +1684,12 @@ int main(void) {
     test_sparse_boundaries();
     test_routing_hard();
     test_routing_invalid();
+    test_lowrank_multilayer();
+    test_lowrank_value_bias();
+    test_manifold_formula_and_poincare();
+    test_contrast_dual_codebook();
+    test_contrast_value_bias_families();
+    test_binding_unbind_and_cval();
     test_hrr_no_overwrite();
     test_fusion_l2_weights();
     if (failures == 0)

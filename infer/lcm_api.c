@@ -93,6 +93,8 @@ int lcm_bind_memory_v3(lcm_memory_v3* mem, int D, int n_lattices,
         !manifold->C || !manifold->T) return -1;
 
     if (binding->M <= 0 || binding->n_layers <= 0) return -1;
+    if (binding->n_layers > LCM_MAX_BIND_LAYERS) return -1;
+    if (binding->r_max <= 0 || binding->r_max != lowrank->r_max) return -1;
     if (!binding->key_cb || !binding->val_cb || !binding->bind_cb
         || !binding->A_k || !binding->A_v) return -1;
 

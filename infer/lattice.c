@@ -400,104 +400,114 @@ void retrieve_single(const float* z, const lattice_memory_t* mem,
 
 /*@
   requires \valid_read(z + (0 .. LCM_D-1));
-  requires \valid_read(mem) && \valid_read(mem->C);
-  requires \valid_read(T_space + (0 .. mem->M * LCM_D * t_dim - 1));
+  requires \valid_read(z_P + (0 .. LCM_D-1));
+  requires \valid_read(C + (0 .. M * LCM_D - 1));
+  requires \valid_read(T_space + (0 .. M * LCM_D * t_dim - 1));
   requires \valid(out + (0 .. LCM_D-1));
-  requires \separated(out, z) && \separated(out, T_space);
-  requires mem->M > 0 && t_dim > 0;
-  requires \forall integer j; 0 <= j < mem->M ==> \valid_read(mem->C[j] + (0 .. LCM_D-1));
+  requires \separated(out, z) && \separated(out, z_P) && \separated(out, T_space);
+  requires M > 0 && t_dim > 0;
+  requires value == \null || \valid_read(value + (0 .. M-1));
+  requires idx_out == \null || \valid(idx_out);
   ensures  \valid(out + (0 .. LCM_D-1));
-  assigns  out[0 .. LCM_D-1];
+  assigns  out[0 .. LCM_D-1], *idx_out;
  */
+static void manifold_slide_core(const float* z, const float* z_P,
+                                const float* C, int M,
+                                const float* T_space, int t_dim,
+                                const float* value, float alpha_val,
+                                float* out, int* idx_out) {
+    int best = 0;
+
+    if (value != NULL && alpha_val > 0.0f) {
+        /* JAX's value_biased_retrieve(z, C, ..., C_out=C_P): score in the
+         * tangent-space coordinates, then exp_map the selected row. */
+        float d2[M];
+        float sum = 0.0f;
+        for (int j = 0; j < M; j++) {
+            d2[j] = 0.0f;
+            const float* row = C + (size_t)j * LCM_D;
+            for (int i = 0; i < LCM_D; i++) {
+                float diff = z[i] - row[i];
+                d2[j] += diff * diff;
+            }
+            sum += d2[j];
+        }
+        float avg = sum / (float)M;
+        float best_score = -INFINITY;
+        for (int j = 0; j < M; j++) {
+            float score = -d2[j] + alpha_val * tanhf(value[j]) * avg;
+            if (score > best_score) { best_score = score; best = j; }
+        }
+    } else {
+        /* Poincaré nearest prototype in the R6 domain. */
+        float best_sim = INFINITY;
+        for (int j = 0; j < M; j++) {
+            vec_t c_P;
+            exp_map_c(C + (size_t)j * LCM_D, c_P, LCM_D, 1.0f);
+            float sim = poincare_similarity_c(z_P, c_P, LCM_D, 1.0f);
+            if (sim < best_sim) { best_sim = sim; best = j; }
+        }
+    }
+
+    /* Tangent space projection at the selected prototype. */
+    vec_t c_P;
+    exp_map_c(C + (size_t)best * LCM_D, c_P, LCM_D, 1.0f);
+
+    /* r = z_P - c_idx (in tangent space) */
+    vec_t r, proj;
+    for (int i = 0; i < LCM_D; i++) r[i] = z_P[i] - c_P[i];
+
+    /* proj = T @ T.T @ r, with T stored row-major (D, t_dim). */
+    const float* T_j = T_space + (size_t)best * LCM_D * t_dim;
+    float t_proj[t_dim];
+    memset(t_proj, 0, (size_t)t_dim * sizeof(float));
+    for (int k = 0; k < t_dim; k++) {
+        for (int i = 0; i < LCM_D; i++)
+            t_proj[k] += T_j[i * t_dim + k] * r[i];
+    }
+    for (int i = 0; i < LCM_D; i++) {
+        proj[i] = 0.0f;
+        for (int k = 0; k < t_dim; k++)
+            proj[i] += T_j[i * t_dim + k] * t_proj[k];
+    }
+
+    /* c_idx + proj → log_map back to Euclidean */
+    vec_t combined;
+    for (int i = 0; i < LCM_D; i++) combined[i] = c_P[i] + proj[i];
+    log_map_c(combined, out, LCM_D, 1.0f);
+
+    if (idx_out) *idx_out = best;
+}
+
 void slide_manifold(const float* z, const lattice_memory_t* mem,
                      const float* T_space, int t_dim, float* out) {
     assert(mem != NULL && T_space != NULL && out != NULL);
     assert(mem->M > 0 && t_dim > 0);
 
-    /* Step 1: exp_map to Poincaré ball */
-    vec_t z_P;
-    exp_map_c(z, z_P, LCM_D, 1.0f);
+    /* R6 domain: every hyperbolic comparison uses exp_map(safe_unit(z)). */
+    vec_t z_u, z_P;
+    safe_unit_c(z, z_u, LCM_D, 1e-8f);
+    exp_map_c(z_u, z_P, LCM_D, 1.0f);
 
-    /* Step 2: Find nearest codebook entry using Poincaré similarity */
-    float best_sim = 1e20f;
-    int   best_idx = 0;
-    /*@
-      loop invariant 0 <= j <= mem->M;
-      loop invariant 0 <= best_idx < mem->M || best_idx == 0;
-      loop assigns j, best_sim, best_idx;
-      loop variant mem->M - j;
-     */
-    for (int j = 0; j < mem->M; j++) {
-        vec_t c_P;
-        exp_map_c(mem->C[j], c_P, LCM_D, 1.0f);
-        float sim = poincare_similarity_c(z_P, c_P, LCM_D, 1.0f);
-        if (sim < best_sim) {
-            best_sim = sim;
-            best_idx = j;
-        }
+    manifold_slide_core(z, z_P, (const float*)mem->C, mem->M,
+                        T_space, t_dim, NULL, 0.0f, out, NULL);
+}
+
+void manifold_forward_c(const float* z, const manifold_mem_t* m,
+                        float alpha_val, float* out, int* idx) {
+    if (!out) return;
+    if (!z || !m || !m->C || !m->T || m->M <= 0 || m->t_dim <= 0) {
+        memset(out, 0, sizeof(vec_t));
+        if (idx) *idx = 0;
+        return;
     }
 
-    /* Step 3: Tangent space projection */
-    vec_t c_P;
-    exp_map_c(mem->C[best_idx], c_P, LCM_D, 1.0f);
+    vec_t z_u, z_P;
+    safe_unit_c(z, z_u, LCM_D, 1e-8f);
+    exp_map_c(z_u, z_P, LCM_D, 1.0f);
 
-    /* r = z_P - c_idx (in tangent space) */
-    vec_t r, proj;
-    /*@
-      loop invariant 0 <= i <= LCM_D;
-      loop assigns i, r[0 .. LCM_D-1];
-      loop variant LCM_D - i;
-     */
-    for (int i = 0; i < LCM_D; i++) r[i] = z_P[i] - c_P[i];
-
-    /* proj = T @ T.T @ r */
-    const float* T_j = T_space + best_idx * LCM_D * t_dim;
-    float t_proj[t_dim];
-    memset(t_proj, 0, t_dim * sizeof(float));
-    /*@
-      loop invariant 0 <= k <= t_dim;
-      loop assigns k, t_proj[0 .. t_dim-1];
-      loop variant t_dim - k;
-     */
-    for (int k = 0; k < t_dim; k++) {
-        /*@
-          loop invariant 0 <= i <= LCM_D;
-          loop assigns i;
-          loop variant LCM_D - i;
-         */
-        for (int i = 0; i < LCM_D; i++) {
-            /* T_space is (M_man, D, t_dim) row-major (matches training
-             * layout), so entry (i, k) is at flat offset i * t_dim + k. */
-            t_proj[k] += T_j[i * t_dim + k] * r[i];
-        }
-    }
-    /*@
-      loop invariant 0 <= i <= LCM_D;
-      loop assigns i, proj[0 .. LCM_D-1];
-      loop variant LCM_D - i;
-     */
-    for (int i = 0; i < LCM_D; i++) {
-        proj[i] = 0;
-        /*@
-          loop invariant 0 <= k <= t_dim;
-          loop assigns k;
-          loop variant t_dim - k;
-         */
-        for (int k = 0; k < t_dim; k++) {
-            /* Same (D, t_dim) row-major indexing as the projection above. */
-            proj[i] += T_j[i * t_dim + k] * t_proj[k];
-        }
-    }
-
-    /* Step 4: c_idx + proj → log_map back to Euclidean */
-    vec_t combined;
-    /*@
-      loop invariant 0 <= i <= LCM_D;
-      loop assigns i, combined[0 .. LCM_D-1];
-      loop variant LCM_D - i;
-     */
-    for (int i = 0; i < LCM_D; i++) combined[i] = c_P[i] + proj[i];
-    log_map_c(combined, out, LCM_D, 1.0f);
+    manifold_slide_core(z, z_P, m->C, m->M, m->T, m->t_dim,
+                        m->value, alpha_val, out, idx);
 }
 
 /* ─── Cooley-Tukey radix-2 FFT (iterative, in-place) ────────────────────────
