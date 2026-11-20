@@ -162,10 +162,12 @@ def hrq_vq_loss(params, z, aux, cfg: LCMConfig):
         raise KeyError(
             "hrq_vq_loss requires aux['hrq_vq'] with 'cont'/'quant' lists "
             "(produced by hrq_forward)")
-    # The top continuous term must live in the same post-log_map domain as
-    # the quantised top row (`log_map(c_top)`). Passing raw z put the two
-    # operands in different spaces whenever ||z|| != 1.
-    z_tan = log_map(safe_unit(z))
+    # The forward input is z_P = exp_map(safe_unit(z)); its tangent
+    # representation is log_map(z_P) = safe_unit(z). That is the same-domain
+    # pointer for log_map(c_top) (the quantised top row). Applying log_map a
+    # second time pushed the top pointer to norm ~3.8 while the fine `cont`
+    # rows are ~1, pulling the top codebook to the wrong radius.
+    z_tan = safe_unit(z)
     cont = [z_tan] + list(pairs['cont'][1:])
     quant = list(pairs['quant'])
     n_fine = len(params['fine'])
@@ -218,9 +220,9 @@ def cognitive_vq_losses(params, stats, cfg: LCMConfig, ema_paths=EMA_PATHS):
     z = stats['z_in']
     # R18: the manifold codebook rows are tangent-space (`log_map(exp_map(C))`
     # below), so the continuous side of its commitment loss must be the
-    # tangent representation of the input, not the raw fused z. For
-    # log_map(exp_map(.)) this is exactly `safe_unit(z)`.
-    z_tan = log_map(safe_unit(z))
+    # forward's tangent pointer, not the raw fused z and not a second log_map.
+    # The forward uses z_P = exp_map(safe_unit(z)); log_map(z_P) = safe_unit(z).
+    z_tan = safe_unit(z)
     beta = cfg.beta_vq
     parts = {}
 

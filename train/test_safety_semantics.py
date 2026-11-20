@@ -1,4 +1,5 @@
 import jax.numpy as jnp
+import pytest
 from train.hyp import to_poincare, poincare_similarity, poincare_distance
 from train.gvalue import make_global_value_vectors, GValueCodebook
 
@@ -19,41 +20,39 @@ def test_poincare_similarity_finite_at_degenerate_norms():
         assert bool(jnp.all(jnp.isfinite(dist))), f"scale={scale}: {dist}"
 
 
-def test_r18_hrq_top_uses_log_map_domain_for_large_z():
-    """A fused z with ‖z‖ > 1 must be compared in the log_map domain.
+@pytest.mark.parametrize("d,expected", [(2, 0.125), (4, 0.0625)])
+def test_r18_hrq_top_uses_unit_tangent_pointer(d, expected):
+    """A fused z with ‖z‖ > 1 must use ``safe_unit(z)``, norm 1.0.
 
-    The quantised top row is in ``log_map(c_top)`` space. Leaving the
-    continuous side as raw z would make the same loss depend on ‖z‖² instead
-    of the quantisation error.
+    The forward is ``z_P = exp_map(safe_unit(z))``; its tangent pointer is
+    ``log_map(z_P) = safe_unit(z)``. Applying ``log_map`` a second time gives
+    norm ≈ 3.804 and pulls the top codebook to the wrong radius. With a zero
+    quantised row the returned commitment is ``beta * ‖cont‖² / d``, so it
+    independently reveals the continuous-side norm.
     """
     from train.losses import hrq_vq_loss
-    from train.hyp import log_map, safe_unit
+    from train.hyp import safe_unit
 
-    d = 2
-    z = jnp.array([[3.0, 0.0]])          # ‖z‖ = 3, outside the ball
-    quant = jnp.array([[0.5, 0.0]])      # already log_map(c_top)-space
+    z = jnp.zeros((1, d)).at[0, 0].set(3.0)   # ‖z‖ = 3, outside the ball
     params = {'top': {'A': jnp.zeros((1, d)), 'W': jnp.eye(d)}, 'fine': []}
     cfg = type('C', (), {'beta_vq': 0.25})()
-    aux = {'cont': [z], 'quant': [quant]}
+    aux = {'cont': [z], 'quant': [jnp.zeros((1, d))]}
     codebook, commitment = hrq_vq_loss(params, z, aux, cfg)
 
-    expected_r = log_map(safe_unit(z))
-    expected_cb = 0.25 * jnp.mean((expected_r - quant) ** 2)
-    expected_cm = expected_cb
-    assert jnp.allclose(codebook[0], expected_cb, atol=1e-6)
-    assert jnp.allclose(commitment[0], expected_cm, atol=1e-6)
-    # The old raw-z form would be 0.25 * mean(([3,0]-[.5,0])²) = 1.5625.
-    assert not jnp.allclose(commitment[0], 1.5625, atol=1e-3)
+    # Hand-computed: safe_unit([3,0,...]) has norm 1, mean square = 1/d.
+    assert jnp.allclose(codebook[0], expected, atol=1e-6)
+    assert jnp.allclose(commitment[0], expected, atol=1e-6)
+    implied_norm = jnp.sqrt(commitment[0] * d / 0.25)
+    assert jnp.allclose(implied_norm, 1.0, atol=1e-5)
+    assert not jnp.allclose(implied_norm, 3.804, atol=1e-2)
 
 
-def test_r18_manifold_commitment_uses_log_map_domain_for_large_z():
-    """The manifold commitment side is log_map(safe_unit(z)), not raw z."""
+@pytest.mark.parametrize("d,expected", [(2, 0.125), (4, 0.0625)])
+def test_r18_manifold_commitment_uses_unit_tangent_pointer(d, expected):
+    """The manifold commitment side is ``safe_unit(z)``, not a second log_map."""
     from train.losses import cognitive_vq_losses
-    from train.hyp import exp_map, log_map, safe_unit
 
-    d = 2
-    z = jnp.array([[3.0, 0.0]])          # ‖z‖ = 3
-    one = jnp.zeros((1, d))
+    z = jnp.zeros((1, d)).at[0, 0].set(3.0)   # ‖z‖ = 3
     ident = jnp.eye(d)
     M = 1
     params = {
@@ -87,11 +86,10 @@ def test_r18_manifold_commitment_uses_log_map_domain_for_large_z():
     cfg = type('C', (), {'beta_vq': 0.25, 'ranks': (1,)})()
     _, parts = cognitive_vq_losses(params, stats, cfg)
 
-    z_tan = log_map(safe_unit(z))
-    C_man = log_map(exp_map(params['manifold']['C']))
-    expected = 0.25 * jnp.mean((z_tan - C_man[0]) ** 2)
+    # Hand-computed: C_man = 0, cont = safe_unit(z), beta=0.25, mean = 1/d.
     assert jnp.allclose(parts['manifold_commitment'], expected, atol=1e-6)
-    # Raw z would be 0.25 * mean([9, 0]) = 2.25.
+    # Old double-log_map value for d=2 is ~1.808; raw z is 2.25.
+    assert not jnp.allclose(parts['manifold_commitment'], 1.808, atol=1e-2)
     assert not jnp.allclose(parts['manifold_commitment'], 2.25, atol=1e-3)
 
 
