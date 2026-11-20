@@ -58,9 +58,9 @@ from z3 import *
 #  Constants — must match lcm.h and the C implementation exactly
 # ═════════════════════════════════════════════════════════════════════════════
 
-MAX_RETRIEVALS       = 12
+MAX_RETRIEVALS       = 128
 MAX_STEPS            = 32
-CONSISTENCY_THRESHOLD = RealVal("0.3")
+CONSISTENCY_THRESHOLD = RealVal("0.7")
 SAFETY_THRESHOLD     = RealVal("0.05")
 DEFAULT_MARGIN       = RealVal("0.5")
 N_VALUE_PAIRS        = 4

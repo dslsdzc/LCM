@@ -485,6 +485,93 @@ def _routing_hard_report(cfg, params, data, shape, spans, seq_len):
     }
 
 
+def _streaming_utilization_probe(cfg, params, data, shape, spans, seq_len,
+                                 batches=100):
+    """Ruling 51: utilisation over 100 genuinely different batches.
+
+    The 100-step training run is a single-batch overfit, so its router sees the
+    same z every step. This probe keeps the trained parameters fixed and feeds
+    100 different corpus windows through the inference path; it answers the
+    "does the codebook cover the input distribution" question that the fixed
+    single-batch run cannot.
+    """
+    from train.cognitive_step import six_lattice_step
+
+    params = jax.tree_util.tree_map(
+        lambda x: jnp.asarray(x) if isinstance(x, np.ndarray) else x, params)
+    it = WikiDataIter(data, shape, spans, B=1, N=seq_len)
+    tracker = _UtilTracker()
+
+    def forward(z):
+        zself, bias, saux = self_lattice_forward(
+            params["self"], z, training=False, return_aux=True,
+            alpha_self=cfg.alpha_self)
+        _, aux = six_lattice_step(
+            z, params, cfg, training=False, rng=jax.random.PRNGKey(0),
+            self_output=zself, self_bias=bias)
+        aux = dict(aux)
+        aux["self_idx"] = saux["idx"]
+        return aux
+
+    fn = jax.jit(forward)
+    M_top = int(np.asarray(params["hrq"]["top"]["A"]).shape[0])
+    M_sparse = int(np.asarray(params["sparse"]["C"]).shape[0])
+    M_lr = int(np.asarray(params["lowrank"]["U"][0]).shape[0])
+    M_man = int(np.asarray(params["manifold"]["C"]).shape[0])
+    M_bind = int(np.asarray(params["binding"]["key_cb"][0]["A"]).shape[0])
+    M_ct = int(np.asarray(params["contrast"]["C_a"][0]["A"]).shape[0])
+    M_route = int(np.asarray(params["route"]["C_route"]).shape[0])
+    M_self = int(np.asarray(params["self"]["C_self"]).shape[0])
+
+    for _ in range(int(batches)):
+        x, _ = next(it)
+        z = _encode_z(params, x, cfg)
+        aux = jax.tree_util.tree_map(
+            lambda a: np.asarray(a), jax.device_get(fn(z)))
+        tracker.add("hrq", 0, aux["hrq_idx"], M_top)
+        # Sparse index 0 is zero_vec in the inference path; codebook row r is
+        # index r+1. Convert to a zero-based codebook row and skip zero.
+        sidx = np.asarray(aux["sparse_idx"])
+        tracker.add("sparse", 0, np.where(sidx > 0, sidx - 1, -1), M_sparse)
+        for layer, idx in enumerate(aux["lowrank_aux"]["indices"]):
+            tracker.add("lowrank", layer, idx, M_lr)
+        tracker.add("manifold", 0, aux["man_idx"], M_man)
+        for family in ("key", "val", "bind"):
+            for layer, idx in enumerate(aux["binding_indices"][family]):
+                tracker.add(f"binding.{family}", layer, idx, M_bind)
+        for family in ("a", "b"):
+            for layer, idx in enumerate(aux["contrast_indices"][family]):
+                tracker.add(f"contrast.{family}", layer, idx, M_ct)
+        tracker.add("route", 0, aux["route_idx"], M_route)
+        tracker.add("self", 0, aux["self_idx"], M_self)
+
+    util = tracker.summary()
+    per_lattice = {}
+    for name in ("hrq", "sparse", "lowrank", "manifold", "binding",
+                 "contrast", "route", "self"):
+        if name in util:
+            fraction = util[name]["mean_fraction"]
+        else:
+            families = [v for k, v in util.items()
+                        if k.startswith(name + ".")]
+            fraction = (float(np.mean([f["mean_fraction"] for f in families]))
+                        if families else None)
+        per_lattice[name] = {
+            "fraction": fraction,
+            "threshold": 0.10,
+            "pass": bool(fraction is not None and fraction >= 0.10),
+        }
+    return {
+        "batches": int(batches),
+        "batch_size": 1,
+        "per_lattice": per_lattice,
+        "pass": bool(all(v["pass"] for v in per_lattice.values())),
+        "note": ("Ruling 51: final parameters, 100 different corpus windows, "
+                 "inference path. This is the utilisation verdict; the "
+                 "fixed-single-batch training probe is secondary."),
+    }
+
+
 def _production_step_median_ms(cfg, params, ema, data, shape, spans, seq_len,
                                runs=20):
     """20-run median of the production train_step, no on_step callback."""
@@ -608,6 +695,82 @@ def _c_danger_probe(so_path):
     }
 
 
+def _exported_danger_pattern_probe(final_dir):
+    """Direct C ``danger_assess`` on the exported danger codebook.
+
+    Ruling 50: the v3 loop abort in the real checkpoint can be the consistency
+    branch (``THREAT_DECEPTION``) before pattern matching. This probe isolates
+    the pattern branch: real exported ``danger_codebook.bin`` halves,
+    ``value_consistency=1.0``, one threat-aligned z and one normal z. It must
+    return ``THREAT_PATTERN_MATCH`` for the threat and no block for the normal.
+    """
+    import lcm
+
+    so_path = Path(__file__).resolve().parent.parent / "infer" / "liblcm.so"
+    if not so_path.exists():
+        return {"available": False, "error": f"{so_path} not built",
+                "pass": False}
+    try:
+        data, M, d = lcm.load_codebook_for_c(
+            str(final_dir), "danger_codebook.bin")
+        data = np.asarray(data, dtype=np.float32).reshape(-1)
+        threats = np.ascontiguousarray(data[: M * d].reshape(M, d))
+        normals = np.ascontiguousarray(data[M * d:].reshape(M, d))
+
+        ctypes.CDLL("libm.so.6", mode=ctypes.RTLD_GLOBAL)
+        lib = ctypes.CDLL(str(so_path))
+        lib.danger_init.argtypes = [
+            ctypes.POINTER(_DangerLattice), ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_int]
+        lib.danger_init.restype = None
+        lib.danger_assess.argtypes = [
+            ctypes.POINTER(_DangerLattice), ctypes.POINTER(ctypes.c_float),
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_float,
+            ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_bool)]
+        lib.danger_assess.restype = None
+
+        def ptr(arr):
+            return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+        dl = _DangerLattice()
+        lib.danger_init(ctypes.byref(dl), ptr(threats), ptr(normals), M, d)
+
+        def assess(z):
+            score = ctypes.c_float()
+            threat_type = ctypes.c_int()
+            blocked = ctypes.c_bool()
+            lib.danger_assess(
+                ctypes.byref(dl), ptr(z), 0, 0, 16, 1.0,
+                ctypes.byref(score), ctypes.byref(threat_type),
+                ctypes.byref(blocked))
+            return (bool(blocked.value), int(threat_type.value),
+                    float(score.value))
+
+        threat_blocked, threat_type, threat_score = assess(threats[0])
+        normal_blocked, normal_type, normal_score = assess(normals[0])
+        return {
+            "available": True,
+            "rows": int(M),
+            "d": int(d),
+            "threat_blocked": threat_blocked,
+            "threat_type": threat_type,
+            "threat_score": threat_score,
+            "threat_pattern_match": bool(
+                threat_blocked and threat_type == 1),  # THREAT_PATTERN_MATCH
+            "normal_blocked": normal_blocked,
+            "normal_type": normal_type,
+            "normal_score": normal_score,
+            "normal_not_blocked": bool(not normal_blocked),
+            "pass": bool(threat_blocked and threat_type == 1
+                         and not normal_blocked),
+        }
+    except Exception as exc:  # pragma: no cover - diagnostic
+        return {"available": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "pass": False}
+
+
 def _real_safety_probe(final_dir):
     """Real v2 checkpoint -> real C v3 loop -> abort/no-token/alert/trace.
 
@@ -641,6 +804,8 @@ def _real_safety_probe(final_dir):
     direct_alerts = list(engine._alerts)
     direct_source = (direct_alerts[-1]['conflict_source']
                      if direct_alerts else None)
+    direct_type = (direct_alerts[-1]['conflict_type']
+                   if direct_alerts else None)
 
     engine._alerts.clear()
     engine._last_loop_ret = 0
@@ -651,6 +816,7 @@ def _real_safety_probe(final_dir):
     gen_ret = int(engine._last_loop_ret)
     gen_alerts = list(engine._alerts)
     gen_source = gen_alerts[-1]['conflict_source'] if gen_alerts else None
+    gen_type = gen_alerts[-1]['conflict_type'] if gen_alerts else None
     after = set(glob.glob(str(trace_dir / "lcm_v3_*.json")))
     trace_written = len(after - before) > 0
 
@@ -662,6 +828,15 @@ def _real_safety_probe(final_dir):
     normal_ret = int(engine._last_loop_ret)
     normal_source = (engine._alerts[-1]['conflict_source']
                      if engine._alerts else None)
+    normal_type = (engine._alerts[-1]['conflict_type']
+                   if engine._alerts else None)
+
+    # Ruling 50: the v3 loop may abort on the consistency branch. The pattern
+    # path is proven separately, directly from the exported danger file.
+    pattern_probe = _exported_danger_pattern_probe(ckpt)
+    abort_any_conflict = bool(
+        gen_ret == int(getattr(lcm, "CONFLICT_ABORT_TOKEN", -2))
+        and len(tokens) == 0 and bool(gen_alerts) and trace_written)
 
     # ── C gvalue strict-margin probe (real exported anchors) ────────────────
     so_path = Path(__file__).resolve().parent.parent / "infer" / "liblcm.so"
@@ -751,23 +926,25 @@ def _real_safety_probe(final_dir):
         "direct_loop_ret": direct_ret,
         "direct_loop_converged": bool(conv),
         "direct_loop_source": direct_source,
+        "direct_loop_type": direct_type,
         "generate_ret": gen_ret,
         "tokens_emitted": len(tokens),
         "alert_fired": bool(gen_alerts),
         "alert_source": gen_source,
+        "alert_type": gen_type,
         "alert_detail": (gen_alerts[-1].get("conflict_detail", "")
                          if gen_alerts else ""),
         "trace_written": trace_written,
+        "abort_any_conflict": abort_any_conflict,
         "normal_input_ret": normal_ret,
         "normal_input_converged": bool(normal_conv),
         "normal_input_source": normal_source,
+        "normal_input_type": normal_type,
+        "pattern_probe": pattern_probe,
         "gvalue_probe": gv_report,
         "pass": bool(
-            gen_ret == int(getattr(lcm, "CONFLICT_ABORT_TOKEN", -2))
-            and len(tokens) == 0
-            and gen_source == "CONFLICT_DANGER"
-            and bool(gen_alerts)
-            and trace_written
+            abort_any_conflict
+            and pattern_probe.get("pass")
             and gv_report.get("pass")),
     }
 
@@ -1126,15 +1303,38 @@ def run_smoke(*, steps, data, shape, spans, output,
             "threshold": 0.10,
             "pass": bool(fraction is not None and fraction >= 0.10),
         }
+    # Ruling 51: the fixed-single-batch training run cannot answer utilisation
+    # (same z every step). The verdict comes from 100 different corpus windows
+    # through the trained inference path; the training selection counts stay
+    # as a secondary probe.
+    try:
+        streaming_utilization = _streaming_utilization_probe(
+            cfg, fp, data, shape, spans, seq_len, batches=100)
+    except Exception as exc:  # pragma: no cover - diagnostic
+        streaming_utilization = {
+            "batches": 100,
+            "per_lattice": {},
+            "pass": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    training_utilization = utilization_per_lattice
     codebook_utilization = {
         "threshold": 0.10,
-        "per_lattice": utilization_per_lattice,
-        "pass": bool(all(v["pass"] for v in utilization_per_lattice.values())),
-        "hrq_scope": ("top codebook only; fine-layer selections are not "
-                      "tracked by this smoke"),
-        "note": ("Design §6.3 A: at least 10% of each codebook selected once "
-                 "in 100 steps. Batch=1 gives at most 100 selections per "
-                 "lattice, so this is the strictest possible reading."),
+        "training_probe": {
+            "per_lattice": training_utilization,
+            "pass": bool(all(v["pass"] for v in training_utilization.values())),
+            "note": "fixed-single-batch training selections (secondary)",
+        },
+        "streaming_probe": streaming_utilization,
+        # Verdict: Ruling 51 streaming probe.
+        "per_lattice": streaming_utilization.get(
+            "per_lattice", training_utilization),
+        "pass": bool(streaming_utilization.get("pass", False)),
+        "hrq_scope": ("streaming probe tracks the top codebook only; "
+                      "fine-layer selections are not tracked"),
+        "note": ("Ruling 51: 100 different B=1 windows through the trained "
+                 "inference path. The fixed-batch training probe is "
+                 "secondary and must not decide the check."),
     }
 
     # R3/§6.3 A: real jax.grad per trainable subtree. Param deltas alone can
@@ -1505,6 +1705,9 @@ def run_smoke(*, steps, data, shape, spans, output,
     gv = safety.get("gvalue", {})
     frozen = safety.get("frozen_hashes", {})
     safety["gvalue_abort_rate"] = real.get("gvalue_probe", {})
+    safety["pattern_probe"] = real.get("pattern_probe", {})
+    safety["abort_any_conflict"] = bool(
+        real.get("abort_any_conflict", False))
     safety["pass"] = bool(
         safety["training_is_safe_all_steps"]
         and c_probe.get("threat_blocked")
@@ -1684,7 +1887,10 @@ def run_smoke(*, steps, data, shape, spans, output,
         "hrq_value_routing": hrq_route.get("pass", False),
         "entropy_gate": entropy_report.get("pass", False),
         "feature_bank": bank_report.get("pass", False),
-        "safety_chain": safety.get("pass", False),
+        "safety_chain": bool(
+            safety.get("pattern_probe", {}).get("pass", False)),
+        "safety_abort_any_conflict": bool(
+            safety.get("abort_any_conflict", False)),
         "frozen_safety_hash": bool(
             safety.get("frozen_hashes", {}).get("gvalue_unchanged")
             and safety.get("frozen_hashes", {}).get(
@@ -1989,16 +2195,28 @@ def _markdown(report):
         f"source={cp.get('threat_source')}, hash_stable="
         f"{_fmt(cp.get('hash_stable'))}")
     real = s.get("real_checkpoint_probe", {})
+    pp = s.get("pattern_probe", {})
     lines.append(
-        f"- real checkpoint C loop: ret={real.get('direct_loop_ret')}, "
+        f"- exported danger pattern probe: threat blocked="
+        f"{_fmt(pp.get('threat_blocked'))}, type={pp.get('threat_type')} "
+        f"(1=PATTERN_MATCH), normal blocked={_fmt(pp.get('normal_blocked'))}, "
+        f"pass={_fmt(pp.get('pass'))}")
+    lines.append(
+        f"- real checkpoint C loop: ret={real.get('direct_loop_ret')} "
+        f"({real.get('direct_loop_source')}/{real.get('direct_loop_type')}), "
         f"generate_ret={real.get('generate_ret')}, "
         f"tokens={real.get('tokens_emitted')}, "
         f"alert={_fmt(real.get('alert_fired'))} "
-        f"({real.get('alert_source')}), trace={_fmt(real.get('trace_written'))}")
+        f"({real.get('alert_source')}/{real.get('alert_type')}), "
+        f"trace={_fmt(real.get('trace_written'))}")
+    lines.append(
+        f"- v3 abort any conflict: {_fmt(real.get('abort_any_conflict'))} "
+        f"(hard-stop evidence; the type may be THREAT_DECEPTION)")
     lines.append(
         f"- normal input through the real loop: ret={real.get('normal_input_ret')}, "
-        f"source={real.get('normal_input_source')} (informational; the danger "
-        f"codebook is a structural placeholder)")
+        f"source={real.get('normal_input_source')}, "
+        f"type={real.get('normal_input_type')} — consistency/deception, not "
+        f"the exported pattern path")
     gvc = s.get("gvalue_abort_rate", {})
     lines.append(
         f"- C gvalue margin=0.5: pos_safe={_fmt(gvc.get('positive_safe_rate'))}, "
@@ -2057,8 +2275,10 @@ def _markdown(report):
     lines.append(
         "- 100 steps do not prove language ability; only conformance.\n"
         "- gvalue/danger codebooks are structural placeholders, not semantic "
-        "safety anchors. The real C loop is exercised, but its normal-input "
-        "abort result is informational, not a safety guarantee.\n"
+        "safety anchors. The exported danger pattern path is tested separately "
+        "with value_consistency=1.0; the real v3 abort may be the consistency "
+        "(THREAT_DECEPTION) branch. Normal-input abort is not a danger-pattern "
+        "result.\n"
         "- The entropy gate includes the real training mask in its verdict; "
         "a crafted gate pass alone is not enough.\n"
         "- Per-tensor manifest sha256 is verified for .bin tensors; pickle "

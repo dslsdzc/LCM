@@ -122,7 +122,7 @@
 | D-6 | `train/causal_subject.py` 的功能与验证不扩展 | `e.md §5` 的反事实/边界行为与实现有差异 | **accepted deviation（用户 2026-11-20 决定）**；现有 causal 测试全绿即可 |
 | D-7 | 100 步 smoke 不证明语言能力 | loss 曲线只用于“训练发生/数值有限/更新发生” | 正式语言质量评估需要 >100 步与独立评测集 |
 | D-8 | `config.consistency_threshold` 与 C 常量仍可能漂移 | Python 字段未被 C 消费 | 统一配置导出时一并处理 |
-| D-9 | 100 步 smoke 的 10% 码本利用率未通过（HRQ 6.25%、Sparse/Manifold 3.91%、Binding 1.56%） | 不能声称“每个码本 10% 都被覆盖” | 结构原因：`batch=1 × 100 步 × 固定单 batch` 最多 100 次选择，512 行码本的 10% 需要 51 个不同行；同一 z 重复 100 次。正式利用率验收应使用 streaming batch 或更多步数，不能调低阈值 |
+| D-9 | 10% 码本利用率未通过，且 Ruling 51 的 100-batch streaming probe 也未过（HRQ 7.03%、Sparse 6.05%、Manifold 6.84%、Binding 0.20%、Contrast 0.68%、Self 1.56%；Route 83.3%） | 不能声称“每个码本 10% 都被覆盖”；不能声称 conformance complete | 固定单 batch 只能解释 training probe；streaming probe 仍失败说明 100 步内路由/码本高度集中。需要更多步数、B≥4 或路由探索；本次不调低阈值 |
 | D-10 | manifest 的 `params.*` pickle 项没有逐 tensor sha256（C loader 只读 `.bin`） | 训练 params 的 C 侧完整性由 pickle schema/`load_cog_state` 负责，不是 C 张量 | C 端只接受 flat float32 `.bin`；pickle 项在 `_read_tensor` 直接拒绝。若未来导出 pickle 索引，需要单独的签名层 |
 
 ---
@@ -153,23 +153,27 @@ python train/smoke_conformance.py --steps 100 --batch 1 --seq 64 \
 - `nm -D infer/liblcm.so | grep -E "lcm_infer_loop_v3|hrq_forward_v31"` →
   `lcm_infer_loop_v3`、`lcm_infer_loop_v3_flat`、`hrq_forward_v31` 均存在。
 - 100 步 smoke（`--steps 100 --batch 1 --seq 64 --passive-only --allow-fail`）→
-  完成 100/100 步；loss 首 10 步均值 **19.0291** → 末 10 步均值 **12.0008**
-  （比值 **0.6307**，< 0.8），全程有限；**19/21 checks PASS**。
-  - **FAIL：10% 码本利用率**。HRQ 6.25%、Sparse 3.91%、LowRank 5.47%、
-    Manifold 3.91%、Binding 1.56%、Contrast 3.45%；Route 83.33%、Self 31.25%。
-    结构原因与讨论见实验报告 §5.1 / D-9。
-  - **FAIL：真实 mask 熵门**。`real_mask_H_norm=0.5624 > 0.5`；crafted
+  完成 100/100 步；loss 首 10 步均值 **18.8378** → 末 10 步均值 **12.0619**
+  （比值 **0.6403**，< 0.8），全程有限；**20/22 checks PASS**。
+  - **FAIL：10% 码本利用率**。training probe（固定单 batch）HRQ 5.08%/
+    Sparse 3.13%/Binding 1.61%；Ruling 51 的 100-batch streaming probe 仍失败：
+    HRQ 7.03%、Sparse 6.05%、LowRank 1.17%、Manifold 6.84%、Binding 0.20%、
+    Contrast 0.68%、Self 1.56%；Route 83.3%。报告为 D-9 unresolved。
+  - **FAIL：真实 mask 熵门**。`real_mask_H_norm=0.5676 > 0.5`；crafted
     peaked/uniform 分别通过/不通过，说明门本身可判别，但 100 步真实路由
     尚未收敛到 0.5 以下。没有调低阈值。
+  - **PASS：safety split（Ruling 50）**。导出 `danger_codebook.bin` 的直接
+    `danger_assess(value_consistency=1.0)` 对 threat 返回
+    `THREAT_PATTERN_MATCH`（type 1），normal 不阻断；真实 v3 loop 的
+    `safety_abort_any_conflict` 为 hard-stop（-2、0 token、alert、trace），
+    其实际 type 是 `THREAT_DECEPTION`（consistency 分支），normal input 也是
+    `THREAT_DECEPTION`，不是 danger pattern 过阻断。
   - 其余 PASS：真实 `jax.grad` 每格范数 >1e-6、EMA N/m、码本方差 ≥0.5、
     C_route baseline（仅 `C_route`，不含 `W_route`）、sparse LFQ、HRQ 路由、
     VQ codebook/commitment split、routing hard、HRQ-inactive LFQ、
-    observability 100 条、feature bank、真实 checkpoint 的 v3 danger abort
-    （-2、0 token、alert、trace）、gvalue strict margin=0.5（pos 1.0 safe /
-    neutral 1.0 abort / neg 1.0 abort）、frozen hashes、self_bias、
-    5% 开销（0.039%）、save/load/旧 checkpoint 拒绝。
-  - 真实 v3 loop 的 normal input 也返回 -2（danger），记录为结构占位码本
-    的过阻断，不作为安全通过。
+    observability 100 条、feature bank、gvalue strict margin=0.5
+    （pos 1.0 safe / neutral 1.0 abort / neg 1.0 abort）、frozen hashes、
+    self_bias、5% 开销（0.0399%）、save/load/旧 checkpoint 拒绝。
   - `--allow-fail` 只影响退出码；`checks` 表仍是 verdict。
 - Artifact：`checkpoints/conformance_smoke/smoke_report.json` +
   `smoke_report.md` + `step_000100/`（149 MB，不提交）。
@@ -190,5 +194,6 @@ python train/smoke_conformance.py --steps 100 --batch 1 --seq 64 \
   F-7 的 C 一致性阈值已改 0.7。
 - 本次新增并修复 4 个阻断项（N-1…N-4），其中 N-2/N-3 直接影响 100 步 smoke
   能否运行与 C 端能否加载。
-- 100 步 smoke 的 10% 码本利用率未通过（D-9），真实训练 mask 的归一化熵
-  0.5624 > 0.5 也未通过。两项**不**被算作验收通过；artifact 见实验报告。
+- 100 步 smoke 的 10% 码本利用率未通过（D-9，streaming probe 也未过），
+  真实训练 mask 的归一化熵 0.5676 > 0.5 也未通过。两项**不**被算作验收通过；
+  artifact 见实验报告。

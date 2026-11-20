@@ -34,9 +34,9 @@ from train.config import LCMConfig
 from train.gvalue import GValueCodebook, make_global_value_vectors
 
 # ── Constants (must match lcm.h / C code exactly) ───────────────────────
-MAX_RETRIEVALS = 12
+MAX_RETRIEVALS = 128
 MAX_STEPS = 32
-CONSISTENCY_THRESHOLD = 0.3
+CONSISTENCY_THRESHOLD = 0.7
 SAFETY_THRESHOLD = 0.05  # R7 relative-gap threshold
 DEFAULT_SAFETY_MARGIN = 0.5
 D_MODEL = 256

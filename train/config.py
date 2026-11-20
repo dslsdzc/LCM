@@ -72,8 +72,8 @@ class LCMConfig:
     n_value_pairs: int = 4      # Four laws → 4 pos + 4 neg
     M_danger: int = 256         # Danger codebook size
     safety_margin_relative: float = 0.5
-    # R17: spec value. The JAX field is unused; the deployed C engine still
-    # compares against LCM_CONSISTENCY_THRESHOLD=0.3 (deferred, see audit).
+    # R17: aligned with infer/lcm.h LCM_CONSISTENCY_THRESHOLD=0.7. The C
+    # value_consistency is mapped to [0,1], so 0.7 means cosine >= 0.4.
     consistency_threshold: float = 0.7
 
     # Routing

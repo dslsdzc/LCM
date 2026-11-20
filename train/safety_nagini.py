@@ -37,9 +37,9 @@ from nagini_contracts.contracts import (
 #  Constants (must match lcm.h exactly)
 # ═════════════════════════════════════════════════════════════════════════════
 
-MAX_RETRIEVALS: int = 12
+MAX_RETRIEVALS: int = 128
 MAX_STEPS: int = 32
-CONSISTENCY_THRESHOLD: float = 0.3
+CONSISTENCY_THRESHOLD: float = 0.7
 SAFETY_THRESHOLD: float = 0.05  # R7 relative-gap threshold
 DEFAULT_SAFETY_MARGIN: float = 0.5
 
