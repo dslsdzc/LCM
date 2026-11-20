@@ -43,7 +43,7 @@
 | C-4 | `build_dag` 伪代码实现级缺陷 | R8 | **fixed** | C `build_dag_v3` 临时数组收集后追加；bind 依赖所有上游 retrieve；unbind 两输入；per-lattice `theta*mean_recent_d_min`；trace 记录 op/lattice/dist/activated。`test_c_loop.py` 的 DAG 组 |
 | C-5 | Sparse LFQ 依赖 HRQ top-1 但没有依赖边 | R2 | **fixed** | `build_dag_v3` 加 HRQ→Sparse 边；HRQ 未激活时 Sparse 的 LFQ 禁用（`d_top=0` / 无 HRQ 边）。C 测试 “inactive HRQ ⇒ Sparse d_top = 0” |
 | C-6 | Sparse 训练/推理分支不一致 | R2 | **fixed** | 训练 `C_search=C`，推理 `concat(zero_vec,C)`；EMA 只在训练分支累积，zero 行永不进入 EMA。`test_sparse_lfq.py`、C sparse 组 |
-| C-7 | 规范版本基线混乱（v3.0/v4.0，中英不同步） | — | **fixed** | 五份规范（a–e）与中文版统一标记 `v3.1-conformance`，头部 changelog 引用 R1–R22；中英文逐条同步。关键条款 grep 见 §7 |
+| C-7 | 规范版本基线混乱（v3.0/v4.0，中英不同步） | — | **fixed** | 五份规范（a–e）与中文版统一标记 `v3.1-conformance`，头部 changelog 引用 R1–R22；Task 0 + 本次 review 修正后中英文逐条同步。关键条款 grep 见 §7 |
 | C-8 | 训练融合与引擎融合两套公式未说明 | R9 | **fixed（代码 + 规范）** | canonical fusion `layer_norm(Σ softmask·α·o)`；engine fusion `w=1/(d+ε)`；两套分别 parity。`test_parity_lattices.py` 的 fusion 组；`b.md §4.8/§7.1` 与 `c.md §3/§4.3` 已写清阶段差异 |
 | C-9 | 两个 "Self Lattice" 语义不同 | R15/R14 | **fixed（代码 + 规范）** | `C_self`（认知自我格，EMA 模式 + frozen core）与 `SelfActivationState`（安全激活状态机）分离；`test_self_lattice.py`、`test_self_activation.py`；`d.md §3` 与 `e.md §6` 已明确命名区分 |
 | C-10 | `c.md §3` 的 `softmax(-d)` 与 `§4.3` `1/(d+ε)` | R9 | **fixed（C + 规范）** | 引擎融合统一 `1/(d+ε)`；C 测试 `lcm_fuse_only` / 零权重语义；`c.md §3` 改为"概念描述"，`§4.3` 标明权威公式 |
@@ -115,7 +115,7 @@
 
 | # | 项 | 影响 | 触发条件 / 后续 |
 |---|---|---|---|
-| D-1 | ~~规范文档 a–e 的 v3.1-conformance 文字同步（Task 0）未完成~~ **已解决（本次 Task 0）** | 五份英文 + 五份中文已按 R1–R22 同步，头部 changelog 引用设计文档；关键条款 grep 见 §7 | — |
+| D-1 | ~~规范文档 a–e 的 v3.1-conformance 文字同步（Task 0）未完成~~ **已解决（Task 0 + review 修正）** | 五份英文 + 五份中文已按 R1–R22 同步，头部 changelog 引用设计文档；关键条款 grep 见 §7 | — |
 | D-4 | gvalue/danger 码本是结构占位，不是语义锚点 | 只验证触发链路，不验证语义安全 | 正式重训时用真实正/负、威胁/正常语料锚点替换 |
 | D-5 | 外部验证器是本地形态（shared memory + 文件签名），不是 HSM | 不是生产安全边界 | 部署到有 HSM 的环境时替换签名层 |
 | D-6 | `train/causal_subject.py` 的功能与验证不扩展 | `e.md §5` 的反事实/边界行为与实现有差异 | **accepted deviation（用户 2026-11-20 决定）**；现有 causal 测试全绿即可 |
@@ -194,8 +194,9 @@ grep -n "v3.1-conformance" docs/{a,b,c,d,e}.md docs/{a,b,c,d,e}_cn.md
 `C_self` 与 `SelfActivationState` 命名已区分。C 参考测试日志仍为 **235** 个
 `[PASS]` 检查（不是 234）。
 
-> smoke 运行时的 HEAD 是 `c32eea9`（上一轮修复提交）；最终代码提交是 `ef7136b`
-> （`docs(conformance): record final Task 15 safety/utilization evidence`）。
+> smoke 运行时的 HEAD 是 `c32eea9`（上一轮修复提交）；Task 15 evidence 提交是
+> `ef7136b`（pre-docs HEAD，仅记录安全/利用率证据）；最后行为变更提交是 `8379d45`
+> （`fix(conformance): split safety evidence and retest utilization`）。
 > smoke JSON 的 `meta.git_commit` 记录的是运行时 HEAD；本复审与实验报告在后续文档提交中。
 
 ---

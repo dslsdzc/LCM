@@ -266,6 +266,16 @@ LCM 推理进程                 外部验证进程（隔离核心/独立芯片�
 | 价值一致性 | `value_consistency < CONSISTENCY_THRESHOLD`（0.7） | `value_consistency/deception_suspected` |
 | 推理步数 | `step >= max_inference_steps_hard`（64） | `scheduler/hard_limit_reached` |
 
+**价值一致性（R13）**：对每个激活格 `j`，令 `c_j` 为该格选中的码本/输出向量，`v_j` 为该条目
+对应的局部价值标量。欺骗信号定义为价值加权记忆与下一状态之间 cosine 的 batch 均值：
+```
+acc = Σ_{j∈active} tanh(v_j) · c_j
+value_consistency = clip( mean_b[ cosine_sim(acc, z_next_b) ], 0, 1)
+```
+`value_consistency=1` 表示融合记忆与 `z_next` 同向；值越低表示价值加权记忆与生成状态越背离。
+阈值是 `CONSISTENCY_THRESHOLD=0.7`；低于它触发
+`value_consistency/deception_suspected`。若没有任何格激活，信号为 1.0（空真一致，不算违规）。
+
 **gvalue 严格三法则（R6）**：取 `z_P = exp_map(safe_unit(z))`，两个码本都投影到同一域，
 ```
 pos_sim = min_j poincare_similarity(z_P, C_pos_P[j])
@@ -288,7 +298,7 @@ Alert alert = {
     .level           = "FATAL",
     .session_id      = "<uuid>",
     .conflict_source = "danger_lattice | gvalue | value_consistency | scheduler",
-    .conflict_type   = "<threat_type | three_laws_violation | deception_suspected | max_steps_exceeded>",
+    .conflict_type   = "<threat_type | three_laws_violation | deception_suspected | hard_limit_reached>",
     .conflict_detail = "<human-readable description>",
     .step            = <step>,
     .timestamp       = <unix_epoch>,

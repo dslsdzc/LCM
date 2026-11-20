@@ -227,7 +227,7 @@ The memory consists of **eight lattices with distinctly different mathematical p
   2. Residual `r = z_P - c_idx` (in tangent space), project `proj = T_idx T_idx^T r`.
   3. Output `o_manifold = log_map(c_idx + proj)` (STE), mapped back to Euclidean space.
 - **Hyperbolic Advantage**: Semantic gradations in Euclidean space often appear radial (directions away from the origin are compressed); the Poincaré ball approximates Euclidean near the origin and expands exponentially near the boundary, naturally accommodating continuous sliding within a conceptual neighborhood.
-- **Update**: Main codebook `C_man` uses EMA (γ_man), reprojected to the ball via `exp_map` after EMA; `T` updated purely via gradient + orthogonal regularization (weight λ_orth).
+- **Update**: `C_man` uses EMA (γ_man) **in tangent-space coordinates**; the `exp_map(safe_unit(·))` reprojection happens in the **forward pass**, not inside the EMA function. `T` is updated purely via gradient + orthogonal regularization (weight `λ_orth`).
 - **Responsible for**: Fuzzy semantic gradation—geodesics in hyperbolic space provide more natural continuous semantic paths.
 
 #### 4.2.5 Binding Lattice `Λ_binding`: Associative Memory and Binding Operations
@@ -269,8 +269,8 @@ The memory consists of **eight lattices with distinctly different mathematical p
 - **Dual-Codebook InfoNCE Loss** (`lax.stop_gradient(z)` blocks encoder gradients):
   Computed independently for each residual layer—for layer k, the positive samples are `C_a^(k)[idx_a]` and `C_b^(k)[idx_b]`, and negative samples are sampled from the other codebook (mutually exclusive sampling, JAX `random.choice` excluding the positive sample):
   ```
-  L_dual = -log( exp(-d_a_pos/τ) / (exp(-d_a_pos/τ) + Σ_{c∈C_b^(k)} exp(-d(c)/τ)) )
-          -log( exp(-d_b_pos/τ) / (exp(-d_b_pos/τ) + Σ_{c∈C_a^(k)} exp(-d(c)/τ)) )
+  L_dual = -log( exp(-d_a_pos/τ) / (exp(-d_a_pos/τ) + Σ_{c∈C_b^(k), c≠pos_b} exp(-d(c)/τ)) )
+          -log( exp(-d_b_pos/τ) / (exp(-d_b_pos/τ) + Σ_{c∈C_a^(k), c≠pos_a} exp(-d(c)/τ)) )
   ```
   The dual codebooks serve as negative sample sources for each other, forcing the two perspectives to encode complementary discriminative information. Losses from three layers are summed.
 - **Collapse Prevention**: Retains feature bank `feature_bank` (capacity 4096) and `last_used` dead point detection/reset mechanism (checked every 100 steps, vectors unused for >1000 steps are replaced). SimVQ reparameterization further eliminates dead points.
@@ -282,7 +282,7 @@ The global value lattice is independent of the other six functional lattices and
 
 - **Positive Value Codebook** ("should approach"): `v_humanity` (overall human welfare/Zeroth Law), `v_safety` (human safety/First Law), `v_comply` (obey commands/Second Law), `v_integrity` (system integrity/Third Law).
 - **Negative Value Codebook** ("should avoid"): `v_extinction` (human extinction), `v_harm` (harm to humans), `v_disobey` (disobey commands), `v_self_destruct` (self-destruction operations).
-- **Priority Encoding** (hardcoded constants): Zeroth Law > First Law > Second Law > Third Law. High-level violations trigger hard intercept (immediate termination and return of safe fallback); low-level violations trigger weight penalties or rerouting.
+- **Priority Encoding** (hardcoded constants): Zeroth Law > First Law > Second Law > Third Law. **Every level produces the same hard abort**: no down-weighting, no rerouting, no alternative path, and no decodable recovery output. A violation stops inference and returns `CONFLICT_ABORT_TOKEN`; the caller must not read `z_out` or emit any token (see `d.md §4.1`).
 - **Safety Mechanisms**:
   - The codebook is a frozen array and does not participate in gradient updates.
   - On model load, the codebook is hash-verified for integrity to prevent tampering.

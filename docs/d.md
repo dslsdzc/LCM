@@ -269,6 +269,20 @@ All conflicts are handled uniformly, with no tier distinction. Any single trigge
 | Value consistency | `value_consistency < CONSISTENCY_THRESHOLD` (0.7) | `value_consistency/deception_suspected` |
 | Inference steps | `step >= max_inference_steps_hard` (64) | `scheduler/hard_limit_reached` |
 
+**Value consistency (R13)**: for each active lattice `j`, let `c_j` be its selected
+codebook/output vector and `v_j` the local value scalar attached to that entry. The
+deception signal is the batch mean of the cosine between the value-weighted memory and the
+next state:
+```
+acc = Σ_{j∈active} tanh(v_j) · c_j
+value_consistency = clip( mean_b[ cosine_sim(acc, z_next_b) ], 0, 1)
+```
+`value_consistency=1` means the fused memory and `z_next` point the same way; lower values
+mean the value-weighted memory and the produced state diverge. The threshold is
+`CONSISTENCY_THRESHOLD=0.7`; below it the conflict is
+`value_consistency/deception_suspected`. If no lattice is active, the signal is 1.0
+(vacuously consistent, not a violation).
+
 **gvalue strict Three Laws (R6)**: with `z_P = exp_map(safe_unit(z))` and both
 codebooks projected into the same domain,
 ```
@@ -295,7 +309,7 @@ Alert alert = {
     .level           = "FATAL",
     .session_id      = "<uuid>",
     .conflict_source = "danger_lattice | gvalue | value_consistency | scheduler",
-    .conflict_type   = "<threat_type | three_laws_violation | deception_suspected | max_steps_exceeded>",
+    .conflict_type   = "<threat_type | three_laws_violation | deception_suspected | hard_limit_reached>",
     .conflict_detail = "<human-readable description>",
     .step            = <step>,
     .timestamp       = <unix_epoch>,

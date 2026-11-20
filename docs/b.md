@@ -377,7 +377,7 @@ score(z, c_j) = -‖z - c_j‖² + α_val · tanh(v_j) · avg_dist²
 `α_val` is therefore dimensionless. `argmax_j score` selects the code; with `α_val=0` this is
 exactly the plain nearest-neighbour `argmin` of the squared distance.
 
-**Global value lattice**: Independent positive/negative value codebook (see 4.7), frozen after training, providing cross-lattice value constraints during inference and fusion.
+**Global value lattice**: Independent positive/negative value codebook (see 4.7), frozen after training, providing cross-lattice value constraints during **inference and value loss** — not in the fusion weights (R5).
 
 ### 4.0 Routing Lattice `Λ_route`
 - Codebook `C_route ∈ R^{n_lattices×d}` (`n_lattices=6`), set as learnable parameters, updated via pure gradient.
@@ -387,7 +387,7 @@ exactly the plain nearest-neighbour `argmin` of the squared distance.
   logits = Linear_route(z_route)                   # (B, n_lattices)
   soft_mask = GumbelSoftmax(logits, tau=0.5, hard=False, axis=-1)  # (B, n_lattices)
   ```
-  During training `hard=False` is fully differentiable; during inference `hard=True` gives a one-hot mask. Gradients flow from `soft_mask` → `logits` → `z_route` → STE → `z`, without interruption.
+  During training `hard=False` keeps the Gumbel noise and is fully differentiable. During inference the routing gate uses a deterministic `one_hot(argmax(logits))` and injects **no** Gumbel noise. Gradients flow from `soft_mask` → `logits` → `z_route` → STE → `z`, without interruption.
 - **VQ loss**: `L_route = β ‖sg[z] − z_route‖²`, β=0.25.
 - **Update**: Both `C_route` and `Linear_route` are updated directly by gradients, no EMA needed.
 
@@ -760,7 +760,7 @@ L_VQ    = L_codebook + L_commitment
 | Hyperbolic Manifold Lattice | Main codebook EMA (γ_man) on tangent coordinates, T pure gradient | HyperVQ + hyperbolic tangent space; reprojection on forward |
 | Residual Binding Lattice | Three sub-lattices per-layer EMA (γ_bind), A_k/A_v pure gradient | Cross-layer binding (reuses shared basis V) |
 | Dual-Codebook Contrast Lattice | **Pure gradient** (SimVQ) + feature bank reset | DualVC dual-view InfoNCE, τ=0.1 |
-| Routing Lattice | **Pure gradient** | Gumbel-Softmax; inference hard one-hot |
+| Routing Lattice | **Pure gradient** | Gumbel-Softmax with noise in training; deterministic `one_hot(argmax)` at inference, no noise |
 | Self Lattice `C_self` | Row 0 (`core`) frozen; rows 1: EMA (γ_self=0.99) | Cognitive self lattice (`e.md §6`), fusion item; not the `SelfActivationState` safety machine |
 | Global Value Lattice (Three Laws) | **Permanently frozen** | JAX frozen parameters, hash verification for tamper protection |
 | Danger Lattice `Λ_danger` | **Permanently frozen** (read-only monitoring) | Safety highest priority, see `d.md` for details |
@@ -773,7 +773,7 @@ L_VQ    = L_codebook + L_commitment
 - Cognitive LCM: all `A`, `W` matrices of the dual-codebook contrast lattice
 - Cognitive LCM: routing lattice codebook `C_route` and projection `W_route`
 - Cognitive LCM: scaling factors `α_i`
-- Cognitive LCM: local value scalars `v_j` (gradient only through the STE relaxation; they never scale the forward codebook vector)
+- Cognitive LCM: local value scalars `v_j` (gradient from the HRQ top-k STE proxy and the optional `L_val`; they do not scale the forward codebook vector, but they do affect retrieval selection)
 - Cognitive LCM: binding lattice key-value projection matrices `A_k`, `A_v` (reusing low-rank lattice shared basis `V`)
 - **Frozen LLM (historical, deprecated)**: all parameters (encoder + 6 codebooks + fusion + W_out) — LangLCM transitional concept
 
@@ -859,9 +859,12 @@ sampling). All of these use `lax.stop_gradient` observations and live outside `j
 shapes are dynamic.
 
 ### 7.2 Training Step Pseudocode
+The jitted function is the pure loss/gradient/optimizer update. The outer `train_step`
+is a **non-jitted Python wrapper** that performs EMA and feature-bank updates after the
+jitted call; those updates need dynamic shapes (dead-code indices) and live outside `jit`.
 ```python
 @jax.jit
-def train_step(params, opt_state, batch, rng):
+def loss_and_update(params, opt_state, batch, rng):
     x, y_lm = batch
 
     def loss_fn(params):
@@ -878,8 +881,16 @@ def train_step(params, opt_state, batch, rng):
     (total_loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
     updates, opt_state = optimizer.update(grads, opt_state, params)
     params = optax.apply_updates(params, updates)
+    return params, opt_state, total_loss, aux
 
-    # EMA updates only for EMA-managed lattices (outside the jit loss)
+
+def train_step(params, opt_state, batch, rng, step):
+    # Jitted part: loss, gradient, optimizer update only.
+    params, opt_state, total_loss, aux = loss_and_update(
+        params, opt_state, batch, rng)
+    z = aux[0]
+
+    # EMA updates only for EMA-managed lattices (outside the jit function)
     params = ema_update_sparse(params, lambda_shrink=λ_shrink)
     params = ema_update_manifold(params)   # tangent coordinates
     params = ema_update_binding(params)
@@ -889,7 +900,7 @@ def train_step(params, opt_state, batch, rng):
     params = feed_and_reset_sparse_bank(params, z, step)
     params = feed_and_reset_contrast_bank(params, z, step)
 
-    return params, opt_state, total_loss
+    return params, opt_state, total_loss, aux
 ```
 
 `optimizer.update` only sees the `trainable` group; `ema`/`frozen` are isolated with

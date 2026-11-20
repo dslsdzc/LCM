@@ -69,7 +69,7 @@ float* dynamic_inference(float* z_initial, Memory* mem, GValue* gv,
         float* outputs; float* confidences;
         execute_dag(dag, &outputs, &confidences);
         // 3. 融合：w_i = 1/(d_i+eps)，见 §4.3
-        float* z_next; float weights[6]; int n_active;
+        float* z_next; float weights[MAX_LATTICES]; int n_active; /* 7 槽；Self 不在此融合 */
         distance_weighted_fusion(outputs, confidences, gv, &z_next, weights,
                                  &n_active);
 
@@ -124,6 +124,12 @@ float* dynamic_inference(float* z_initial, Memory* mem, GValue* gv,
 **熵门（R9）**：`H_norm = H(w) / ln(n_active)` 使用本步**实际激活**的节点数，不是固定 6 或 7；
 `n_active=1` 时 `H_norm=0`。阈值 0.5。原始 nats（`H<0.5`）对 6 格融合不可达（`ln 6≈1.79`），
 这正是 F-6 缺陷。
+
+**索引与 Self（R15）**：`MAX_LATTICES=7` 包含 `LATTICE_SELF`。`cand[]` 声明为
+`MAX_LATTICES + 1` 只是溢出保护；`active[]` 与 `retrieve[]` 按 `lattice_id` 索引，最多 7 项。
+Self 的输出是独立的加性项 `self_bias·z_self`，**从不进入 `distance_weighted_fusion`**，因此
+`n_active <= 6`。`weights[]` 有 `MAX_LATTICES` 个槽位，Self 槽不会越界，但融合循环只走到
+`n_routed` 个功能格。
 
 ```c
 /* === 冲突类型枚举与结构体 === */
@@ -322,13 +328,16 @@ DAG build_dag(const float* z, Memory* mem, int value_bias) {
             bind_node->inputs[i] = retrieve[i]->output;
     }
 
-    /* unbind：inputs[0] = bind 输出，inputs[1] = 查询键。 */
+    /* unbind：inputs[0] = bind 输出。inputs[1] = 键投影。
+     * `retrieve[0]` 是键格的检索输出；追加阶段把键格排在最前，因此该指针
+     * 有顺序保证，且与 bind 消费的是同一个键。A_k z 投影由绑定格自己拥有，
+     * 不是公共原语。 */
     if (bind_node) {
         OpNode* node = dag_push(&dag, OP_HRR_UNBIND, /*lattice_id=*/ALL,
                                 0.0f, z);
         node->n_inputs = 2;
         node->inputs[0] = bind_node->output;
-        node->inputs[1] = retrieve[0]->output;  /* 与 bind 消费同一个键 */
+        node->inputs[1] = retrieve[0]->output;
     }
 
     return dag;  /* execute_dag 负责 distance_weighted_fusion */

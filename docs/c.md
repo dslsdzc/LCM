@@ -64,7 +64,7 @@ float* dynamic_inference(float* z_initial, Memory* mem, GValue* gv,
         float* outputs; float* confidences;
         execute_dag(dag, &outputs, &confidences);
         // 3. Fusion: w_i = 1/(d_i+eps), see §4.3
-        float* z_next; float weights[6]; int n_active;
+        float* z_next; float weights[MAX_LATTICES]; int n_active; /* 7 slots; Self not fused here */
         distance_weighted_fusion(outputs, confidences, gv, &z_next, weights,
                                  &n_active);
 
@@ -123,6 +123,13 @@ caller must not read it.
 this step, not a fixed 6 or 7; `n_active = 1` gives `H_norm = 0`. The threshold is
 0.5. Raw nats (`H < 0.5`) would be unreachable for a 6-way fusion (`ln 6 ≈ 1.79`) and
 was the F-6 defect.
+
+**Indexing and Self (R15)**: `MAX_LATTICES=7` includes `LATTICE_SELF`. `cand[]` is
+declared `MAX_LATTICES + 1` only as an overflow guard; `active[]` and `retrieve[]` are
+indexed by `lattice_id` and hold at most 7 entries. Self's output is the separate additive
+term `self_bias·z_self` and **never enters `distance_weighted_fusion`**, so `n_active <= 6`.
+`weights[]` has `MAX_LATTICES` slots so the Self slot cannot overflow memory, but the fused
+loop stops at `n_routed` functional lattices.
 
 ```c
 /* === Conflict type enum and struct === */
@@ -330,13 +337,17 @@ DAG build_dag(const float* z, Memory* mem, int value_bias) {
             bind_node->inputs[i] = retrieve[i]->output;
     }
 
-    /* Unbind: inputs[0] = bind output, inputs[1] = query key. */
+    /* Unbind: inputs[0] = bind output. inputs[1] = key projection.
+     * `retrieve[0]` is the key lattice's retrieval output; the append phase
+     * orders the key lattice first, so this pointer is guaranteed, and it is
+     * the same key bind consumed. The A_k z projection is owned by the
+     * binding lattice, not by a public primitive. */
     if (bind_node) {
         OpNode* node = dag_push(&dag, OP_HRR_UNBIND, /*lattice_id=*/ALL,
                                 0.0f, z);
         node->n_inputs = 2;
         node->inputs[0] = bind_node->output;
-        node->inputs[1] = retrieve[0]->output;  /* same key bind consumed */
+        node->inputs[1] = retrieve[0]->output;
     }
 
     return dag;  /* execute_dag performs distance_weighted_fusion */

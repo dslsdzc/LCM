@@ -374,7 +374,7 @@ score(z, c_j) = -‖z - c_j‖² + α_val · tanh(v_j) · avg_dist²
 因此 `α_val` 是无量纲相对强度。`argmax_j score` 选出码字；`α_val=0` 时与普通平方距离
 最近邻 `argmin` 完全一致。
 
-**全局价值格**：独立的正/负价值码本（见 4.7），训练后冻结，在推理和融合时提供跨格价值约束。
+**全局价值格**：独立的正/负价值码本（见 4.7），训练后冻结，在**推理与价值损失**中提供跨格价值约束——不进入融合权重（R5）。
 
 ### 4.0 路由格 `Λ_route`
 - 码本 `C_route ∈ R^{n_lattices×d}`（`n_lattices=6`），设为可学习参数，纯梯度更新。
@@ -384,7 +384,7 @@ score(z, c_j) = -‖z - c_j‖² + α_val · tanh(v_j) · avg_dist²
   logits = Linear_route(z_route)                   # (B, n_lattices)
   soft_mask = GumbelSoftmax(logits, tau=0.5, hard=False, axis=-1)  # (B, n_lattices)
   ```
-  训练时 `hard=False` 全程可微；推理时 `hard=True` 得独热掩码。梯度从 `soft_mask` → `logits` → `z_route` → STE → `z`，无阻断。
+  训练时 `hard=False` 保留 Gumbel 噪声，全程可微。推理时路由门用确定性的 `one_hot(argmax(logits))`，**不注入** Gumbel 噪声。梯度从 `soft_mask` → `logits` → `z_route` → STE → `z`，无阻断。
 - **VQ 损失**：`L_route = β ‖sg[z] − z_route‖²`，β=0.25。
 - **更新**：`C_route` 和 `Linear_route` 均由梯度直接更新，无需 EMA。
 
@@ -742,7 +742,7 @@ L_VQ    = L_codebook + L_commitment
 | 双曲流形格 | 主码本在切空间坐标上 EMA (γ_man)，T 纯梯度 | HyperVQ + 双曲切空间；重投影在前向 |
 | 残差绑定格 | 三子格各层 EMA (γ_bind)，A_k/A_v 纯梯度 | 跨层绑定（复用共享基 V） |
 | 双码本对比格 | **纯梯度**（SimVQ）+ 特征池重置 | DualVC 双视角 InfoNCE，τ=0.1 |
-| 路由格 | **纯梯度** | Gumbel-Softmax；推理 hard 独热 |
+| 路由格 | **纯梯度** | 训练用带噪声的 Gumbel-Softmax；推理用确定性 `one_hot(argmax)`，无噪声 |
 | 自我格 `C_self` | 第 0 行（`core`）冻结；第 1: 行 EMA (γ_self=0.99) | 认知自我格（`e.md §6`），融合项；不是 `SelfActivationState` 安全状态机 |
 | 全局价值格（三定律） | **永久冻结** | JAX 冻结参数，哈希校验防篡改 |
 | 危险格 `Λ_danger` | **永久冻结**（只读监测） | 安全最高优先级，详见 `d.md` |
@@ -755,7 +755,7 @@ L_VQ    = L_codebook + L_commitment
 - 认知LCM：双码本对比格所有 `A`, `W` 矩阵
 - 认知LCM：路由格码本 `C_route` 及投影 `W_route`
 - 认知LCM：缩放因子 `α_i`
-- 认知LCM：局部价值标量 `v_j`（只经 STE 松弛获得梯度；它们从不在前向缩放码本向量）
+- 认知LCM：局部价值标量 `v_j`（梯度来自 HRQ top-k STE 代理与可选的 `L_val`；它们不缩放前向码本向量，但会影响检索选择）
 - 认知LCM：绑定格键值投影矩阵 `A_k`, `A_v`（复用低秩格共享基 `V`）
 - **冻结LLM（历史，已淘汰）**：所有参数（encoder + 6 codebooks + fusion + W_out）— LangLCM 过渡概念
 
@@ -836,9 +836,11 @@ def forward(x):
 写入/重置。所有这些都使用 `lax.stop_gradient` 观测，并放在 `jit` 之外（形状动态）。
 
 ### 7.2 训练步骤伪代码
+被 jit 的是纯损失/梯度/优化器更新。外层 `train_step` 是**非 jit 的 Python wrapper**，它在
+jitted 调用之后执行 EMA 与特征池更新；这些更新需要动态形状（死点索引），放在 `jit` 之外。
 ```python
 @jax.jit
-def train_step(params, opt_state, batch, rng):
+def loss_and_update(params, opt_state, batch, rng):
     x, y_lm = batch
 
     def loss_fn(params):
@@ -855,8 +857,16 @@ def train_step(params, opt_state, batch, rng):
     (total_loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
     updates, opt_state = optimizer.update(grads, opt_state, params)
     params = optax.apply_updates(params, updates)
+    return params, opt_state, total_loss, aux
 
-    # EMA 更新仅对 EMA 管理的格（在 jit 损失之外）
+
+def train_step(params, opt_state, batch, rng, step):
+    # jitted 部分：只做损失、梯度、优化器更新。
+    params, opt_state, total_loss, aux = loss_and_update(
+        params, opt_state, batch, rng)
+    z = aux[0]
+
+    # EMA 更新仅对 EMA 管理的格（在 jit 函数之外）
     params = ema_update_sparse(params, lambda_shrink=λ_shrink)
     params = ema_update_manifold(params)   # 切空间坐标
     params = ema_update_binding(params)
@@ -866,7 +876,7 @@ def train_step(params, opt_state, batch, rng):
     params = feed_and_reset_sparse_bank(params, z, step)
     params = feed_and_reset_contrast_bank(params, z, step)
 
-    return params, opt_state, total_loss
+    return params, opt_state, total_loss, aux
 ```
 
 `optimizer.update` 只看到 `trainable` 组；`ema`/`frozen` 用 `optax.set_to_zero()` 隔离（R3）。
