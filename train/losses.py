@@ -94,6 +94,167 @@ def commit_loss(z, C, beta=0.25):
     return beta * jnp.mean((lax.stop_gradient(z_n) - C_n[idx]) ** 2)
 
 
+# ── R18: layered codebook / commitment losses ──────────────────────────────
+#
+# These are two distinct terms, not one name used for both directions:
+#
+#   codebook loss    β·mean((sg[r] − C[idx])²)   → gradient only to C
+#   commitment loss  β·mean((r − sg[C[idx]])²)   → gradient only to r
+#
+# b.md §4.0.3's residual_vq_commit_loss is the first form. It moves the
+# codebook toward the encoder, and does nothing for the encoder. The second
+# form is what pulls the encoder (and upper residual layers) toward the
+# codebook. EMA-managed codebooks (sparse/manifold/binding) never receive
+# gradients — their codebook term is skipped (see cognitive_vq_losses), but
+# the commitment term still trains the encoder.
+
+def _codebook_term(r, q, beta):
+    """β·mean((sg[r] − q)²) for an already-gathered quantised vector q."""
+    return beta * jnp.mean((lax.stop_gradient(r) - q) ** 2)
+
+
+def _commitment_term(r, q, beta):
+    """β·mean((r − sg[q])²) for an already-gathered quantised vector q."""
+    return beta * jnp.mean((r - lax.stop_gradient(q)) ** 2)
+
+
+def codebook_loss(r, C, idx, beta=0.25):
+    """VQ codebook loss: ``β·mean((sg[r] − C[idx])²)``.
+
+    Gradient flows only into the codebook ``C``; ``r`` is detached.
+    """
+    return _codebook_term(r, C[idx], beta)
+
+
+def commitment_loss(r, C, idx, beta=0.25):
+    """VQ commitment loss: ``β·mean((r − sg[C[idx]])²)``.
+
+    Gradient flows only into ``r`` (the encoder / upper residual layer); the
+    selected codebook row is detached.
+    """
+    return _commitment_term(r, C[idx], beta)
+
+
+def hrq_vq_loss(params, z, aux, cfg: LCMConfig):
+    """Per-layer HRQ codebook/commitment losses in post-``log_map`` space.
+
+    R18: HRQ's loss lives in the Euclidean space after ``log_map``, not in the
+    tangent-space residual ``r``. ``hrq_forward`` already returns one
+    continuous/quantised pair per layer (top-1 plus each fine layer) in that
+    space, so this consumes the forward pass instead of re-running it.
+
+    Args:
+        params: HRQ params (used only to document the layer source; the pairs
+            are already materialised in ``aux``).
+        z: (B, d) tangent-space input to the lattice (unused; kept for the
+            interface fixed by the task).
+        aux: the step/loop aux dict carrying ``hrq_vq`` — or that dict itself.
+        cfg: LCMConfig; ``cfg.beta_vq`` is the weight.
+
+    Returns:
+        (codebook, commitment), each a ``(1 + n_fine,)`` array of per-layer
+        scalars. The top-level prototype is the first entry.
+    """
+    pairs = aux['hrq_vq'] if isinstance(aux, dict) and 'hrq_vq' in aux else aux
+    cont, quant = pairs['cont'], pairs['quant']
+    beta = cfg.beta_vq
+    codebook = jnp.stack([_codebook_term(c, q, beta)
+                          for c, q in zip(cont, quant)])
+    commitment = jnp.stack([_commitment_term(c, q, beta)
+                            for c, q in zip(cont, quant)])
+    return codebook, commitment
+
+
+def cognitive_vq_losses(params, stats, cfg: LCMConfig):
+    """Compose the whole R18 loss from one forward pass's stats.
+
+    ``stats`` is the last step of ``cog_loop_scan(..., return_stats=True)`` or
+    the aux returned by ``six_lattice_step``: it carries the per-layer
+    continuous/quantised vectors, residual inputs and selection indices the
+    losses need, so nothing is recomputed with a second full forward pass.
+
+    Returns:
+        (total, parts): ``total`` is the scalar added to the training loss
+        (codebook + commitment); ``parts`` holds per-lattice and split totals
+        for logging. EMA-owned codebooks report a zero codebook term by design.
+    """
+    z = stats['z_in']
+    beta = cfg.beta_vq
+    parts = {}
+
+    # HRQ — pure gradient: top + every fine layer, both terms.
+    hrq_cb, hrq_cm = hrq_vq_loss(params['hrq'], z, stats, cfg)
+    parts['hrq_codebook'] = jnp.sum(hrq_cb)
+    parts['hrq_commitment'] = jnp.sum(hrq_cm)
+
+    # Sparse — EMA codebook: skip codebook, keep commitment.
+    parts['sparse_codebook'] = jnp.array(0.0)
+    parts['sparse_commitment'] = commitment_loss(
+        z, params['sparse']['C'], stats['sparse_idx'], beta)
+
+    # LowRank — pure gradient: every rank layer.
+    lowrank_cb = jnp.array(0.0)
+    lowrank_cm = jnp.array(0.0)
+    V = params['lowrank']['A_V'] @ params['lowrank']['W_V']
+    lr_aux = stats['lowrank_aux']
+    for u_k, rank, residual, idx in zip(
+            params['lowrank']['U'], cfg.ranks,
+            lr_aux['residuals'], lr_aux['indices']):
+        C_k = u_k @ V[:, :rank].T
+        lowrank_cb = lowrank_cb + codebook_loss(residual, C_k, idx, beta)
+        lowrank_cm = lowrank_cm + commitment_loss(residual, C_k, idx, beta)
+    parts['lowrank_codebook'] = lowrank_cb
+    parts['lowrank_commitment'] = lowrank_cm
+
+    # Manifold — EMA codebook: skip codebook; commitment in log_map space.
+    C_man = log_map(exp_map(params['manifold']['C']))
+    parts['manifold_codebook'] = jnp.array(0.0)
+    parts['manifold_commitment'] = commitment_loss(
+        z, C_man, stats['man_idx'], beta)
+
+    # Binding — three EMA sub-codebook families, each layer's own residual.
+    binding_cm = jnp.array(0.0)
+    for family in ('key', 'val', 'bind'):
+        for cb, residual, idx in zip(
+                params['binding'][f'{family}_cb'],
+                stats['binding_residuals'][family],
+                stats['binding_indices'][family]):
+            binding_cm = binding_cm + commitment_loss(
+                residual, cb['A'] @ cb['W'], idx, beta)
+    parts['binding_codebook'] = jnp.array(0.0)
+    parts['binding_commitment'] = binding_cm
+
+    # Contrast — pure gradient: C_a and C_b, every layer, both terms.
+    contrast_cb = jnp.array(0.0)
+    contrast_cm = jnp.array(0.0)
+    for family in ('a', 'b'):
+        fam_aux = stats['contrast_aux'][family]
+        for cb, residual, idx in zip(
+                params['contrast'][f'C_{family}'],
+                fam_aux['residuals'], fam_aux['indices']):
+            C_k = cb['A'] @ cb['W']
+            contrast_cb = contrast_cb + codebook_loss(residual, C_k, idx, beta)
+            contrast_cm = contrast_cm + commitment_loss(
+                residual, C_k, idx, beta)
+    parts['contrast_codebook'] = contrast_cb
+    parts['contrast_commitment'] = contrast_cm
+
+    # Routing — pure gradient, one term each. ``route_commit_loss`` is the
+    # codebook direction (its argument is the raw C_route[idx], not the STE
+    # output); commitment_loss supplies the encoder-side pull.
+    C_route = params['route']['C_route']
+    route_idx = stats['route_idx']
+    parts['route_codebook'] = route_commit_loss(
+        z, C_route[route_idx], beta)
+    parts['route_commitment'] = commitment_loss(z, C_route, route_idx, beta)
+
+    codebook = sum(v for k, v in parts.items() if k.endswith('_codebook'))
+    commitment = sum(v for k, v in parts.items() if k.endswith('_commitment'))
+    parts['codebook'] = codebook
+    parts['commitment'] = commitment
+    return codebook + commitment, parts
+
+
 def compute_contrast_loss(params, z, cfg: LCMConfig, gvalue=None):
     """Contrastive InfoNCE loss (detached from encoder).
 

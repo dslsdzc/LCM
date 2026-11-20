@@ -78,7 +78,7 @@ def test_hrq_top_retrieval_picks_nearest():
     z = jnp.array([[0.2, 0.0]])
     z_P = exp_map(z)
     sims = poincare_similarity(z_P[:, None, :], C_P[None, :, :]).squeeze(-1)
-    o, idx, top_sim = hrq_forward(params, z, tau_fallback=0.1)
+    o, idx, top_sim, _ = hrq_forward(params, z, tau_fallback=0.1)
     assert int(idx[0]) == 0, f"expected nearest proto 0, got {int(idx[0])}"
     assert jnp.allclose(top_sim, sims[0].min(), atol=1e-6), \
         "top_sim must be the similarity of the nearest (argmin) prototype"
@@ -97,7 +97,7 @@ def test_hrq_fallback_uses_closest_pair():
     z = jnp.array([[0.2, 0.2]])  # equidistant from proto 0 and proto 1
     z_P = exp_map(z)
     sims = poincare_similarity(z_P[:, None, :], C_P[None, :, :]).squeeze(-1)
-    o, idx, _ = hrq_forward(params, z, tau_fallback=0.1)
+    o, idx, _, _ = hrq_forward(params, z, tau_fallback=0.1)
     # argmin of (nearly) equal sims → one of the two close protos, never the far one
     assert int(idx[0]) in (0, 1), f"expected near proto, got {int(idx[0])}"
     ref_w = _ref_route(z_P, sims, C_P, params['fine'], weighted=True)
@@ -113,7 +113,7 @@ def test_hrq_value_scalars_branch_unchanged():
     z = jnp.array([[0.2, 0.0]])
     # v=[0,1,0], alpha large → proto 1 (farther, but valuable) wins
     vs = jnp.array([0.0, 1.0, 0.0])
-    o, idx, _ = hrq_forward(params, z, tau_fallback=0.1,
+    o, idx, _, _ = hrq_forward(params, z, tau_fallback=0.1,
                             value_scalars=vs, alpha_val=2.0)
     assert int(idx[0]) == 1, f"value-biased argmax should pick proto 1, got {int(idx[0])}"
     assert jnp.all(jnp.isfinite(o))

@@ -49,6 +49,7 @@ from train.ema_state import (
 from train.feature_bank import FeatureBank
 from train.param_groups import merge_params, partition_params
 from train.lattices import contrast_info_nce_loss, manifold_orth_loss
+from train.losses import cognitive_vq_losses
 from train.qwen_lm import qwen_forward, load_qwen_params, QWEN_CONFIG
 from train.checkpoint import (
     FORMAT_VERSION, HEADER_FMT_V2, HEADER_SIZE_V2, save_manifest,
@@ -414,7 +415,7 @@ def _simvq_codebook(simvq):
 
 
 def pack_codebooks_for_c(p):
-    """Extract all codebook (K_i, d) matrices into flat list for cognitive loop."""
+    """Extract all codebook (K_i, d) matrices into a flat list for export."""
     flat = []
 
     # HRQ: top + fine per layer
@@ -444,6 +445,12 @@ def pack_codebooks_for_c(p):
     for i in range(len(p['contrast']['C_a'])):
         flat.append(_simvq_codebook(p['contrast']['C_a'][i]))
         flat.append(_simvq_codebook(p['contrast']['C_b'][i]))
+
+    # Routing (R19): C_route is a real codebook and W_route the gate matrix.
+    # Neither participates in the six-lattice fusion, but dropping them here
+    # left exports without routing data.
+    flat.append(p['route']['C_route'])
+    flat.append(p['route']['W_route'])
 
     return flat
 
@@ -546,9 +553,11 @@ def make_train_step(cfg, optimizer, joint=False):
     Self-lattice provides internal state machine (mode selection, self output).
 
     When joint=True, additional Stage 3 losses are computed:
-      - VQ commitment (all codebooks)
       - Contrastive NCE
       - Manifold orthogonality
+
+    The R18 layered codebook/commitment losses run unconditionally (also when
+    joint=False); they are main training losses, not Stage 3 extras.
     """
 
     @jax.jit
@@ -583,7 +592,6 @@ def make_train_step(cfg, optimizer, joint=False):
         def loss_fn(p_trainable):
             p = merge_params(p_trainable, ema_params, frozen_params)
             z = encoder_forward(p['encoder'], ctx, cfg.n_heads)  # (B, d)
-            codebooks = pack_codebooks_for_c(p)
 
             # ── Normalise encoder output to the unit sphere ───────────────
             # The canonical path (model.forward) does exactly this, and the six
@@ -698,16 +706,16 @@ def make_train_step(cfg, optimizer, joint=False):
                 jnp.where(conv, 0.001 * jnp.log(
                     (n_steps.astype(jnp.float32) + 1e-8) / cfg.max_inference_steps), 0.0))
 
-            # ── Stage 3 joint losses ─────────────────────────────────────
-            stage3_extra = {}
+            # ── R18: layered codebook/commitment losses ──────────────────
+            # These are main training losses, not Stage-3 extras: they run
+            # unconditionally, including joint=False. They consume the last
+            # loop step's forward outputs (the same stats the EMA pass uses),
+            # so no second full forward pass is made.
+            vq_loss, vq_parts = cognitive_vq_losses(p, loop_stats, cfg)
+            loss = loss + vq_loss
+            stage3_extra = {f'vq_{key}': value
+                            for key, value in vq_parts.items()}
             if joint:
-                vq_total = jnp.array(0.0)
-                for cb in codebooks:
-                    dists = jnp.sum((z[:, None, :] - cb[None, :, :]) ** 2, axis=-1)
-                    vq_total = vq_total + jnp.mean(dists.min(axis=-1))
-                stage3_extra['vq'] = vq_total
-                loss = loss + cfg.beta_vq * vq_total
-
                 if 'contrast' in p:
                     c_loss = cfg.lambda_contrast * contrast_info_nce_loss(
                         p['contrast'], z, tau=0.5)
@@ -718,16 +726,10 @@ def make_train_step(cfg, optimizer, joint=False):
                     # λ·‖Tᵀ T − I‖², NOT λ·mean(Σ T²). The latter is plain
                     # weight decay on the tangent basis: it drives T → 0 rather
                     # than towards an orthonormal frame, collapsing the tangent
-                    # space the manifold lattice projects into.
-                    # No forward pass here, so the active manifold codes are
-                    # recomputed with the same Euclidean criterion this loop
-                    # already uses for its VQ term.
-                    C_man = p['manifold']['C']
-                    man_idx = jnp.argmin(
-                        jnp.sum((z[:, None, :] - C_man[None, :, :]) ** 2, axis=-1),
-                        axis=-1)
+                    # space the manifold lattice projects into. The active rows
+                    # come from the loop's own forward, not a recomputed argmin.
                     o_loss = manifold_orth_loss(
-                        p['manifold']['T'], man_idx,
+                        p['manifold']['T'], loop_stats['man_idx'],
                         cfg.n_orth_samples, lambda_orth=cfg.lambda_orth,
                         rng=rng)
                     stage3_extra['orth'] = o_loss

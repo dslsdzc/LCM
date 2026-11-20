@@ -203,7 +203,7 @@ def test_binding_ema_uses_value_biased_forward_indices():
     z = jnp.array([[0.1, 0.0]])
     # Row 1 has value 1; alpha=20 makes the value term dominate the distance.
     v = jnp.array([0.0, 1.0])
-    _, residuals, indices = binding_forward(
+    _, residuals, indices, _ = binding_forward(
         params, z, V, value_scalars=v, alpha_val=20.0)
 
     key_residual = residuals['key'][0]

@@ -176,8 +176,12 @@ def cog_loop_scan(z, params, cfg, max_steps=None, rng=None,
         diffs: (max_steps, B) — stepwise delta ‖z_{t+1} - z_t‖.
         entropies: (max_steps, B) — stepwise fusion entropy, in nats.
         stats: only when return_stats=True — dict with per-step ``z_in``,
-            ``hrq_idx``, ``sparse_idx``, ``man_idx``, ``binding_residuals``
-            and ``binding_indices`` (each stacked along axis 0).
+            ``route_idx``, ``hrq_idx``, ``sparse_idx``, ``man_idx``, ``hrq_vq``
+            (R18 continuous/quantised pairs), ``lowrank_aux``,
+            ``contrast_aux``, ``binding_residuals`` and ``binding_indices``
+            (each stacked along axis 0). These are exactly the inputs the R18
+            losses and the EMA pass consume, so neither needs a second forward
+            pass.
     """
     from jax import lax
 
@@ -197,9 +201,15 @@ def cog_loop_scan(z, params, cfg, max_steps=None, rng=None,
             # The state the lattices received, not the fused output: EMA
             # accumulates the vector each codebook actually quantised.
             'z_in': z_cur,
+            'route_idx': aux['route_idx'],
             'hrq_idx': aux['hrq_idx'],
             'sparse_idx': aux['sparse_idx'],
             'man_idx': aux['man_idx'],
+            # R18 loss targets: per-layer continuous/quantised pairs and
+            # residual/selected-row inputs from the same forward pass.
+            'hrq_vq': aux['hrq_vq'],
+            'lowrank_aux': aux['lowrank_aux'],
+            'contrast_aux': aux['contrast_aux'],
             'binding_residuals': aux['binding_residuals'],
             'binding_indices': aux['binding_indices'],
         }

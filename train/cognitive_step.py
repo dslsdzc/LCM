@@ -57,6 +57,8 @@ def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
         aux: dict with 'soft_mask', 'weights' (normalised fusion weights),
             'entropy' (per-sample, nats), 'lattice_outputs', and the
             per-lattice selection indices the canonical forward exposes.
+            R18 adds 'z_in', 'hrq_vq', 'lowrank_aux' and 'contrast_aux': the
+            per-layer loss targets from this same forward pass.
     """
     if rng is None:
         rng = jax.random.PRNGKey(0)
@@ -81,8 +83,9 @@ def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
     alpha_val = cfg.alpha_val
 
     # Return arities differ and are not uniform: lowrank_forward and
-    # contrast_forward return a bare array, the other four return tuples.
-    o_hrq, hrq_idx, hrq_top_sim = hrq_forward(
+    # contrast_forward return a bare array by default and expose their per-layer
+    # loss targets via return_aux=True; the other four return tuples.
+    o_hrq, hrq_idx, hrq_top_sim, hrq_vq = hrq_forward(
         params['hrq'], z, cfg.tau_route_fallback,
         value_scalars=vs.get('hrq'), alpha_val=alpha_val)
     # LFQ dynamic threshold: Poincare dis-similarity to the nearest HRQ top
@@ -92,21 +95,23 @@ def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
         params['sparse'], z, training=training,
         lambda_sparse=cfg.lambda_sparse, d_top=d_top,
         value_scalars=vs.get('sparse'), alpha_val=alpha_val)
-    o_lowrank = lowrank_forward(
+    o_lowrank, lowrank_aux = lowrank_forward(
         params['lowrank'], z, cfg.ranks,
-        value_scalars=vs.get('lowrank'), alpha_val=alpha_val)
+        value_scalars=vs.get('lowrank'), alpha_val=alpha_val,
+        return_aux=True)
     o_manifold, man_idx = manifold_forward(
         params['manifold'], z,
         value_scalars=vs.get('manifold'), alpha_val=alpha_val)
     # binding_forward quantises against the shared low-rank base V, derived
     # from lowrank's own factors rather than stored separately.
     V = params['lowrank']['A_V'] @ params['lowrank']['W_V']
-    o_binding, binding_residuals, binding_indices = binding_forward(
+    o_binding, binding_residuals, binding_indices, binding_b_q = binding_forward(
         params['binding'], z, V,
         value_scalars=vs.get('binding'), alpha_val=alpha_val)
-    o_contrast = contrast_forward(
+    o_contrast, contrast_aux = contrast_forward(
         params['contrast'], z,
-        value_scalars=vs.get('contrast'), alpha_val=alpha_val)
+        value_scalars=vs.get('contrast'), alpha_val=alpha_val,
+        return_aux=True)
 
     lattice_outputs = [o_hrq, o_sparse, o_lowrank, o_manifold, o_binding,
                        o_contrast]
@@ -119,6 +124,9 @@ def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
         self_bias_weight=self_bias_weight if self_output is not None else None)
 
     aux = {
+        # The state the lattices received. Kept here (not only in the loop's
+        # stats) so the R18 losses can be composed from a single step too.
+        'z_in': z,
         'soft_mask': soft_mask,
         'weights': weights,
         'entropy': entropy,
@@ -127,7 +135,12 @@ def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
         'route_idx': route_idx,
         'hrq_idx': hrq_idx,
         'hrq_top_sim': hrq_top_sim,
+        # R18: per-layer log_map-space continuous/quantised pairs for HRQ's
+        # codebook and commitment terms (top + every fine layer).
+        'hrq_vq': hrq_vq,
         'sparse_idx': sparse_idx,
+        # R18: per-rank residual inputs and selected rows.
+        'lowrank_aux': lowrank_aux,
         'man_idx': man_idx,
         # Per-layer query vectors of the binding residual chains — the space
         # each binding codebook actually quantises, and therefore the space its
@@ -136,5 +149,9 @@ def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
         # Rows selected by this forward. Under value bias these differ from a
         # plain Euclidean argmin, so EMA must not recompute them.
         'binding_indices': binding_indices,
+        # R20 will consume this once unbind/v_out lands.
+        'binding_b_q': binding_b_q,
+        # R18: C_a/C_b per-layer residual inputs and selected rows.
+        'contrast_aux': contrast_aux,
     }
     return z_next, aux

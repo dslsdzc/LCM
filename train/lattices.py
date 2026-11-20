@@ -10,7 +10,7 @@ from jax import lax
 import jax.nn as jnn
 
 from train.hyp import (
-    poincare_similarity, exp_map, log_map, mobius_add, safe_unit,
+    poincare_similarity, exp_map, log_map, mobius_add,
 )
 from train.config import LCMConfig
 
@@ -119,7 +119,11 @@ def init_route_params(rng, n_lattices, d):
 def routing_gate(params, z, tau, hard=False, rng=None):
     """Gumbel-Softmax routing gate.
 
-    Supports optional bias injection via params['bias'] (6,).
+    ``hard=True`` is the inference path: deterministic one-hot argmax with no
+    Gumbel noise (R19). ``hard=False`` is the training path and keeps the
+    Gumbel noise for exploration.
+
+    Supports optional bias injection via params['bias'] (n_lattices,).
     Bias is added to logits before softmax — used by BehaviorExplorer
     for active bias exploration (see e.md §六).
     """
@@ -134,14 +138,20 @@ def routing_gate(params, z, tau, hard=False, rng=None):
     logits = z_route @ params['W_route']  # (B, n_lattices)
     if 'bias' in params:
         logits = logits + params['bias'][None, :]  # (B, n_lattices)
-    if rng is None:
-        rng = jax.random.PRNGKey(0)
-    soft_mask = jax.nn.softmax((logits + _sample_gumbel(rng, logits.shape)) / tau, axis=-1)
 
     if hard:
-        # Straight-through: hard in forward, soft gradient in backward
-        hard_mask = jax.nn.one_hot(soft_mask.argmax(axis=-1), soft_mask.shape[-1])
-        soft_mask = lax.stop_gradient(hard_mask - soft_mask) + soft_mask
+        # R19: inference is deterministic — one_hot(argmax(logits)) with no
+        # Gumbel noise. The soft mask exists only as the backward proxy.
+        deterministic = jax.nn.softmax(logits / tau, axis=-1)
+        hard_mask = jax.nn.one_hot(logits.argmax(axis=-1), logits.shape[-1])
+        soft_mask = lax.stop_gradient(hard_mask - deterministic) + deterministic
+    else:
+        # Training keeps the Gumbel noise: it is the only stochastic
+        # exploration the gate has.
+        if rng is None:
+            rng = jax.random.PRNGKey(0)
+        soft_mask = jax.nn.softmax(
+            (logits + _sample_gumbel(rng, logits.shape)) / tau, axis=-1)
 
     return soft_mask, z_route, idx
 
@@ -152,7 +162,7 @@ def _sample_gumbel(rng, shape):
 
 
 def route_commit_loss(z, z_code, beta=0.25):
-    """Codebook loss for the routing gate (unit-sphere normalized).
+    """R18 routing codebook loss: ``β·mean((sg[z] − z_route)²)``.
 
     ``z_code`` MUST be the raw codebook vector ``C_route[idx]``, not
     ``routing_gate``'s STE output. The STE output is
@@ -160,14 +170,12 @@ def route_commit_loss(z, z_code, beta=0.25):
     so using it here leaves ``C_route`` with exactly zero gradient and only
     AdamW's decoupled weight decay touching it. Passing the raw vector makes
     this the ordinary VQ codebook loss and gives ``C_route`` the gradient
-    ``∂/∂C_route = 2β(zr_n - sg(z_n))`` on the selected row.
+    ``∂/∂C_route = 2β(C_route[idx] - sg[z])`` on the selected row.
 
     Forward value is identical either way (the STE output *is* ``C_route[idx]``
     in the forward pass), so this only changes the backward pass.
     """
-    z_n = safe_unit(z)
-    zr_n = safe_unit(z_code)
-    return beta * jnp.mean((lax.stop_gradient(z_n) - zr_n) ** 2)
+    return beta * jnp.mean((lax.stop_gradient(z) - z_code) ** 2)
 
 
 # ── 4.1 Hierarchical Lattice (Λ_hrq) ────────────────────────────────────────
@@ -186,6 +194,15 @@ def hrq_forward(params, z, tau_fallback=0.1, value_scalars=None, alpha_val=0.0):
 
     1. Top-1 hard routing on top-level prototypes (fallback for uncertainty).
     2. Möbius residual through fine layers.
+
+    Returns:
+        (o_hrq, top_idx, top_sim, vq_pairs). ``vq_pairs`` carries R18's
+        Euclidean-space training pairs: ``cont`` and ``quant`` are each a list
+        with one ``(B, d)`` vector for the top layer followed by one per fine
+        layer. ``cont`` is the pre-quantisation residual pointer after
+        ``log_map``; ``quant`` is the selected prototype after ``log_map``.
+        The pair is materialised here so the loss never needs a second forward
+        pass.
     """
     d = z.shape[-1]
     z_P = exp_map(z)
@@ -216,32 +233,48 @@ def hrq_forward(params, z, tau_fallback=0.1, value_scalars=None, alpha_val=0.0):
 
     # Möbius residual through the fine layers, shared by both routing branches
     # (they were duplicated verbatim; a fix to one silently missed the other).
+    # Also returns the per-layer log_map-space query/prototype pairs R18 needs.
     def fine_residual(r, fine_params):
+        cont, quant = [], []
         for fb in fine_params:
             C_fb_P = exp_map(fb['A'] @ fb['W'])
             vr_sims = poincare_similarity(r[:, None, :], C_fb_P[None, :, :]).squeeze(-1)
-            r = mobius_add(r, -C_fb_P[vr_sims.argmin(axis=-1)])
-        return r
+            c_fb = C_fb_P[vr_sims.argmin(axis=-1)]
+            cont.append(log_map(r))
+            quant.append(log_map(c_fb))
+            r = mobius_add(r, -c_fb)
+        return r, cont, quant
 
-    def hard_route(z_P, c_top, fine_params):
-        return log_map(mobius_add(c_top, fine_residual(mobius_add(z_P, -c_top), fine_params)))
+    # Hard branch: routed prototype, residual from z_P ⊖ c_top.
+    r_hard, cont_hard, quant_hard = fine_residual(
+        mobius_add(z_P, -c_top), params['fine'])
+    # Fallback branch: softmax-weighted prototype blend.
+    weights = jax.nn.softmax(-sims, axis=-1)  # (B, M_top)
+    c_top_w = jnp.einsum('bm,md->bd', weights, C_top_P)  # weighted
+    r_soft, cont_soft, quant_soft = fine_residual(
+        mobius_add(z_P, -c_top_w), params['fine'])
 
-    def fallback_route(z_P, sims, C_top_P, fine_params):
-        weights = jax.nn.softmax(-sims, axis=-1)  # (B, M_top)
-        c_top_w = jnp.einsum('bm,md->bd', weights, C_top_P)  # weighted
-        return log_map(mobius_add(c_top_w,
-                                  fine_residual(mobius_add(z_P, -c_top_w), fine_params)))
-
-    o_hrq = jnp.where(use_fallback[:, None],
-                      fallback_route(z_P, sims, C_top_P, params['fine']),
-                      hard_route(z_P, c_top, params['fine']))
+    o_hard = log_map(mobius_add(c_top, r_hard))
+    o_soft = log_map(mobius_add(c_top_w, r_soft))
+    o_hrq = jnp.where(use_fallback[:, None], o_soft, o_hard)
 
     # Value-scalar gradient path (forward ≡ 0), added after all routing so it
     # cannot be swallowed by an upstream stop_gradient.
     if top_scores is not None:
         o_hrq = o_hrq + ste_relax(top_scores, C_top_P)
 
-    return o_hrq, top_idx, top_sim
+    # The top term always targets the routed top-1 prototype: the fallback
+    # blend is not a codebook row and has no codebook target. Fine-layer pairs
+    # follow whichever branch actually ran, selected elementwise.
+    def _pick(hard, soft):
+        return jnp.where(use_fallback[:, None], soft, hard)
+
+    vq_pairs = {
+        'cont': [z] + [_pick(a, b) for a, b in zip(cont_hard, cont_soft)],
+        'quant': [log_map(c_top)] + [
+            _pick(a, b) for a, b in zip(quant_hard, quant_soft)],
+    }
+    return o_hrq, top_idx, top_sim, vq_pairs
 
 
 # ── 4.2 Sparse Lattice (Λ_sparse) ───────────────────────────────────────────
@@ -324,12 +357,19 @@ def init_lowrank_params(rng, d, M_lr, ranks):
     return params
 
 
-def lowrank_forward(params, z, ranks, value_scalars=None, alpha_val=0.0):
-    """Incremental rank VQ with shared base V."""
+def lowrank_forward(params, z, ranks, value_scalars=None, alpha_val=0.0,
+                    return_aux=False):
+    """Incremental rank VQ with shared base V.
+
+    ``return_aux=True`` additionally returns the per-layer residual inputs and
+    selected indices (R18's codebook/commitment targets). The default keeps the
+    historical bare-array return for existing callers.
+    """
     V = params['A_V'] @ params['W_V']  # (d, r_max)
     o_total = jnp.zeros_like(z)
     relax = None
     r = z
+    residuals, indices = [], []
     for l, (u_k, r_k) in enumerate(zip(params['U'], ranks)):
         C_k = u_k @ V[:, :r_k].T  # (M_lr, d)
         if value_scalars is not None and alpha_val > 0:
@@ -340,12 +380,16 @@ def lowrank_forward(params, z, ranks, value_scalars=None, alpha_val=0.0):
         else:
             dist = jnp.linalg.norm(r[:, None, :] - C_k[None, :, :], axis=-1)
             idx = dist.argmin(axis=-1)
+        residuals.append(r)
+        indices.append(idx)
         c_k = C_k[idx]
         o_total = o_total + c_k
         r = r - c_k
     o_total = z + lax.stop_gradient(o_total - z)  # STE
     if relax is not None:
         o_total = o_total + relax  # value-scalar gradient (forward ≡ 0)
+    if return_aux:
+        return o_total, {'residuals': residuals, 'indices': indices}
     return o_total
 
 
@@ -497,12 +541,14 @@ def binding_forward(params, z, V, value_scalars=None, alpha_val=0.0):
     """HRR binding/unbinding with cross-layer superposition.
 
     Returns:
-        (o_bind, residuals, indices): residuals maps 'key'/'val'/'bind' to the
-        list of per-layer query vectors, so the EMA pass can update each
+        (o_bind, residuals, indices, b_q): residuals maps 'key'/'val'/'bind' to
+        the list of per-layer query vectors, so the EMA pass can update each
         binding codebook in the space it actually quantises. indices maps the
         same families to the rows selected by *this* forward (value-biased when
         ``value_scalars`` is active); EMA must use them rather than recomputing
-        a plain Euclidean argmin.
+        a plain Euclidean argmin. ``b_q`` is the pre-STE quantised bound
+        representation, added for R20's unbind output and for the binding
+        codebook loss; ``v_out`` is still R20/Task 6.
     """
     # Key/value projections: W_k = V @ A_k, z_k = z @ W_k.T
     # (d, r_max) @ (r_max, d) = (d, d); (B, d) @ (d, d) = (B, d)
@@ -528,15 +574,15 @@ def binding_forward(params, z, V, value_scalars=None, alpha_val=0.0):
     b_q_list, bind_inputs, bind_idx, relax_b = _residual_vq_chain(
         params['bind_cb'], b_raw, value_scalars, alpha_val)
 
-    o_bind = jnp.sum(jnp.stack(b_q_list), axis=0)
-    o_bind = z + lax.stop_gradient(o_bind - z)  # STE
+    b_q = jnp.sum(jnp.stack(b_q_list), axis=0)
+    o_bind = z + lax.stop_gradient(b_q - z)  # STE
     for step in (relax_k, relax_v, relax_b):
         if step is not None:
             o_bind = o_bind + step  # value-scalar gradient (forward ≡ 0)
 
     residuals = {'key': key_inputs, 'val': val_inputs, 'bind': bind_inputs}
     indices = {'key': key_idx, 'val': val_idx, 'bind': bind_idx}
-    return o_bind, residuals, indices
+    return o_bind, residuals, indices, b_q
 
 
 # ── 4.6 Contrast Lattice (Λ_contrast) ───────────────────────────────────────
@@ -551,11 +597,17 @@ def init_contrast_params(rng, d, M_contrast, n_layers):
     }
 
 
-def contrast_forward(params, z, value_scalars=None, alpha_val=0.0):
-    """Dual codebook contrast lattice."""
-    a_q_list, _, _, relax_a = _residual_vq_chain(
+def contrast_forward(params, z, value_scalars=None, alpha_val=0.0,
+                     return_aux=False):
+    """Dual codebook contrast lattice.
+
+    ``return_aux=True`` additionally returns each family's per-layer residual
+    inputs and selected indices for R18's codebook/commitment terms. The
+    default keeps the historical bare-array return.
+    """
+    a_q_list, a_inputs, a_idx, relax_a = _residual_vq_chain(
         params['C_a'], z, value_scalars, alpha_val)
-    b_q_list, _, _, relax_b = _residual_vq_chain(
+    b_q_list, b_inputs, b_idx, relax_b = _residual_vq_chain(
         params['C_b'], z, value_scalars, alpha_val)
 
     o_contrast = (jnp.sum(jnp.stack(a_q_list), axis=0)
@@ -565,6 +617,11 @@ def contrast_forward(params, z, value_scalars=None, alpha_val=0.0):
         if step is not None:
             o_contrast = o_contrast + step / 2.0  # value-scalar gradient
 
+    if return_aux:
+        return o_contrast, {
+            'a': {'residuals': a_inputs, 'indices': a_idx},
+            'b': {'residuals': b_inputs, 'indices': b_idx},
+        }
     return o_contrast
 
 
