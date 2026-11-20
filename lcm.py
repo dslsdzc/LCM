@@ -1634,6 +1634,10 @@ class LCMInferEngine:
         print(f"[OBS]  Black box: raw={raw_capacity} every_n={obs_every_n}")
         print(f"[NARR] Narrative memory: {lt_status}")
 
+        # ── External verifier (R14/R16): created lazily by enable_verifier ──
+        self.verifier = None
+        self.verifier_poller = None
+
         # ── Predictive cache (implicit inference reuse) ──
         self._pred_cache_capacity = getattr(raw_capacity, 'pred_cache_capacity', 2048)
         self._pred_enabled = False
@@ -1991,6 +1995,38 @@ class LCMInferEngine:
         print(f"  Logged:  {stats['motivation']['n_logged']}")
         print(f"{'=' * 46}\n")
 
+    def enable_verifier(self, dim=None, threshold_low=3.0,
+                        threshold_high=6.0, observe_limit=3,
+                        mode=None, trace_dir=None):
+        """Start the external verifier and poll it every generation step.
+
+        R16: the local verifier form has no parent polling thread, so the
+        inference loop must call ``state()`` for LOCK/OBSERVE callbacks to be
+        delivered. This is that call site. A separate danger-snapshot producer
+        calls ``submit()``; this engine only polls.
+        """
+        from train.external_verifier import VerifierProcess
+        from train.observability import VerifierPoller
+
+        self.verifier = VerifierProcess(
+            dim=int(dim or self.d),
+            threshold_low=threshold_low,
+            threshold_high=threshold_high,
+            observe_limit=observe_limit,
+            mode=mode,
+            trace_dir=trace_dir,
+            alert_callback=self._on_verifier_state,
+            observe_callback=self._on_verifier_state,
+        )
+        self.verifier.start()
+        self.verifier_poller = VerifierPoller(self.verifier)
+        print(f"[VERIFIER] polling every step (mode={self.verifier.mode})")
+
+    def _on_verifier_state(self, alert):
+        state = alert.get('state') or alert.get('type')
+        print(f"[VERIFIER] {state}: {alert.get('detail', '')}",
+              file=sys.stderr)
+
     def enable_causal(self, enable_counterfactual=True):
         """Enable causal subject."""
         from train.causal_subject import CausalSubject
@@ -2169,19 +2205,43 @@ class LCMInferEngine:
             record = None
             if traces:
                 last_t = traces[-1]
+                weights = last_t.get('weights')
+                # R16 StepRecord fields. The C trace exposes weights,
+                # confidences and z_next; it does not expose sparse_idx or a
+                # gvalue margin, so those stay None (no invented values).
+                z_next = last_t.get('z_next')
+                conv_diff = None
+                if z_next is not None:
+                    conv_diff = float(np.linalg.norm(
+                        np.asarray(z_next, dtype=np.float32)
+                        - np.asarray(z_q, dtype=np.float32)))
+                world_dev = None
+                try:
+                    world_dev = float(np.linalg.norm(
+                        np.asarray(z_cur, dtype=np.float32) - self.self_C[0]))
+                except Exception:
+                    world_dev = None
+                pred_err = None
+                if z_pred is not None:
+                    pred_err = float(np.sum(
+                        (np.asarray(z_pred, dtype=np.float32)
+                         - np.asarray(z_q, dtype=np.float32)) ** 2))
                 record = self.obs.record_step(
                     step=gen_step,
                     source=source,
                     step_time_ms=step_ms,
-                    soft_mask=last_t.get('weights'),
-                    route_idx=np.argmax(last_t.get('weights', [0])).item()
-                        if last_t.get('weights') is not None else None,
+                    soft_mask=weights,
+                    route_idx=np.argmax(weights).item()
+                        if weights is not None else None,
                     is_safe=not last_t.get('has_conflict', False),
-                    convergence_diff=0.0 if converged else None,
+                    convergence_diff=conv_diff,
+                    prediction_error=pred_err,
                     dag_nodes=traces,
                     conflict_source=None if not last_t.get('has_conflict')
                         else trace_step_conflict_source(last_t),
-                    z_q=z_q,
+                    z_cur=z_cur,
+                    z_next=z_q,
+                    world_dev=world_dev,
                 )
 
             # ── Feed to narrative memory ──
@@ -2202,6 +2262,16 @@ class LCMInferEngine:
                         'agency_modulator_explore', 0.0)
                 except Exception as e:
                     print(f"[CAUSAL] Feed error: {e}")
+
+            # ── External verifier poll (R16): state() delivers LOCK/OBSERVE
+            # callbacks on the next step; the local form has no polling thread.
+            verifier_poller = getattr(self, 'verifier_poller', None)
+            if verifier_poller is not None:
+                from train.external_verifier import LOCK
+                if verifier_poller.poll(gen_step) == LOCK:
+                    print("[SAFETY] external verifier LOCK; generation halted",
+                          file=sys.stderr)
+                    return
 
             yield next_id
             token_ids.append(next_id)

@@ -17,6 +17,7 @@ import os
 import pickle
 import sys
 import time
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -694,7 +695,7 @@ def make_train_step(cfg, optimizer, joint=False):
 
     @jax.jit
     def train_step(params, opt_state, ema_state, batch, lr, rng,
-                   self_state=None, step=None):
+                   self_state=None, step=None, routing_bias=None):
         inputs, targets = batch
         B, N = inputs.shape
         # Context / generation split for the active channel (see the
@@ -740,7 +741,8 @@ def make_train_step(cfg, optimizer, joint=False):
             # every consumer below expects.
             z_qs, diffs, entropies, loop_stats = cog_loop_scan(
                 z, p, cfg, max_steps=cfg.max_inference_steps,
-                rng=jax.random.fold_in(rng, 7), return_stats=True)
+                rng=jax.random.fold_in(rng, 7), return_stats=True,
+                routing_bias=routing_bias)
             z_qs = jnp.transpose(z_qs, (1, 0, 2))     # (B, max_steps, d)
             diffs = jnp.transpose(diffs, (1, 0))      # (B, max_steps)
             entropies = jnp.transpose(entropies, (1, 0))
@@ -876,7 +878,17 @@ def make_train_step(cfg, optimizer, joint=False):
                                      if 'self_bias' in loop_stats
                                      else jnp.array(0.0)),
                        'z_margin': z_margin, 'stage3': stage3_extra,
-                       'loop_stats': loop_stats}
+                       'loop_stats': loop_stats,
+                       # R16 self-observation fields, from this same forward
+                       # (no second pass).
+                       'z_cur': z,
+                       'z_next': z_qs[:, -1, :],
+                       'soft_mask': loop_stats.get(
+                           'soft_mask', jnp.zeros((B, cfg.n_lattices))),
+                       'route_idx': loop_stats.get(
+                           'route_idx', jnp.zeros((B,), dtype=jnp.int32)),
+                       'convergence_diff': jnp.mean(diffs[:, -1]),
+                       'is_safe': jnp.array(True)}
             return loss, aux_out
 
         (loss, aux_out), grads = jax.value_and_grad(loss_fn, has_aux=True)(
@@ -896,6 +908,9 @@ def make_train_step(cfg, optimizer, joint=False):
         new_ema, new_ema_state = _apply_ema_updates(
             ema_params, ema_state, aux_out['loop_stats'], cfg, step)
         new_params = merge_params(new_trainable, new_ema, frozen_params)
+        # Exposed for the wiring test: proves the bias reached the routed step
+        # rather than being computed and discarded.
+        aux_out['routing_bias_used'] = routing_bias
         return new_params, new_opt, new_ema_state, loss, aux_out
 
     return train_step
@@ -1010,6 +1025,79 @@ def _contrast_bank_step(params, contrast_bank, contrast_last_used, loop_stats,
     return params, clock
 
 
+def _self_observe_step(obs, narr, reflection, explorer, verifier_poller,
+                       abs_step, step_time_ms, aux_out, loss_f, cfg):
+    """Record one training step into the R16 self-observation stack.
+
+    Every sub-call is fault-isolated: a broken narrative/reflection/verifier
+    must never change the training trajectory (e.md §1 core constraint).
+    Returns the safety flag used by the next step's danger priority.
+    """
+    from train.behavior_explorer import compute_tension_from_aux
+
+    try:
+        soft_mask = np.asarray(jax.device_get(aux_out['soft_mask']))[0]
+        route_idx = int(np.asarray(
+            jax.device_get(aux_out['route_idx'])).ravel()[0])
+        z_cur = np.asarray(jax.device_get(aux_out['z_cur']))[0]
+        z_next = np.asarray(jax.device_get(aux_out['z_next']))[0]
+        conv = float(np.asarray(
+            jax.device_get(aux_out['convergence_diff'])))
+        is_safe = bool(np.asarray(jax.device_get(aux_out['is_safe'])))
+    except Exception:
+        soft_mask, route_idx, z_cur, z_next = None, None, None, None
+        conv, is_safe = None, True
+    is_safe = bool(is_safe and np.isfinite(loss_f))
+
+    dag_nodes = None
+    if soft_mask is not None:
+        dag_nodes = [{
+            'step': abs_step,
+            'route_idx': route_idx,
+            'soft_mask': np.asarray(soft_mask).tolist(),
+        }]
+    record = obs.record_step(
+        step=abs_step, source=0, step_time_ms=step_time_ms,
+        soft_mask=soft_mask, route_idx=route_idx, is_safe=is_safe,
+        convergence_diff=conv, dag_nodes=dag_nodes,
+        z_cur=z_cur, z_next=z_next)
+
+    if record is not None:
+        try:
+            narr.feed(record)
+        except Exception:
+            pass
+        try:
+            reflection.observe(abs_step, record, cache_hit=None)
+        except Exception:
+            pass
+
+    try:
+        tension = compute_tension_from_aux(
+            {'soft_mask': soft_mask}, z_cur, z_next,
+            pred_error=None, d_model=cfg.d_model)
+        explorer.observe_tension(abs_step, tension,
+                                 safety_breach=not is_safe)
+    except Exception:
+        pass
+
+    try:
+        reflection.maybe_reflect(abs_step, narrative=narr)
+        for suggestion in reflection.drain_suggestions():
+            reflection.apply_suggestion(suggestion, explorer,
+                                        danger=not is_safe)
+    except Exception:
+        pass
+
+    if verifier_poller is not None:
+        try:
+            verifier_poller.poll(abs_step)
+        except Exception:
+            pass
+
+    return is_safe
+
+
 def _lr_decay_steps(start_step, steps):
     """Policy A: a resumed run continues the original cosine curve.
 
@@ -1057,7 +1145,8 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
               seq_len=256, log_every=100, save_every=1000,
               data_path=None, shape_path=None, spans_path=None,
               qwen_ckpt=None, resume=None, joint=False, auto_mode=False,
-              full_verify=True, allow_missing_self=False):
+              full_verify=True, allow_missing_self=False,
+              self_awareness=True, verifier=None):
     """Run dual-channel cognitive training (Stage 2).
 
     Dual channels from cognitive state z_q:
@@ -1076,6 +1165,17 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
         allow_missing_self: R15 escape hatch for resuming a pre-``C_self``
             checkpoint. Off by default; when on, the self codebook and its EMA
             branch are reset explicitly (old weights are not migrated).
+        self_awareness: R16 wiring switch. When on, every step records the
+            black box, feeds narrative memory, advances the behavior explorer
+            (bias enters ``train_step``), and schedules the reflection loop
+            every 200 steps. Off is the no-observation baseline.
+        verifier: optional external verifier instance. It is polled with
+            :class:`train.observability.VerifierPoller` each step. ``cog_train``
+            does not create one by default: training has no gvalue/danger
+            snapshot to submit, and a verifier process per training run is
+            heavier than the 5% observation budget. The inference engine
+            (``lcm.py``) owns the production wiring; this hook exists for
+            callers that already have a verifier.
     """
     from train.data import WikiDataIter
     from tqdm import tqdm
@@ -1145,6 +1245,35 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
                              B=batch_size, N=seq_len)
     train_step = make_train_step(cfg, optimizer, joint=joint)
 
+    # ── Self-observation stack (R16 / e.md §1) ──────────────────────────
+    # The external VerifierProcess is deliberately not created here: training
+    # has no danger/gvalue snapshot to submit, and one process per training
+    # run would be heavier than the 5% observation budget. lcm.py wires the
+    # poller on the inference path; callers that already own a verifier can
+    # pass ``verifier=`` above.
+    obs = narr = reflection = explorer = verifier_poller = None
+    routing_bias = np.zeros(cfg.n_lattices, dtype=np.float32)
+    if self_awareness:
+        from train.observability import ObservabilityRecorder, VerifierPoller
+        from train.narrative_memory import NarrativeMemory
+        from train.reflection_loop import ReflectionLoop, REFLECT_INTERVAL
+        from train.behavior_explorer import BehaviorExplorer
+
+        obs = ObservabilityRecorder(
+            raw_capacity=1000, long_term_capacity=10000,
+            record_every_n=1, long_term_every=100,
+            anomaly_oversample=3)
+        narr = NarrativeMemory(max_records=10000)
+        reflection = ReflectionLoop(
+            interval=REFLECT_INTERVAL,
+            log_path=os.path.join(output_dir, 'reflection.log'))
+        explorer = BehaviorExplorer()
+        routing_bias = explorer.get_best_bias()
+        if verifier is not None:
+            verifier_poller = VerifierPoller(verifier)
+        print("[SELF] Black box + narrative + reflection (200) + "
+              "behavior (10) wired")
+
     packed_codebooks = pack_codebooks_for_c(params)
     codebooks_flat = [
         cb for name in ('hrq', 'sparse', 'lowrank', 'manifold',
@@ -1210,6 +1339,9 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
         sup = Supervisor(output_dir, cfg, enable_auto=True,
                          val_data_path=data_path, val_shape_path=shape_path)
 
+    last_is_safe = True  # danger priority for the next behavior-plan step
+    obs_error_logged = False
+
     for item in plan:
         # item['offset'] is loop-relative (schedule/log/save/bank guards);
         # abs_step is the state clock (EMA last_used, dead-code detection,
@@ -1224,9 +1356,21 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
         params_backup, opt_state_backup = params, opt_state
         ema_state_backup, self_state_backup = ema_state, self_state
 
+        # Level-1 behavior modulation: every 10 steps, danger first. The bias
+        # is a real train_step input (R16), not a diagnostic that gets dropped.
+        if explorer is not None:
+            try:
+                routing_bias = explorer.plan_step(
+                    abs_step, danger=not last_is_safe)
+            except Exception:
+                routing_bias = np.zeros(cfg.n_lattices, dtype=np.float32)
+        step_bias = jnp.asarray(routing_bias, dtype=jnp.float32)
+        step_t0 = time.perf_counter()
+
         if sup:
             params, opt_state, loss_val, aux_out = sup.step(
-                train_step, params, opt_state, batch, current_lr, step_rng,
+                partial(train_step, routing_bias=step_bias),
+                params, opt_state, batch, current_lr, step_rng,
                 step=abs_step, self_state=self_state, ema_state=ema_state)
             # Supervisor keeps its historical 4-tuple and carries the EMA state
             # through aux, so its rollback path stays compatible with callers
@@ -1235,13 +1379,29 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
         else:
             params, opt_state, ema_state, loss_val, aux_out = train_step(
                 params, opt_state, ema_state, batch, current_lr, step_rng,
-                self_state=self_state, step=abs_step)
+                self_state=self_state, step=abs_step,
+                routing_bias=step_bias)
+        step_time_ms = (time.perf_counter() - step_t0) * 1000.0
 
         # Update self state from forward pass
         if self_state is not None and aux_out.get('self_state') is not None:
             self_state = aux_out['self_state']
 
         loss_f = float(loss_val)
+
+        # ── R16: self-observation stack ────────────────────────────────
+        # Host-side, outside jit, and fault-isolated: a self-observation
+        # failure must not change the training trajectory.
+        if obs is not None:
+            try:
+                last_is_safe = _self_observe_step(
+                    obs, narr, reflection, explorer, verifier_poller,
+                    abs_step, step_time_ms, aux_out, loss_f, cfg)
+            except Exception as exc:
+                if not obs_error_logged:
+                    obs_error_logged = True
+                    print(f"[SELF] observation error (training continues): "
+                          f"{exc}", file=sys.stderr)
 
         # NaN/inf self-heal: without a Supervisor, one bad step would poison
         # params forever (every later checkpoint NaN). Roll back and skip.
@@ -1307,6 +1467,8 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
 
     pbar.close()
     pbar.refresh()
+    if reflection is not None:
+        reflection.wait(timeout=30.0)
     final_step = start_step + steps
     final_dir = os.path.join(output_dir, f"step_{final_step:06d}")
     save_cog_checkpoint(params, final_dir, final_step, self_state=self_state,

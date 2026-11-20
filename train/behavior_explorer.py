@@ -86,6 +86,8 @@ class BehaviorExplorer:
         self.current_bias: Optional[np.ndarray] = None
         self._bias_start_step: int = 0
         self._eval_buffer: deque = deque(maxlen=eval_window * 2)
+        # Level-2 suggestions are bounded deltas on top of the learned bias.
+        self.bias_override = np.zeros(n_dim, dtype=np.float32)
 
         # 统计
         self.n_explores = 0
@@ -140,6 +142,47 @@ class BehaviorExplorer:
             ]))
             bias[dim] = DISCRETE_VALUES[best_vi]
         return bias
+
+    def get_best_bias(self) -> np.ndarray:
+        """Current best bias including bounded Level-2 corrections."""
+        return np.clip(self.select_greedy_bias() + self.bias_override,
+                       -0.2, 0.2).astype(np.float32)
+
+    @staticmethod
+    def should_update(step: int, interval: int = 10) -> bool:
+        """e.md §4: behavior exploration runs every M=10 steps, not per step."""
+        return interval > 0 and step % interval == 0
+
+    def plan_step(self, step: int, danger: bool = False,
+                  interval: int = 10) -> np.ndarray:
+        """Choose the routing bias for this step (danger has priority).
+
+        * danger: return a zero bias and abandon any in-flight evaluation;
+        * interval boundary: epsilon-greedy exploration may pick a new bias;
+        * otherwise: reuse the learned best bias.
+        """
+        if danger:
+            self.current_bias = None
+            return np.zeros(self.n_dim, dtype=np.float32)
+        # A selected bias is evaluated for the whole interval; do not snap
+        # back to the greedy choice on the very next step.
+        if (self.current_bias is not None
+                and self.should_update(step, interval)):
+            self.finalize_evaluation(step)
+        if self.current_bias is not None:
+            return self.current_bias.copy()
+        if self.should_update(step, interval) and self.should_explore(step):
+            return self.select_bias(step)
+        return self.get_best_bias()
+
+    def apply_bias_delta(self, dim: int, delta: float) -> bool:
+        """Apply a bounded Level-2 bias correction to one dimension."""
+        if not (0 <= int(dim) < self.n_dim):
+            return False
+        delta = float(np.clip(delta, -0.2, 0.2))
+        self.bias_override[int(dim)] = float(np.clip(
+            self.bias_override[int(dim)] + delta, -0.2, 0.2))
+        return True
 
     # ── 张力反馈 ──
 
@@ -216,10 +259,6 @@ class BehaviorExplorer:
         return int(np.argmin(np.abs(np.array(DISCRETE_VALUES, dtype=np.float32) - val)))
 
     # ── 统计 ──
-
-    def get_best_bias(self) -> np.ndarray:
-        """返回当前最佳偏置（用于推理时默认使用）。"""
-        return self.select_greedy_bias()
 
     def print_summary(self) -> None:
         print(f"\n{'=' * 46}")

@@ -144,7 +144,7 @@ def dag_fuse(z, codebooks, thresholds, tau=0.1, eps=1e-6):
 # ─── Macro loop (compact via lax.scan) ──────────────────────────────────────
 
 def cog_loop_scan(z, params, cfg, max_steps=None, rng=None,
-                  return_stats=False):
+                  return_stats=False, routing_bias=None):
     """Cognitive macro loop: the canonical six-lattice step, repeated.
 
     The step itself lives in train/cognitive_step.py and is shared with
@@ -166,6 +166,8 @@ def cog_loop_scan(z, params, cfg, max_steps=None, rng=None,
         max_steps: loop length; defaults to cfg.max_inference_steps.
         rng: PRNG key, split into one subkey per step so the routing gate's
             Gumbel noise is reproducible rather than re-seeded identically.
+        routing_bias: optional (6,) host/device bias added to the routing gate
+            at every macro step (BehaviorExplorer's Level-1 modulation).
         return_stats: when True, append a per-step stats pytree carrying the
             selection indices and binding residual inputs the EMA pass needs.
             Default False keeps the historical 3-tuple return for the existing
@@ -216,7 +218,8 @@ def cog_loop_scan(z, params, cfg, max_steps=None, rng=None,
             }
         z_next, aux = six_lattice_step(
             z_cur, params, cfg, training=True, rng=key,
-            self_output=self_output, self_bias=self_bias)
+            routing_bias=routing_bias, self_output=self_output,
+            self_bias=self_bias)
         if self_extras:
             aux = {**aux, **self_extras}
         diff = jnp.sqrt(jnp.sum((z_next - z_cur) ** 2, axis=-1))
@@ -229,6 +232,8 @@ def cog_loop_scan(z, params, cfg, max_steps=None, rng=None,
                 # The state the lattices received, not the fused output: EMA
                 # accumulates the vector each codebook actually quantised.
                 'z_in': z_cur,
+                'soft_mask': aux['soft_mask'],
+                'entropy': aux['entropy'],
                 'route_idx': aux['route_idx'],
                 'hrq_idx': aux['hrq_idx'],
                 'sparse_idx': aux['sparse_idx'],

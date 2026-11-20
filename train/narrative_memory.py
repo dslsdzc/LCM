@@ -25,11 +25,12 @@ Usage:
     # Export
     narr.export_json("narrative.json")
 """
+import random
 import time
 import json
 import numpy as np
-from collections import defaultdict
-from dataclasses import dataclass, asdict
+from collections import defaultdict, deque
+from dataclasses import dataclass, field, asdict
 from typing import Optional, List, Dict, Any, Tuple, Callable
 
 
@@ -113,6 +114,31 @@ DEFAULT_THRESHOLDS: Dict[str, float] = {
 }
 
 
+def _above_mean_sigma(value: float, history: deque,
+                      sigma: float, min_history: int = 5) -> bool:
+    """``value > mean(history) + sigma * std(history)`` with cold-start guard."""
+    if len(history) < min_history:
+        return False
+    values = np.asarray(history, dtype=np.float64)
+    mean = float(values.mean())
+    std = float(values.std())
+    return value > mean + sigma * std
+
+
+def _context_summary(record) -> Dict[str, Any]:
+    """Small, JSON-safe trajectory slice — vectors stay in the record itself."""
+    mask = getattr(record, 'soft_mask', None)
+    if mask is not None:
+        mask = np.asarray(mask).ravel().astype(float).tolist()
+    return {
+        'step': int(getattr(record, 'step', 0)),
+        'is_safe': bool(getattr(record, 'is_safe', True)),
+        'route_idx': getattr(record, 'route_idx', None),
+        'convergence_diff': getattr(record, 'convergence_diff', None),
+        'soft_mask': mask,
+    }
+
+
 # ─── Importance Evaluator ──────────────────────────────────────────────────
 
 class ImportanceEvaluator:
@@ -177,6 +203,10 @@ class NarrativeRecord:
     promoted: bool = False      # manually promoted from raw buffer
     pinned: bool = False        # protected from consolidation (model-driven forgetting bypass)
 
+    # e.md §3: narrative metadata
+    context: Dict[str, Any] = field(default_factory=dict)  # before/after window
+    access_count: int = 0       # subsequent reads; forgetting score factor
+
     # Original data (same fields as StepRecord)
     soft_mask: Optional[np.ndarray] = None
     route_idx: Optional[int] = None
@@ -193,16 +223,20 @@ class NarrativeRecord:
     convergence_diff: Optional[float] = None
     convergence_entropy: Optional[float] = None
     n_retrievals: int = 0
+    prediction_error: Optional[float] = None
     dag_nodes: Optional[List[Dict[str, Any]]] = None
     conflict_source: Optional[str] = None
     conflict_detail: Optional[str] = None
+    z_cur: Optional[np.ndarray] = None
+    z_next: Optional[np.ndarray] = None
     z_q: Optional[np.ndarray] = None
     z: Optional[np.ndarray] = None
 
     @classmethod
     def from_step_record(cls, record, importance_score=0.0,
                          importance_rule="", user_flagged=False,
-                         promoted=False, pinned=False) -> "NarrativeRecord":
+                         promoted=False, pinned=False,
+                         context=None, access_count=0) -> "NarrativeRecord":
         """Promote a StepRecord to NarrativeRecord."""
         return cls(
             step=record.step,
@@ -212,6 +246,8 @@ class NarrativeRecord:
             user_flagged=user_flagged or getattr(record, 'user_flagged', False),
             promoted=promoted,
             pinned=pinned,
+            context=dict(context or {}),
+            access_count=int(access_count),
             soft_mask=getattr(record, 'soft_mask', None),
             route_idx=getattr(record, 'route_idx', None),
             hrq_top_sim=getattr(record, 'hrq_top_sim', None),
@@ -227,9 +263,12 @@ class NarrativeRecord:
             convergence_diff=getattr(record, 'convergence_diff', None),
             convergence_entropy=getattr(record, 'convergence_entropy', None),
             n_retrievals=getattr(record, 'n_retrievals', 0),
+            prediction_error=getattr(record, 'prediction_error', None),
             dag_nodes=getattr(record, 'dag_nodes', None),
             conflict_source=getattr(record, 'conflict_source', None),
             conflict_detail=getattr(record, 'conflict_detail', None),
+            z_cur=getattr(record, 'z_cur', None),
+            z_next=getattr(record, 'z_next', None),
             z_q=getattr(record, 'z_q', None),
             z=getattr(record, 'z', None),
         )
@@ -255,19 +294,52 @@ class NarrativeMemory:
     """
     def __init__(self, max_records: int = 10000,
                  rules: Optional[List[ImportanceRule]] = None,
-                 thresholds: Optional[Dict[str, float]] = None):
+                 thresholds: Optional[Dict[str, float]] = None,
+                 context_window: int = 5,
+                 prediction_sigma: float = 2.0,
+                 convergence_sigma: float = 2.0,
+                 routing_kl_threshold: float = 0.5,
+                 history_window: int = 1000,
+                 random_fn: Optional[Callable[[], float]] = None,
+                 random_seed: Optional[int] = None):
         """
         Args:
-            max_records: 最大记录数（超出后丢弃最旧）。
-            rules: 重要性规则列表（默认使用内置7条）。
-            thresholds: 覆盖默认阈值。
+            max_records: 最大记录数（e.md §3: 10000）。
+            rules: legacy 重要性规则（保留给旧调用方；feed 使用 e.md §3
+                的五条规则）。
+            thresholds: legacy 规则阈值。
+            context_window: NarrativeRecord.context 的前后窗口（默认 5）。
+            prediction_sigma: 预测误差触发阈值 mean + Nσ（默认 2）。
+            convergence_sigma: 收敛异常触发阈值 mean + Nσ（默认 2）。
+            routing_kl_threshold: routing KL novelty 阈值（nats）。
+            history_window: 运行统计窗口。
+            random_fn: 可注入的 [0,1) 随机源（测试/可复现用）。
+            random_seed: 未注入 random_fn 时 random.Random 的种子。
         """
-        self.max_records = max_records
+        self.max_records = max(1, int(max_records))
         self.evaluator = ImportanceEvaluator(rules, thresholds)
+        self.context_window = max(1, int(context_window))
+        self.prediction_sigma = float(prediction_sigma)
+        self.convergence_sigma = float(convergence_sigma)
+        self.routing_kl_threshold = float(routing_kl_threshold)
+        self.random_fn = random_fn or random.Random(random_seed).random
+
         self._narrative: List[NarrativeRecord] = []
         self._total_evaluated = 0
         self._total_stored = 0
         self._last_step = -1
+
+        # e.md §3 dynamic thresholds. History excludes the candidate record,
+        # so the first outlier is measured against settled ordinary data.
+        self._prediction_history: deque = deque(maxlen=max(10, int(history_window)))
+        self._convergence_history: deque = deque(maxlen=max(10, int(history_window)))
+        self._routing_mean: Optional[np.ndarray] = None
+        self._routing_count = 0
+
+        # context: raw before/after window and the open records that can still
+        # accept "after" entries.
+        self._raw_history: deque = deque(maxlen=self.context_window)
+        self._open_context: deque = deque(maxlen=self.context_window)
 
     # ── Feed records from black box ──
 
@@ -289,26 +361,125 @@ class NarrativeMemory:
         self._total_evaluated += 1
         step_num = step if step is not None else getattr(record, 'step', 0)
 
-        # Evaluate importance
-        score, rule = self.evaluator.evaluate(record, step=step_num)
+        # e.md §3's five triggers, in priority order. The legacy evaluator is
+        # kept for old callers but is no longer the narrative filter.
+        score, rule = self._classify(record, step_num)
         flagged = user_flagged or getattr(record, 'user_flagged', False)
 
+        # "after" context is the raw trajectory, not only the stored events:
+        # every feed (ordinary or important) advances the open windows.
+        summary = _context_summary(record)
+        for previous in self._open_context:
+            after = previous.context.setdefault('after', [])
+            if len(after) < self.context_window:
+                after.append(summary)
+
         if score <= 0 and not flagged:
+            self._remember_raw(record)
             return None
 
-        # Promote to narrative record
+        context = {
+            'window': self.context_window,
+            'before': [_context_summary(r) for r in self._raw_history],
+            'after': [],
+        }
         nrec = NarrativeRecord.from_step_record(
             record, importance_score=score, importance_rule=rule,
-            user_flagged=flagged)
+            user_flagged=flagged, context=context)
         self._narrative.append(nrec)
         self._total_stored += 1
         self._last_step = step_num
+
+        self._open_context.append(nrec)
+        self._remember_raw(record)
 
         # Cap size — pinned entries are never dropped by FIFO
         if len(self._narrative) > self.max_records:
             self._cap_size()
 
         return nrec
+
+    # ── e.md §3 triggers ──
+
+    def _classify(self, record, step_num: int) -> Tuple[float, str]:
+        """Return ``(importance, rule_name)`` for the five R16 triggers."""
+        # 1. Safety conflict has absolute priority.
+        if getattr(record, 'is_safe', True) is False:
+            return 1.0, 'safety_conflict'
+
+        # 2. High prediction error: value > running mean + 2σ.
+        pred = getattr(record, 'prediction_error', None)
+        if pred is not None and np.isfinite(float(pred)):
+            triggered = _above_mean_sigma(
+                float(pred), self._prediction_history, self.prediction_sigma)
+            self._prediction_history.append(float(pred))
+            if triggered:
+                return 0.8, 'prediction_error'
+
+        # 3. Routing novelty: KL(current || historical mean) > threshold.
+        mask = getattr(record, 'soft_mask', None)
+        if mask is not None:
+            p = np.asarray(mask, dtype=np.float64).ravel()
+            if p.size and np.all(np.isfinite(p)) and p.sum() > 0:
+                p = p / p.sum()
+                if self._routing_mean is not None and self._routing_count >= 10:
+                    q = self._routing_mean
+                    kl = float(np.sum(p * np.log(
+                        (p + 1e-12) / (q + 1e-12))))
+                    if kl > self.routing_kl_threshold:
+                        return 0.6, 'routing_novelty'
+                self._routing_count += 1
+                if self._routing_mean is None:
+                    self._routing_mean = p.copy()
+                else:
+                    self._routing_mean = (
+                        self._routing_mean * (self._routing_count - 1) + p
+                    ) / self._routing_count
+
+        # 4. Convergence anomaly: value > running mean + 2σ.
+        conv = getattr(record, 'convergence_diff', None)
+        if conv is not None and np.isfinite(float(conv)):
+            triggered = _above_mean_sigma(
+                float(conv), self._convergence_history, self.convergence_sigma)
+            self._convergence_history.append(float(conv))
+            if triggered:
+                return 0.7, 'convergence_anomaly'
+
+        # 5. Low-probability ordinary sampling: 1%.
+        if float(self.random_fn()) < 0.01:
+            return 0.1, 'random_sample'
+
+        return 0.0, ''
+
+    def _remember_raw(self, record) -> None:
+        self._raw_history.append(record)
+
+    # ── Access / forgetting score ──
+
+    @staticmethod
+    def forgetting_score(record: NarrativeRecord) -> float:
+        """e.md §3: importance × access frequency (unpinned only)."""
+        return float(record.importance_score) * (1.0 + float(record.access_count))
+
+    def access(self, step: Optional[int] = None, index: Optional[int] = None,
+               count: int = 1) -> Optional[NarrativeRecord]:
+        """Record a subsequent access, used by forgetting."""
+        target = None
+        if index is not None:
+            target = self._narrative[index]
+        elif step is not None:
+            for rec in reversed(self._narrative):
+                if rec.step == step:
+                    target = rec
+                    break
+        elif self._narrative:
+            target = self._narrative[-1]
+        if target is not None:
+            target.access_count += int(count)
+        return target
+
+    # Alias used by some call sites.
+    touch = access
 
     # ── Manual promotion (user-triggered from raw buffer) ──
 
@@ -325,7 +496,10 @@ class NarrativeMemory:
             return None
         nrec = NarrativeRecord.from_step_record(
             record, importance_score=1.0, importance_rule='user_marked',
-            promoted=True, pinned=True)  # promoted entries are pinned by default
+            promoted=True, pinned=True,
+            context={'window': self.context_window,
+                     'before': [_context_summary(r) for r in self._raw_history],
+                     'after': []})  # promoted entries are pinned by default
         self._narrative.append(nrec)
         self._total_stored += 1
         if len(self._narrative) > self.max_records:
@@ -344,11 +518,12 @@ class NarrativeMemory:
         if len(self._narrative) <= self.max_records:
             return
 
-        pinned = [(i, r) for i, r in enumerate(self._narrative) if r.pinned]
         unpinned = [(i, r) for i, r in enumerate(self._narrative) if not r.pinned]
 
-        # Sort unpinned by importance_score ascending
-        unpinned_sorted = sorted(unpinned, key=lambda x: x[1].importance_score)
+        # e.md §3: retention score = importance × access frequency.
+        # Ties drop the older record (stable secondary key on step).
+        unpinned_sorted = sorted(
+            unpinned, key=lambda x: (self.forgetting_score(x[1]), x[1].step))
 
         # Drop lowest-scoring unpinned entries
         n_drop = len(self._narrative) - self.max_records
@@ -407,17 +582,22 @@ class NarrativeMemory:
         before = len(self._narrative)
 
         if scorer_fn is None:
-            # Default: importance decay over time
+            # Default: importance × access frequency, decayed by age.
             def _default_scorer(r):
                 age = current_step - r.step
                 decay = np.exp(-0.01 * max(age, 0))
-                return r.importance_score * decay
+                return self.forgetting_score(r) * decay
             scorer_fn = _default_scorer
 
         kept = []
         for r in self._narrative:
             if r.pinned:
                 kept.append(r)
+            elif (current_step - r.step > 5000 and r.access_count == 0
+                  and r.importance_score < 0.2):
+                # e.md §3: stale, never-accessed, low-importance records are
+                # demoted/deleted without waiting for capacity pressure.
+                continue
             else:
                 score = scorer_fn(r)
                 if score >= keep_threshold:
@@ -556,7 +736,8 @@ class NarrativeMemory:
             d = asdict(r)
             for k, v in list(d.items()):
                 if isinstance(v, np.ndarray):
-                    if include_vectors and k in ('z_q', 'z'):
+                    if include_vectors and k in ('z_q', 'z', 'z_cur',
+                                                 'z_next'):
                         d[k] = v.tolist()
                     elif k in ('soft_mask', 'value_signals') and v is not None:
                         d[k] = v.tolist()
@@ -583,6 +764,12 @@ class NarrativeMemory:
         self._total_evaluated = 0
         self._total_stored = 0
         self._last_step = -1
+        self._prediction_history.clear()
+        self._convergence_history.clear()
+        self._routing_mean = None
+        self._routing_count = 0
+        self._raw_history.clear()
+        self._open_context.clear()
 
 
 __all__ = [

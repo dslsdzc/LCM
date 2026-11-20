@@ -5,11 +5,18 @@
 
 设计详见 e.md §七（原计划外，补充规格）。
 """
+import json
+import queue
+import threading
 import time
+from pathlib import Path
+
 import numpy as np
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Callable, Tuple
+
+from train.jsonl_log import append_json_line
 
 
 # ─── 异常检测 ──────────────────────────────────────────────────────────────────
@@ -637,6 +644,86 @@ class ReflectionReport:
         return s
 
 
+# ─── Periodic reflection (e.md §4 / R16) ───────────────────────────────────
+
+REFLECT_INTERVAL = 200
+MAX_BIAS_DELTA = 0.2
+EXPLORE_MIN = 0.05
+EXPLORE_MAX = 0.5
+
+
+@dataclass
+class Suggestion:
+    """A Level-2 strategy suggestion for the Level-1 explorer.
+
+    Level 2 may only *suggest*. ``safety_filter`` is the gate every suggestion
+    must pass before any Level-1 parameter is changed.
+    """
+    step: int
+    action_type: str
+    params: Dict[str, Any]
+    reason: str
+    severity: float = 0.5
+
+
+def safety_filter(suggestion: Suggestion, *,
+                  danger: bool = False,
+                  current_explore: float = 0.2,
+                  n_dim: int = 6) -> bool:
+    """Validate a Level-2 suggestion against Level-1 safety bounds.
+
+    Rules (d.md / e.md §8): Level 2 cannot directly manipulate Level 0.
+    Accepted actions are bounded bias deltas and bounded explore-rate changes.
+    Under danger, only zero-or-reducing changes are allowed.
+    """
+    if not isinstance(suggestion, Suggestion):
+        return False
+    action = suggestion.action_type
+    params = suggestion.params or {}
+
+    if action == 'bias_delta':
+        dim = params.get('dim')
+        delta = params.get('delta')
+        if not isinstance(dim, int) or not (0 <= dim < n_dim):
+            return False
+        try:
+            delta = float(delta)
+        except (TypeError, ValueError):
+            return False
+        if not np.isfinite(delta) or abs(delta) > MAX_BIAS_DELTA:
+            return False
+        if danger and delta > 0.0:
+            return False
+        return True
+
+    if action == 'explore_rate_reduce':
+        try:
+            factor = float(params.get('factor', 1.0))
+        except (TypeError, ValueError):
+            return False
+        if not np.isfinite(factor) or not (0.0 < factor <= 1.0):
+            return False
+        target = max(EXPLORE_MIN, float(current_explore) * factor)
+        if target < EXPLORE_MIN or target > EXPLORE_MAX:
+            return False
+        if danger and target > current_explore:
+            return False
+        return True
+
+    if action == 'explore_rate_set':
+        try:
+            target = float(params.get('value'))
+        except (TypeError, ValueError):
+            return False
+        if not np.isfinite(target) or not (EXPLORE_MIN <= target <= EXPLORE_MAX):
+            return False
+        if danger and target > current_explore:
+            return False
+        return True
+
+    return False
+
+
 class ReflectionLoop:
     """反思回路主控制器。
 
@@ -656,7 +743,14 @@ class ReflectionLoop:
     def __init__(self, anomaly_window: int = 100,
                  anomaly_z: float = 3.0,
                  max_records: int = 2000,
-                 cooldown: int = 50):
+                 cooldown: int = 50,
+                 interval: int = REFLECT_INTERVAL,
+                 log_path: Optional[str] = None,
+                 history_window: int = 2000,
+                 abandoned_steps: int = 1000,
+                 abandoned_weight: float = 0.05,
+                 entropy_variance_threshold: float = 0.01,
+                 cache_trend_window: int = 5):
         self.detector = AnomalyDetector(
             stats_window=anomaly_window,
             z_threshold=anomaly_z,
@@ -671,6 +765,22 @@ class ReflectionLoop:
         # 抑制：同类型异常在 N 步内不重复触发
         self._last_signal: Dict[str, int] = defaultdict(int)
         self._cooldown = cooldown
+
+        # ── Periodic (Level 2) reflection ──
+        self.interval = max(1, int(interval))
+        self.log_path = Path(log_path) if log_path is not None else None
+        self.abandoned_steps = max(1, int(abandoned_steps))
+        self.abandoned_weight = float(abandoned_weight)
+        self.entropy_variance_threshold = float(entropy_variance_threshold)
+        self.cache_trend_window = max(2, int(cache_trend_window))
+        self._observations: deque = deque(maxlen=max(10, int(history_window)))
+        self.suggestions: "queue.Queue[Suggestion]" = queue.Queue()
+        # Public alias for callers that ask for the queue by its spec name.
+        self.suggestion_queue = self.suggestions
+        self._thread: Optional[threading.Thread] = None
+        self._analysis_lock = threading.Lock()
+        self.n_analyses = 0
+        self.last_report: Optional[dict] = None
 
     # ── 输入 ──
 
@@ -713,6 +823,263 @@ class ReflectionLoop:
             if r is not None:
                 last_report = r
         return last_report
+
+    # ── Periodic reflection (R16: every 200 steps, async) ──
+
+    def observe(self, step: int, record=None,
+                soft_mask=None, convergence_diff=None,
+                cache_hit: Optional[float] = None) -> None:
+        """Feed one trajectory sample into the slow-analysis history.
+
+        This is O(1) append; no analysis runs here. ``record`` may be a
+        ``StepRecord``; explicit keyword values override its fields.
+        """
+        if record is not None:
+            if soft_mask is None:
+                soft_mask = getattr(record, 'soft_mask', None)
+            if convergence_diff is None:
+                convergence_diff = getattr(record, 'convergence_diff', None)
+        weights = None
+        entropy = None
+        if soft_mask is not None:
+            weights = np.asarray(soft_mask, dtype=np.float64).ravel()
+            if weights.size and weights.sum() > 0:
+                p = weights / weights.sum()
+                entropy = float(-np.sum(p * np.log(p + 1e-12)))
+        self._observations.append({
+            'step': int(step),
+            'weights': weights,
+            'entropy': entropy,
+            'convergence_diff': (None if convergence_diff is None
+                                 else float(convergence_diff)),
+            'cache_hit': (None if cache_hit is None else float(cache_hit)),
+        })
+
+    def maybe_reflect(self, step: int, narrative=None,
+                      cache_stats=None) -> bool:
+        """Launch one background analysis at each interval boundary."""
+        if step <= 0 or step % self.interval != 0:
+            return False
+        if self._thread is not None and self._thread.is_alive():
+            return False
+        # Snapshot before the thread starts: `observe` keeps appending while
+        # the analysis runs, and iterating a mutating deque is a race.
+        snapshot = list(self._observations)
+        self._thread = threading.Thread(
+            target=self._analysis_worker,
+            args=(int(step), narrative, cache_stats, snapshot),
+            name=f"reflection-{step}", daemon=True)
+        self._thread.start()
+        return True
+
+    def _analysis_worker(self, step: int, narrative, cache_stats,
+                         observations) -> None:
+        try:
+            self.reflect_now(step=step, narrative=narrative,
+                             cache_stats=cache_stats,
+                             observations=observations)
+        except Exception as exc:  # Level 2 must never kill inference
+            if self.log_path is not None:
+                try:
+                    append_json_line(self.log_path, {
+                        'step': int(step), 'event': 'reflection_error',
+                        'error': repr(exc)})
+                except OSError:
+                    pass
+
+    def wait(self, timeout: Optional[float] = None) -> None:
+        """Join the background analysis, if one is running."""
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+
+    def reflect_now(self, step: Optional[int] = None, narrative=None,
+                    cache_stats=None,
+                    observations: Optional[list] = None) -> dict:
+        """Run the four analyses inline (deterministic test/CLI path)."""
+        with self._analysis_lock:
+            return self._analyze(step=step, narrative=narrative,
+                                 cache_stats=cache_stats,
+                                 observations=observations)
+
+    def _analyze(self, step: Optional[int], narrative,
+                 cache_stats, observations: Optional[list] = None) -> dict:
+        if observations is None:
+            observations = list(self._observations)
+        if step is None:
+            step = observations[-1]['step'] if observations else self._last_step
+
+        abandoned = self._abandoned_lattices(step, observations)
+        entropy_variance = self._entropy_variance(observations)
+        anomaly = self._three_sigma(step, observations, narrative)
+        cache_hit, cache_declining = self._cache_trend(observations,
+                                                       cache_stats)
+
+        found: List[Suggestion] = []
+        for dim in abandoned:
+            found.append(Suggestion(
+                step=step, action_type='bias_delta',
+                params={'dim': int(dim), 'delta': 0.1},
+                reason=f"lattice {dim} average weight < "
+                       f"{self.abandoned_weight} for >{self.abandoned_steps} "
+                       f"steps",
+                severity=0.6))
+        if entropy_variance > self.entropy_variance_threshold:
+            found.append(Suggestion(
+                step=step, action_type='explore_rate_reduce',
+                params={'factor': 0.8},
+                reason=f"routing entropy variance {entropy_variance:.4f} "
+                       f"> {self.entropy_variance_threshold}",
+                severity=0.4))
+        if anomaly is not None:
+            found.append(Suggestion(
+                step=step, action_type='explore_rate_reduce',
+                params={'factor': 0.5},
+                reason=f"3σ anomaly at step {anomaly['step']} "
+                       f"(value={anomaly['value']:.3f})",
+                severity=0.8))
+        if cache_declining:
+            found.append(Suggestion(
+                step=step, action_type='explore_rate_reduce',
+                params={'factor': 0.9},
+                reason=f"prediction cache hit rate declining "
+                       f"({cache_hit:.3f})",
+                severity=0.5))
+
+        report = {
+            'event': 'reflection',
+            'step': int(step),
+            'interval': self.interval,
+            'abandoned_lattices': list(abandoned),
+            'routing_entropy_variance': float(entropy_variance),
+            'anomaly_3sigma': anomaly,
+            'cache_hit_rate': cache_hit,
+            'cache_declining': bool(cache_declining),
+            'n_suggestions': len(found),
+            'timestamp': time.time(),
+        }
+        self.last_report = report
+        self.n_analyses += 1
+        for suggestion in found:
+            self.suggestions.put(suggestion)
+
+        if self.log_path is not None:
+            record = dict(report)
+            record['suggestions'] = [
+                {'action_type': s.action_type, 'params': s.params,
+                 'reason': s.reason, 'severity': s.severity}
+                for s in found]
+            append_json_line(self.log_path, record)
+        return report
+
+    def _abandoned_lattices(self, step: int, observations: list) -> List[int]:
+        recent = [o for o in observations
+                  if step - o['step'] <= self.abandoned_steps
+                  and o['weights'] is not None]
+        if len(recent) < 100:
+            return []
+        if step - recent[0]['step'] < self.abandoned_steps:
+            return []
+        matrix = np.stack([o['weights'] for o in recent])
+        means = matrix.mean(axis=0)
+        return [int(i) for i, mean in enumerate(means)
+                if mean < self.abandoned_weight]
+
+    @staticmethod
+    def _entropy_variance(observations: list) -> float:
+        values = [o['entropy'] for o in observations
+                  if o['entropy'] is not None]
+        if len(values) < 2:
+            return 0.0
+        return float(np.var(values))
+
+    def _three_sigma(self, step: int, observations: list,
+                     narrative) -> Optional[dict]:
+        recent = [o['convergence_diff'] for o in observations
+                  if o['convergence_diff'] is not None]
+        if not recent:
+            return None
+        current = recent[-1]
+        historical: List[float] = []
+        if narrative is not None:
+            try:
+                historical = [
+                    float(r.convergence_diff) for r in narrative.get_all()
+                    if getattr(r, 'convergence_diff', None) is not None]
+            except Exception:
+                historical = []
+        if len(historical) < 10:
+            # Fall back to the loop's own history, excluding the current point.
+            historical = recent[-101:-1]
+        if len(historical) < 10:
+            return None
+        mean = float(np.mean(historical))
+        std = float(np.std(historical))
+        if current > mean + 3.0 * std:
+            return {'step': int(step), 'value': float(current),
+                    'mean': mean, 'std': std,
+                    'threshold': mean + 3.0 * std}
+        return None
+
+    def _cache_trend(self, observations: list,
+                     cache_stats) -> Tuple[Optional[float], bool]:
+        values = [o['cache_hit'] for o in observations
+                  if o['cache_hit'] is not None]
+        current = values[-1] if values else None
+        if cache_stats is not None:
+            if isinstance(cache_stats, dict):
+                hit = cache_stats.get('hit_rate')
+                if hit is None:
+                    hit = cache_stats.get('cache_hit')
+                if hit is None:
+                    hit = cache_stats.get('cache_util')
+                if hit is not None:
+                    values = values + [float(hit)]
+                    current = float(hit)
+            else:
+                try:
+                    current = float(cache_stats)
+                    values = values + [current]
+                except (TypeError, ValueError):
+                    pass
+        window = values[-self.cache_trend_window:]
+        if len(window) < self.cache_trend_window:
+            return current, False
+        diffs = np.diff(window)
+        declining = bool(np.all(diffs < -1e-3)
+                         and (window[0] - window[-1]) > 0.01)
+        return current, declining
+
+    def drain_suggestions(self) -> List[Suggestion]:
+        out: List[Suggestion] = []
+        while True:
+            try:
+                out.append(self.suggestions.get_nowait())
+            except queue.Empty:
+                return out
+
+    def apply_suggestion(self, suggestion: Suggestion, explorer,
+                         *, danger: bool = False) -> bool:
+        """Safety-filter a Level-2 suggestion, then change Level 1."""
+        current_explore = float(getattr(explorer, 'explore_prob', 0.2))
+        if not safety_filter(suggestion, danger=danger,
+                             current_explore=current_explore):
+            return False
+        if suggestion.action_type == 'bias_delta':
+            apply = getattr(explorer, 'apply_bias_delta', None)
+            if apply is None:
+                return False
+            apply(int(suggestion.params['dim']),
+                  float(suggestion.params['delta']))
+            return True
+        if suggestion.action_type == 'explore_rate_reduce':
+            explorer.explore_prob = max(
+                EXPLORE_MIN,
+                current_explore * float(suggestion.params['factor']))
+            return True
+        if suggestion.action_type == 'explore_rate_set':
+            explorer.explore_prob = float(suggestion.params['value'])
+            return True
+        return False
 
     # ── 反思 ──
 
@@ -843,4 +1210,7 @@ __all__ = [
     'CorrectionExecutor',
     'ReflectionReport',
     'ReflectionLoop',
+    'Suggestion',
+    'safety_filter',
+    'REFLECT_INTERVAL',
 ]
