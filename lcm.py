@@ -1661,7 +1661,11 @@ class LCMInferEngine:
         self.fusion_ln_bias = mem['fusion_ln_bias']
         self.value_scalars = mem['value_scalars']
         self.self_C = mem['self_C']
-        self.self_M = mem['self_C'].shape[0]
+        # C fusion_mem_t.M_self excludes the frozen core row; self_C has
+        # 1 + self_M rows. Keeping the rows separate avoids a Task-10
+        # one-row-past-the-array read.
+        self.self_M = mem['self_M']
+        self.self_rows = mem['self_rows']
         self.self_tau = mem['self_tau']
         self.self_bias = mem['self_bias']
 

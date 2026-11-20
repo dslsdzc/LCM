@@ -56,19 +56,47 @@ def canonical_sha256(tensors):
     return h.hexdigest()
 
 
-def _normalise_file_ref(ref):
-    """Normalise a ``file_map`` value to ``(filename, byte_offset)``.
+def value_scalar_specs(cfg):
+    """R22 per-codebook value-scalar order, as ``(name, family, M)``.
 
-    Accepted forms: ``"x.bin"``, ``("x.bin", 32)``, or
-    ``{"file": "x.bin", "offset": 32}``. The offset is the byte position of
-    the tensor payload inside the file (32 for header-bearing v2 codebooks).
+    JAX-free and shared by ``train.checkpoint`` (save/load) and
+    ``train.c_load`` (C inference). ``cfg`` may be an ``LCMConfig`` or the
+    exported ``config.json`` dict.
+    """
+    def _get(key):
+        return cfg[key] if isinstance(cfg, dict) else getattr(cfg, key)
+
+    return [
+        ('hrq', 'top', int(_get('M_top'))),
+        ('hrq', 'fine', int(_get('M_fine'))),
+        ('sparse', None, int(_get('M_sparse'))),
+        ('lowrank', None, int(_get('M_lr'))),
+        ('manifold', None, int(_get('M_man'))),
+        ('binding', 'key', int(_get('M_bind'))),
+        ('binding', 'val', int(_get('M_bind'))),
+        ('binding', 'bind', int(_get('M_bind'))),
+        ('contrast', 'a', int(_get('M_contrast'))),
+        ('contrast', 'b', int(_get('M_contrast'))),
+    ]
+
+
+def _normalise_file_ref(ref):
+    """Normalise a ``file_map`` value to ``(filename, byte_offset, storage)``.
+
+    Accepted forms: ``"x.bin"``, ``("x.bin", 32)``,
+    ``{"file": "x.bin", "offset": 32}``, or
+    ``{"file": "cog_params.pkl", "storage": "pickle"}``. The offset is the
+    byte position of the tensor payload inside the file (32 for
+    header-bearing v2 codebooks); pickle entries have no byte offset.
     """
     if isinstance(ref, str):
-        return ref, 0
+        return ref, 0, 'bin'
     if isinstance(ref, (tuple, list)) and len(ref) == 2:
-        return str(ref[0]), int(ref[1])
+        return str(ref[0]), int(ref[1]), 'bin'
     if isinstance(ref, dict) and 'file' in ref:
-        return str(ref['file']), int(ref.get('offset', 0))
+        storage = str(ref.get('storage', 'bin'))
+        offset = None if storage == 'pickle' else int(ref.get('offset', 0))
+        return str(ref['file']), offset, storage
     raise TypeError(f"bad file_map entry {ref!r}; expected str/(name, off)/dict")
 
 
@@ -86,7 +114,9 @@ def save_manifest(output_dir, tensors, file_map=None):
     file (and byte offset) that actually stores its payload. When supplied,
     the entry gains a ``file`` field and ``offset`` becomes the byte offset
     inside that file (Ruling 9); ``canonical_offset`` keeps the stream
-    position. Tensors without a mapping keep ``offset == canonical_offset``.
+    position. Pickle-stored entries use ``storage="pickle"`` and
+    ``offset=None`` rather than claiming a meaningless byte offset. Tensors
+    without a mapping keep ``offset == canonical_offset``.
     """
     entries = {}
     canonical_offset = 0
@@ -107,9 +137,12 @@ def save_manifest(output_dir, tensors, file_map=None):
             'sha256': hashlib.sha256(_canonical_tensor_bytes(a)).hexdigest(),
         }
         if file_map is not None and name in file_map:
-            filename, file_offset = _normalise_file_ref(file_map[name])
+            filename, file_offset, storage = _normalise_file_ref(
+                file_map[name])
             entry['file'] = filename
             entry['offset'] = file_offset
+            if storage != 'bin':
+                entry['storage'] = storage
         entries[name] = entry
         canonical_offset += length
     manifest = {'format_version': FORMAT_VERSION, 'tensors': entries}

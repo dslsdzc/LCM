@@ -67,7 +67,7 @@ def _cfg():
     }
 
 
-def _build_fixture(tmp_path):
+def _build_fixture(tmp_path, ranks=RANKS):
     """Write a complete synthetic export and return the expected arrays."""
     exp = {}
     tensors = {}
@@ -102,8 +102,8 @@ def _build_fixture(tmp_path):
 
     # LowRank: ragged U_0..U_{n-1} then shared V (d, r_max).
     parts = []
-    U = np.zeros((N_LR, M_LR, R_MAX), dtype=np.float32)
-    for k, r_k in enumerate(RANKS):
+    U = np.zeros((len(ranks), M_LR, R_MAX), dtype=np.float32)
+    for k, r_k in enumerate(ranks):
         U_k = np.zeros((M_LR, r_k), dtype=np.float32)
         U_k[:, 0] = 40.0 + k
         U[k, :, :r_k] = U_k
@@ -253,6 +253,21 @@ def test_manifest_file_offsets(tmp_path):
     assert entry['sha256'] == canonical_sha256({'a': a})
 
 
+def test_manifest_pickle_entries_have_no_offset(tmp_path):
+    """Pickle-stored params must not claim a meaningless byte offset."""
+    a = np.arange(2, dtype=np.float32)
+    save_manifest(
+        str(tmp_path), {'a': a, 'params.x': a},
+        file_map={'a': ('a.bin', 0),
+                  'params.x': {'file': 'cog_params.pkl',
+                               'storage': 'pickle'}})
+    manifest = load_manifest(str(tmp_path))
+    pickled = manifest['tensors']['params.x']
+    assert pickled['file'] == 'cog_params.pkl'
+    assert pickled['storage'] == 'pickle'
+    assert pickled['offset'] is None
+
+
 def test_loads_lowrank_all_layers(tmp_path):
     exp = _build_fixture(tmp_path)
     mem = load_lattice_memories(str(tmp_path), _cfg())
@@ -267,6 +282,23 @@ def test_loads_lowrank_all_layers(tmp_path):
         assert np.all(mem['lowrank_U'][k, :, r_k:] == 0), \
             f"layer {k} must be zero-padded past rank {r_k}"
     np.testing.assert_array_equal(mem['lowrank_V'], exp['lowrank_V'])
+
+
+def test_lowrank_two_ranks_ignores_stale_n_lr_layers(tmp_path):
+    """ranks is the file-split source of truth, not the n_lr_layers hint."""
+    ranks = (1, 4)
+    exp = _build_fixture(tmp_path, ranks=ranks)
+    cfg = _cfg()
+    cfg['ranks'] = list(ranks)
+    cfg['n_lr_layers'] = 3          # deliberately stale (2 U layers on disk)
+    mem = load_lattice_memories(str(tmp_path), cfg)
+
+    assert mem['lowrank_U'].shape == (2, M_LR, R_MAX)
+    assert list(mem['lowrank_ranks']) == [1, 4]
+    np.testing.assert_array_equal(mem['lowrank_U'][0, :, :1],
+                                  exp['lowrank_U'][0, :, :1])
+    np.testing.assert_array_equal(mem['lowrank_U'][1, :, :4],
+                                  exp['lowrank_U'][1, :, :4])
 
 
 def test_loads_binding_and_contrast_all_layers(tmp_path):
@@ -318,9 +350,16 @@ def test_loads_hrq_sparse_manifold_route_fusion_self(tmp_path):
                                   exp['fusion_ln_scale'])
     np.testing.assert_array_equal(mem['fusion_ln_bias'],
                                   exp['fusion_ln_bias'])
+    assert set(mem['fusion']) == {'alpha', 'ln_scale', 'ln_bias'}
+    np.testing.assert_array_equal(mem['fusion']['alpha'],
+                                  exp['fusion_alpha'])
 
     assert mem['self_C'].shape == (1 + N_SELF, D)
     np.testing.assert_array_equal(mem['self_C'], exp['self_C'])
+    # C fusion_mem_t.M_self counts mode rows, excluding the core row.
+    assert mem['self_M'] == N_SELF
+    assert mem['self_rows'] == N_SELF + 1
+    assert mem['self_M'] + 1 == mem['self_C'].shape[0]
     assert mem['self_tau'] == exp['self_tau']
     assert mem['self_bias'] == exp['self_bias']
 
@@ -332,7 +371,12 @@ def test_loads_hrq_sparse_manifold_route_fusion_self(tmp_path):
             ('contrast', 'a', M_CONTRAST), ('contrast', 'b', M_CONTRAST)]:
         arr = (mem['value_scalars'][name] if family is None
                else mem['value_scalars'][name][family])
+        expected = (exp['value_scalars'][name] if family is None
+                    else exp['value_scalars'][name][family])
         assert arr.shape == (m,), f"value_scalars[{name}][{family}]"
+        # Distinct per-leaf values: a wrong order or a zeroed loader fails.
+        np.testing.assert_array_equal(
+            arr, expected, err_msg=f"value_scalars[{name}][{family}]")
 
 
 def test_truncated_lowrank_is_rejected(tmp_path):

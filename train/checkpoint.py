@@ -52,7 +52,7 @@ import numpy as np
 from train.bin_format import (  # noqa: F401  (re-exported)
     FORMAT_VERSION, HEADER_FMT_V2, HEADER_SIZE_V2, MANIFEST_NAME,
     OLD_FORMAT_ERROR, _compute_checksum, canonical_sha256, load_manifest,
-    read_bin_v2, save_manifest,
+    read_bin_v2, save_manifest, value_scalar_specs as _value_scalar_specs,
 )
 
 # Codebook type constants
@@ -434,13 +434,14 @@ def save_checkpoint(state, cfg, output_dir="checkpoint", step=None):
 
 
 def _save_route(params, path):
-    """route: C_route + W_route → flat float32."""
+    """route: C_route + W_route → flat float32 (returned for the manifest)."""
     rt = params['route']
     flat = np.concatenate([
         np.asarray(rt['C_route']).ravel(),
         np.asarray(rt['W_route']).ravel(),
     ]).astype(np.float32)
     flat.tofile(path)
+    return flat
 
 
 # ── Trainable parts that must survive a round-trip ───────────────────────────
@@ -451,27 +452,13 @@ def _save_route(params, path):
 def _save_fusion(params, path):
     """fusion: alpha (n_lattices,) + ln_scale (d,) + ln_bias (d,)."""
     fu = params['fusion']
-    np.concatenate([
+    flat = np.concatenate([
         np.asarray(fu['alpha']).ravel(),
         np.asarray(fu['ln_scale']).ravel(),
         np.asarray(fu['ln_bias']).ravel(),
-    ]).astype(np.float32).tofile(path)
-
-
-def _value_scalar_specs(cfg):
-    """R22's per-codebook value-scalar order, as (name, family, M)."""
-    return [
-        ('hrq', 'top', cfg.M_top),
-        ('hrq', 'fine', cfg.M_fine),
-        ('sparse', None, cfg.M_sparse),
-        ('lowrank', None, cfg.M_lr),
-        ('manifold', None, cfg.M_man),
-        ('binding', 'key', cfg.M_bind),
-        ('binding', 'val', cfg.M_bind),
-        ('binding', 'bind', cfg.M_bind),
-        ('contrast', 'a', cfg.M_contrast),
-        ('contrast', 'b', cfg.M_contrast),
-    ]
+    ]).astype(np.float32)
+    flat.tofile(path)
+    return flat
 
 
 def _save_value_scalars(params, path, cfg):
@@ -497,6 +484,7 @@ def _save_value_scalars(params, path, cfg):
     flat = np.concatenate(parts).astype(np.float32)
     hdr = _pack_header(len(specs), cfg.d_model, 1, CB_EUCLIDEAN, 1.0)
     _write_bin(path, hdr, flat.tobytes())
+    return flat
 
 
 def _save_self(params, path):
@@ -509,15 +497,18 @@ def _save_self(params, path):
         np.asarray(sp['bias_self']).ravel(),
     ]).astype(np.float32)
     flat.tofile(path)
+    return flat
 
 
 def _save_binding_proj(params, path):
     """binding HRR projections A_k / A_v (the codebooks are in bind_codebook.bin)."""
     b = params['binding']
-    np.concatenate([
+    flat = np.concatenate([
         np.asarray(b['A_k']).ravel(),
         np.asarray(b['A_v']).ravel(),
-    ]).astype(np.float32).tofile(path)
+    ]).astype(np.float32)
+    flat.tofile(path)
+    return flat
 
 
 def _load_fusion(path, cfg):

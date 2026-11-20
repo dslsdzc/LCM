@@ -147,6 +147,11 @@ typedef struct {
  *   LowRank      U[layer][row][j]        = U[(layer*M_lr + row)*r_max + j]
  *   Binding      key_cb[layer][row][j]   = key_cb[(layer*M + row)*D + j]
  *   Contrast     C_a[layer][row][j]      = C_a[(layer*M + row)*D + j]
+ *
+ * Task 10 note: lcm_memory_v3 uses typed substructs (hrq/sparse/.../fusion),
+ * not a homogeneous ``lattices[7]`` array. build_dag_v3 should switch on
+ * lattice_id_t or build a local pointer table; there is intentionally one
+ * struct per lattice because their layouts differ.
  */
 
 typedef struct {

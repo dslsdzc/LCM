@@ -20,7 +20,7 @@ import os
 
 import numpy as np
 
-from train.bin_format import load_manifest
+from train.bin_format import load_manifest, value_scalar_specs
 
 
 def _require(cfg, key):
@@ -44,10 +44,13 @@ def _read_tensor(ckpt_dir, manifest, name):
         raise ValueError(
             f"manifest tensor {name!r} has no 'file' mapping; re-export "
             f"required (schema v2 needs file/offset)")
-    if file_name.endswith('.pkl'):
+    if entry.get('storage') == 'pickle' or file_name.endswith('.pkl'):
         raise ValueError(
             f"manifest tensor {name!r} lives in {file_name}, not a .bin "
             f"file; the C loader only reads flat float32 files")
+    if entry.get('offset') is None:
+        raise ValueError(
+            f"manifest tensor {name!r} has no file offset; re-export required")
 
     length = int(entry['length'])
     if length % 4:
@@ -69,22 +72,6 @@ def _read_tensor(ckpt_dir, manifest, name):
     return np.ascontiguousarray(arr.reshape(entry['shape']), dtype=np.float32)
 
 
-def _value_scalar_layout(cfg):
-    """R22 order. Must match train.checkpoint._value_scalar_specs."""
-    return [
-        ('hrq', 'top', int(_require(cfg, 'M_top'))),
-        ('hrq', 'fine', int(_require(cfg, 'M_fine'))),
-        ('sparse', None, int(_require(cfg, 'M_sparse'))),
-        ('lowrank', None, int(_require(cfg, 'M_lr'))),
-        ('manifold', None, int(_require(cfg, 'M_man'))),
-        ('binding', 'key', int(_require(cfg, 'M_bind'))),
-        ('binding', 'val', int(_require(cfg, 'M_bind'))),
-        ('binding', 'bind', int(_require(cfg, 'M_bind'))),
-        ('contrast', 'a', int(_require(cfg, 'M_contrast'))),
-        ('contrast', 'b', int(_require(cfg, 'M_contrast'))),
-    ]
-
-
 def load_lattice_memories(ckpt_dir, cfg):
     """Load every lattice/tensor the C engine needs from an exported ckpt.
 
@@ -102,10 +89,17 @@ def load_lattice_memories(ckpt_dir, cfg):
         contrast_a, contrast_b,
         route_C, route_W,
         fusion_alpha, fusion_ln_scale, fusion_ln_bias,
-        value_scalars, self_C, self_core, self_modes, self_tau, self_bias.
+        fusion (alias dict), value_scalars,
+        self_C, self_M, self_rows, self_core, self_modes, self_tau,
+        self_bias.
+
+    ``self_M`` is the number of mode rows (excluding the frozen core row);
+    ``self_rows == 1 + self_M`` is the number of rows in ``self_C``.
 
     Raises ValueError on a missing/mismatched tensor instead of silently
-    falling back to first-layer or zero data.
+    falling back to first-layer or zero data. Per-tensor sha256 verification
+    is deferred to Task 10/15; this loader relies on the manifest's
+    file/offset/length mapping and shape checks.
     """
     ckpt_dir = str(ckpt_dir)
     manifest = load_manifest(ckpt_dir)
@@ -150,17 +144,15 @@ def load_lattice_memories(ckpt_dir, cfg):
     # ── LowRank: ragged U_k blocks then shared V ──────────────────────────
     M_lr = int(_require(cfg, 'M_lr'))
     r_max = int(_require(cfg, 'r_max'))
-    n_lr = int(cfg.get('n_lr_layers', 0))
     ranks = cfg.get('ranks')
     if ranks is None:
-        if n_lr <= 0:
+        n_hint = int(cfg.get('n_lr_layers', 0))
+        if n_hint <= 0:
             raise ValueError("config.json has neither ranks nor n_lr_layers")
-        ranks = [r_max] * n_lr
+        ranks = [r_max] * n_hint
+    # ranks determines the file split. n_lr_layers is metadata and may be
+    # stale (e.g. _small_cfg keeps the default 3 with ranks=(2,4)).
     ranks = [int(r) for r in ranks]
-    if n_lr and len(ranks) != n_lr:
-        raise ValueError(
-            f"config.json ranks has {len(ranks)} entries but "
-            f"n_lr_layers={n_lr}")
     n_lr = len(ranks)
     lowrank = _read_tensor(ckpt_dir, manifest, 'lowrank_codebook').ravel()
     lowrank_U = np.zeros((n_lr, M_lr, r_max), dtype=np.float32)
@@ -176,16 +168,13 @@ def load_lattice_memories(ckpt_dir, cfg):
         lowrank_U[k, :, :r_k] = lowrank[pos:pos + n].reshape(M_lr, r_k)
         pos += n
     v_flat = lowrank[pos:]
-    if v_flat.size == d * r_max:
-        lowrank_V = np.ascontiguousarray(v_flat.reshape(d, r_max))
-    elif v_flat.size == d * d:
-        # Tolerate a full (d, d) shared base: only the leading r_max columns
-        # are used by the rank-k reconstruction.
-        lowrank_V = np.ascontiguousarray(v_flat.reshape(d, d)[:, :r_max])
-    else:
+    # Ruling 11: only the current d*r_max layout is accepted; a legacy d*d
+    # shared base is not migrated.
+    if v_flat.size != d * r_max:
         raise ValueError(
             f"lowrank_codebook tail has {v_flat.size} floats; expected "
-            f"d*r_max={d * r_max} (or d*d)")
+            f"d*r_max={d * r_max}")
+    lowrank_V = np.ascontiguousarray(v_flat.reshape(d, r_max))
 
     # ── Manifold: C then T ─────────────────────────────────────────────────
     M_man = int(_require(cfg, 'M_man'))
@@ -266,7 +255,7 @@ def load_lattice_memories(ckpt_dir, cfg):
         fusion[n_lattices + d:n_lattices + 2 * d])
 
     # ── R22 value scalars (nested, fixed order) ───────────────────────────
-    vs_layout = _value_scalar_layout(cfg)
+    vs_layout = value_scalar_specs(cfg)
     vs_total = sum(m for _, _, m in vs_layout)
     vs_flat = _read_tensor(ckpt_dir, manifest, 'value_scalars').ravel()
     if vs_flat.size != vs_total:
@@ -327,8 +316,17 @@ def load_lattice_memories(ckpt_dir, cfg):
         'fusion_alpha': fusion_alpha,
         'fusion_ln_scale': fusion_ln_scale,
         'fusion_ln_bias': fusion_ln_bias,
+        # Brief-compatible alias for Task 10; the flat keys stay for callers.
+        'fusion': {
+            'alpha': fusion_alpha,
+            'ln_scale': fusion_ln_scale,
+            'ln_bias': fusion_ln_bias,
+        },
         'value_scalars': value_scalars,
         'self_C': self_C,
+        # self_M excludes the frozen core row; self_C has 1 + self_M rows.
+        'self_M': int(self_modes.shape[0]),
+        'self_rows': int(self_C.shape[0]),
         'self_core': self_core,
         'self_modes': self_modes,
         'self_tau': self_tau,

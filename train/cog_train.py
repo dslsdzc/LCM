@@ -54,6 +54,8 @@ from train.qwen_lm import qwen_forward, load_qwen_params, QWEN_CONFIG
 from train.checkpoint import (
     FORMAT_VERSION, HEADER_FMT_V2, HEADER_SIZE_V2, save_manifest,
     _pack_header, _compute_checksum, load_cog_state, save_cog_state,
+    _save_route, _save_fusion, _save_value_scalars, _save_self,
+    _save_binding_proj,
 )
 
 # Global Qwen params cache (load once, reuse across calls)
@@ -1363,7 +1365,7 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
         'n_heads': train_cfg.n_heads,
         'd_ff': train_cfg.d_ff,
         'n_lattices': train_cfg.n_lattices,
-        'n_lr_layers': train_cfg.n_lr_layers,
+        'n_lr_layers': len(params['lowrank']['U']),
         'r_max': train_cfg.r_max,
         # Per-layer ranks: the lowrank .bin stores ragged U_k blocks, so the
         # loader cannot infer the split from r_max alone.
@@ -1482,67 +1484,19 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
     # Routing / fusion / value scalars / self / binding projections. Before
     # this export these lived only in cog_params.pkl, so the C engine could
     # not receive them at all and inference fell back to first-layer data.
-    rt = params['route']
-    route_flat = _np.concatenate([
-        _to_np(rt['C_route']).ravel(),
-        _to_np(rt['W_route']).ravel(),
-    ]).astype(_np.float32)
-    route_flat.tofile(os.path.join(output_dir, "route_codebook.bin"))
-    manifest_tensors['route_codebook'] = route_flat
-
-    fu = params['fusion']
-    fusion_flat = _np.concatenate([
-        _to_np(fu['alpha']).ravel(),
-        _to_np(fu['ln_scale']).ravel(),
-        _to_np(fu['ln_bias']).ravel(),
-    ]).astype(_np.float32)
-    fusion_flat.tofile(os.path.join(output_dir, "fusion.bin"))
-    manifest_tensors['fusion'] = fusion_flat
-
-    # R22 value scalars, fixed order (must match train.checkpoint._value_scalar_specs).
-    from train.checkpoint import _value_scalar_specs
-    vs = params.get('value_scalars', {})
-    vs_parts = []
-    for _vname, _vfamily, _vM in _value_scalar_specs(train_cfg):
-        _vvalue = vs.get(_vname)
-        if _vfamily is not None:
-            _vvalue = None if _vvalue is None else _vvalue[_vfamily]
-        _varr = _np.asarray(
-            _vvalue if _vvalue is not None else _np.zeros(_vM)).ravel()
-        if _varr.size != _vM:
-            raise ValueError(
-                f"value_scalars[{_vname!r}][{_vfamily!r}] has {_varr.size} "
-                f"floats, expected {_vM} (R22 nested layout)")
-        vs_parts.append(_varr)
-    vs_flat = _np.concatenate(vs_parts).astype(_np.float32)
-    _vs_data = vs_flat.tobytes()
-    _vs_hdr = struct.pack(
-        _CB_HEADER_FMT, len(vs_parts), int(d), 1, 1, 1.0, FORMAT_VERSION, 0,
-        zlib.crc32(_vs_data) & 0xFFFFFFFF)
-    with open(os.path.join(output_dir, "value_scalars.bin"), "wb") as _vf:
-        _vf.write(_vs_hdr)
-        _vf.write(_vs_data)
-    manifest_tensors['value_scalars'] = vs_flat
-
-    # Self lattice: core (d,) + modes (M_self, d) + tau_self + bias_self.
-    sp = params['self']
-    self_flat = _np.concatenate([
-        _to_np(sp['core']).ravel(),
-        _to_np(sp['modes']).ravel(),
-        _to_np(sp['tau_self']).ravel(),
-        _to_np(sp['bias_self']).ravel(),
-    ]).astype(_np.float32)
-    self_flat.tofile(os.path.join(output_dir, "self_lattice.bin"))
-    manifest_tensors['self_lattice'] = self_flat
-
-    # Binding HRR projections A_k / A_v (codebooks are in bind_codebook.bin).
-    bd = params['binding']
-    bp_flat = _np.concatenate([
-        _to_np(bd['A_k']).ravel(),
-        _to_np(bd['A_v']).ravel(),
-    ]).astype(_np.float32)
-    bp_flat.tofile(os.path.join(output_dir, "binding_proj.bin"))
-    manifest_tensors['binding_proj'] = bp_flat
+    # The file writers are shared with train.checkpoint._save_* so the two
+    # export paths cannot drift; each returns the flat payload for the
+    # manifest.
+    manifest_tensors['route_codebook'] = _save_route(
+        params, os.path.join(output_dir, "route_codebook.bin"))
+    manifest_tensors['fusion'] = _save_fusion(
+        params, os.path.join(output_dir, "fusion.bin"))
+    manifest_tensors['value_scalars'] = _save_value_scalars(
+        params, os.path.join(output_dir, "value_scalars.bin"), train_cfg)
+    manifest_tensors['self_lattice'] = _save_self(
+        params, os.path.join(output_dir, "self_lattice.bin"))
+    manifest_tensors['binding_proj'] = _save_binding_proj(
+        params, os.path.join(output_dir, "binding_proj.bin"))
 
     # The tokenizer this run actually trained with, not a probed default.
     # The old code copied data/tokenizer.json — the legacy 30k BPE — no matter
@@ -1630,8 +1584,7 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
 
     # Ruling 9: logical tensor → file + payload byte offset. Header-bearing
     # v2 codebooks start after the 32-byte header; raw flat files at 0; the
-    # pickled training params point at cog_params.pkl (no byte offset is
-    # meaningful inside a pickle, so 0).
+    # pickled training params use storage="pickle" with offset=None.
     file_map = {
         'encoder': ('encoder.bin', 0),
         'decoder': ('decoder.bin', 0),
@@ -1651,7 +1604,8 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
     }
     for _name in manifest_tensors:
         if _name.startswith('params.'):
-            file_map[_name] = ('cog_params.pkl', 0)
+            # Pickle tensors have no byte offset; do not claim 0 as one.
+            file_map[_name] = {'file': 'cog_params.pkl', 'storage': 'pickle'}
     save_manifest(output_dir, manifest_tensors, file_map=file_map)
 
     # 统计大小

@@ -158,6 +158,42 @@ def test_exported_config_carries_the_real_training_config(exported):
     assert exported_cfg["entropy_threshold"] == cfg.entropy_threshold
 
 
+def test_exported_config_M_lr_comes_from_U_rows(tmp_path, tiny_spec):
+    """M_lr is U[0].shape[0] (=codebook rows), never d (A_V.shape[0])."""
+    from train.conftest import build_tiny_corpus
+    from train.cog_train import RunIdentity, init_cog_params, save_cog_checkpoint
+    from train.config import LCMConfig
+
+    meta, _ = build_tiny_corpus(tmp_path, tiny_spec, ["北京是中国的首都" * 4])
+    cfg = dataclasses.replace(
+        LCMConfig(),
+        vocab_size=tiny_spec.model_vocab_size,
+        d_model=16, d_ff=32, n_heads=4, n_encoder_layers=1,
+        max_seq_len=16, max_inference_steps=4,
+        M_top=8, M_fine=4, n_hrq_layers=1, M_sparse=8,
+        M_lr=4, ranks=(2, 4), r_max=4,
+        # Deliberately stale: the tensor has two U layers (ranks), not three.
+        n_lr_layers=3,
+        M_man=8, M_bind=8, n_bind_layers=1,
+        M_contrast=8, n_contrast_layers=1, n_self_codes=4,
+    )
+    params, self_state = init_cog_params(cfg, jax.random.PRNGKey(0))
+    assert params["lowrank"]["U"][0].shape[0] == 4
+    assert params["lowrank"]["U"][0].shape[0] != cfg.d_model
+
+    out = str(tmp_path / "ckpt")
+    save_cog_checkpoint(
+        params, out, 0, run_identity=RunIdentity(tiny_spec, dict(meta)),
+        train_cfg=cfg, self_state=self_state, allow_missing_buffers=True)
+
+    with open(os.path.join(out, "config.json")) as f:
+        exported_cfg = json.load(f)
+    assert exported_cfg["M_lr"] == params["lowrank"]["U"][0].shape[0]
+    assert exported_cfg["M_lr"] == 4
+    assert exported_cfg["M_lr"] != exported_cfg["d_model"]
+    assert exported_cfg["n_lr_layers"] == len(params["lowrank"]["U"]) == 2
+
+
 def test_checkpoint_carries_the_trained_tokenizer(exported):
     _, _, out, tiny_spec, _ = exported
     from train.tokenizer_spec import sha256_file
