@@ -170,16 +170,15 @@ def test_per_layer_gradients_and_layer_counts_with_multiple_layers():
 
     # Contrast: two layers per family; C_b (and C_a) get gradient on every layer.
     cp = init_contrast_params(key, d, 3, n_layers=2)
-    _, ct_aux = contrast_forward(cp, z, return_aux=True)
-    assert len(ct_aux['a']['residuals']) == len(ct_aux['b']['residuals']) == 2
+    _, ct_aux = contrast_forward(cp, z)
+    assert len(ct_aux['residuals']['a']) == len(ct_aux['residuals']['b']) == 2
 
     def contrast_codebook(p):
-        _, aux = contrast_forward(p, z, return_aux=True)
+        _, aux = contrast_forward(p, z)
         total = jnp.array(0.0)
         for fam in ('a', 'b'):
             for cb, res, idx in zip(
-                    p[f'C_{fam}'], aux[fam]['residuals'],
-                    aux[fam]['indices']):
+                    p[f'C_{fam}'], aux['residuals'][fam], aux[fam]):
                 total = total + codebook_loss(
                     res, cb['A'] @ cb['W'], idx, 0.25)
         return total

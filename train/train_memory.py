@@ -75,7 +75,7 @@ def make_memory_step(cfg, gvalue_C_pos, gvalue_C_neg):
 
             from train.lattices import contrast_info_nce_loss
             loss_contrast = cfg.lambda_contrast * contrast_info_nce_loss(
-                p['contrast'], z, tau=0.5)
+                p['contrast'], z, tau=cfg.tau_contrast)
 
             if cfg.lambda_orth > 0:
                 # λ·‖Tᵀ T − I‖² (not λ·mean(Σ T²), which is just weight decay

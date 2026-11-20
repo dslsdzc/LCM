@@ -37,9 +37,9 @@ def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
         params: carries 'route', 'fusion', the six lattice param dicts, and
             optionally 'value_scalars'.
         cfg: LCMConfig.
-        gvalue: optional GValueCodebook for value-biased fusion. Passed through
-            rather than hardcoded, so a caller that has one keeps its
-            modulation; cognitive training passes None this round.
+        gvalue: DEPRECATED for fusion (R5 removed the value-signal soft
+            penalty). Still accepted and forwarded for API compatibility; it
+            does not affect the fused state.
         training: selects sparse_forward's LFQ path and the routing gate's
             hard/soft choice. A loop step is a forward evaluation of the
             lattice stack, so this mirrors whatever the surrounding pass is.
@@ -81,9 +81,9 @@ def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
     vs = params.get('value_scalars', {})
     alpha_val = cfg.alpha_val
 
-    # Return arities differ and are not uniform: lowrank_forward and
-    # contrast_forward return a bare array by default and expose their per-layer
-    # loss targets via return_aux=True; the other four return tuples.
+    # Return arities differ and are not uniform: lowrank_forward exposes its
+    # per-layer loss targets via return_aux=True; contrast_forward returns
+    # ``(output, indices_aux)``; the other four return tuples.
     #
     # R1/R2 ordering: HRQ runs first because sparse's LFQ threshold is defined
     # against HRQ's top-1 prototype (the C-5 dependency edge). ``hrq_top_sim``
@@ -110,13 +110,13 @@ def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
     # binding_forward quantises against the shared low-rank base V, derived
     # from lowrank's own factors rather than stored separately.
     V = params['lowrank']['A_V'] @ params['lowrank']['W_V']
-    o_binding, binding_residuals, binding_indices, binding_b_q = binding_forward(
+    (o_binding, binding_residuals, binding_indices, binding_b_q,
+     binding_k_q) = binding_forward(
         params['binding'], z, V,
         value_scalars=vs.get('binding'), alpha_val=alpha_val)
     o_contrast, contrast_aux = contrast_forward(
         params['contrast'], z,
-        value_scalars=vs.get('contrast'), alpha_val=alpha_val,
-        return_aux=True)
+        value_scalars=vs.get('contrast'), alpha_val=alpha_val)
 
     lattice_outputs = [o_hrq, o_sparse, o_lowrank, o_manifold, o_binding,
                        o_contrast]
@@ -154,9 +154,11 @@ def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
         # Rows selected by this forward. Under value bias these differ from a
         # plain Euclidean argmin, so EMA must not recompute them.
         'binding_indices': binding_indices,
-        # R20 will consume this once unbind/v_out lands.
+        # R20: quantised bound representation and summed key, exposed for the
+        # unbind output/losses and parity.
         'binding_b_q': binding_b_q,
-        # R18: C_a/C_b per-layer residual inputs and selected rows.
+        'binding_k_q': binding_k_q,
+        # R18/R21: C_a/C_b per-layer residual inputs and selected rows.
         'contrast_aux': contrast_aux,
     }
     return z_next, aux

@@ -99,8 +99,14 @@ def _codebook_rows(params):
     for fam in ('C_a', 'C_b'):
         for l, cb in enumerate(params['contrast'][fam]):
             out[f'contrast/{fam}/{l}/A'] = cb['A'].shape[0]
-    for name, v in params['value_scalars'].items():
-        out[f'value_scalars/{name}'] = v.shape[0]
+    def _vs_rows(value, prefix='value_scalars'):
+        for name, v in value.items():
+            if isinstance(v, dict):
+                _vs_rows(v, f'{prefix}/{name}')
+            else:
+                out[f'{prefix}/{name}'] = v.shape[0]
+
+    _vs_rows(params['value_scalars'])
     return out
 
 

@@ -178,8 +178,9 @@ def cog_loop_scan(z, params, cfg, max_steps=None, rng=None,
         stats: only when return_stats=True — dict with per-step ``z_in``,
             ``route_idx``, ``hrq_idx``, ``sparse_idx``, ``man_idx``, ``hrq_vq``
             (R18 continuous/quantised pairs), ``lowrank_aux``,
-            ``contrast_aux``, ``binding_residuals``, ``binding_indices`` and
-            ``binding_b_q`` (each stacked along axis 0). These are exactly the
+            ``contrast_aux``, ``binding_residuals``, ``binding_indices``,
+            ``binding_b_q`` and ``binding_k_q`` (each stacked along axis 0).
+            These are exactly the
             inputs the R18 losses and the EMA pass consume, so neither needs a
             second forward pass.
     """
@@ -217,9 +218,10 @@ def cog_loop_scan(z, params, cfg, max_steps=None, rng=None,
                 'contrast_aux': aux['contrast_aux'],
                 'binding_residuals': aux['binding_residuals'],
                 'binding_indices': aux['binding_indices'],
-                # R20 (Task 6): the quantised bound representation, needed for
-                # the unbind/output stage and its commitment term.
+                # R20: the quantised bound representation and summed key,
+                # needed for the unbind/output stage and its commitment term.
                 'binding_b_q': aux['binding_b_q'],
+                'binding_k_q': aux['binding_k_q'],
             }
             return z_next, (z_next, diff, aux['entropy'], stats)
 

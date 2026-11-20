@@ -46,7 +46,7 @@ from train.cog_loop import cog_loop_scan
 from train.ema_state import (
     ema_update_binding, ema_update_manifold, ema_update_sparse, init_ema_state,
 )
-from train.feature_bank import FeatureBank
+from train.feature_bank import FeatureBank, init_contrast_last_used
 from train.param_groups import merge_params, partition_params
 from train.lattices import contrast_info_nce_loss, manifold_orth_loss
 from train.losses import cognitive_vq_losses
@@ -288,10 +288,15 @@ def load_cog_buffers(resume, params, cfg):
 
     These are buffers, not parameters: a resume that cannot restore them would
     silently restart the EMA statistics from zero, so the v2 checkpoint is
-    required to carry both (``load_cog_state(require_buffers=True)``). The
-    saved step is returned because restored ``last_used`` values are absolute
-    step indices from the old run; the loop must continue from that origin, not
-    from 0.
+    required to carry the EMA state and sparse feature bank
+    (``load_cog_state(require_buffers=True)``). The contrast bank and its
+    ``last_used`` clock are additive R21 buffers; a pre-R21 checkpoint gets
+    fresh ones. The saved step is returned because restored ``last_used``
+    values are absolute step indices from the old run; the loop must continue
+    from that origin, not from 0.
+
+    Returns:
+        ``(ema_state, feature_bank, contrast_bank, contrast_last_used, step)``.
     """
     if resume:
         pkl_path = os.path.join(resume, "cog_params.pkl")
@@ -302,10 +307,21 @@ def load_cog_buffers(resume, params, cfg):
         ckpt = load_cog_state(resume, require_buffers=True)
         ema_state = jax.tree_util.tree_map(
             lambda x: jnp.asarray(x), ckpt['ema_state'])
-        return ema_state, ckpt['feature_bank'], int(ckpt.get('step', 0))
+        contrast_last_used = ckpt.get('contrast_last_used')
+        if contrast_last_used is None:
+            # Additive R21 buffer: pre-R21 v2 checkpoints did not carry it.
+            contrast_last_used = init_contrast_last_used(
+                cfg.n_contrast_layers, cfg.M_contrast)
+        contrast_bank = ckpt.get('contrast_bank')
+        if contrast_bank is None:
+            contrast_bank = FeatureBank(cfg.bank_capacity, cfg.d_model)
+        return (ema_state, ckpt['feature_bank'], contrast_bank,
+                contrast_last_used, int(ckpt.get('step', 0)))
 
     return (init_ema_state(params, cfg),
-            FeatureBank(cfg.bank_capacity, cfg.d_model), 0)
+            FeatureBank(cfg.bank_capacity, cfg.d_model),
+            FeatureBank(cfg.bank_capacity, cfg.d_model),
+            init_contrast_last_used(cfg.n_contrast_layers, cfg.M_contrast), 0)
 
 
 # ─── Init full params ───────────────────────────────────────────────────────
@@ -382,11 +398,7 @@ def init_cog_params(cfg, rng, qwen_ckpt=None, resume=None):
         # there is no routing mask to fuse by and no per-lattice scaling.
         params['route'] = init_route_params(keys[8], cfg.n_lattices, d)
         params['fusion'] = init_fusion_params(keys[9], cfg.n_lattices, d)
-        params['value_scalars'] = init_value_scalars(keys[11], [
-            ('hrq', cfg.M_top), ('sparse', cfg.M_sparse),
-            ('lowrank', cfg.M_lr), ('manifold', cfg.M_man),
-            ('binding', cfg.M_bind), ('contrast', cfg.M_contrast),
-        ])
+        params['value_scalars'] = init_value_scalars(cfg)
 
     # Load the frozen Qwen bridge for the active channel. Language LCM is
     # retired: it is not an alternative backend, and a path that is not a .npz
@@ -722,7 +734,7 @@ def make_train_step(cfg, optimizer, joint=False):
             if joint:
                 if 'contrast' in p:
                     c_loss = cfg.lambda_contrast * contrast_info_nce_loss(
-                        p['contrast'], z, tau=0.5)
+                        p['contrast'], z, tau=cfg.tau_contrast)
                     stage3_extra['contrast'] = c_loss
                     loss = loss + c_loss
 
@@ -768,32 +780,80 @@ def make_train_step(cfg, optimizer, joint=False):
 
 # ─── Training loop ──────────────────────────────────────────────────────────
 
-def _host_bank_update(params, ema_state, feature_bank, step, cfg):
-    """Replace dead sparse rows from the feature bank (host numpy).
+def _host_bank_update(params, ema_state, feature_bank, contrast_bank,
+                      contrast_last_used, loop_stats, step, cfg):
+    """Replace dead sparse/contrast rows from their feature banks (host numpy).
 
     Runs outside jit: the number of dead rows is dynamic and must not become a
-    traced shape. The replacement vectors come from observed states, and the
-    replaced rows are cold-started (N/m zeroed) by ``FeatureBank``.
-    """
-    if 'sparse' not in ema_state or 'sparse' not in params:
-        return params, ema_state
-    if len(feature_bank) == 0:
-        return params, ema_state
-    state = ema_state['sparse']
-    dead = feature_bank.dead_indices(
-        state['last_used'], step, cfg.bank_dead_threshold)
-    if dead.size == 0:
-        return params, ema_state
+    traced shape.
 
-    C_new, state_new = feature_bank.replace_dead_sparse(
-        params['sparse']['C'], state, step, cfg.bank_dead_threshold)
-    new_params = dict(params)
-    new_params['sparse'] = dict(params['sparse'], C=jnp.asarray(C_new))
-    new_ema = dict(ema_state)
-    new_ema['sparse'] = jax.tree_util.tree_map(jnp.asarray, state_new)
-    print(f"[COG] feature bank: replaced {len(dead)} dead sparse rows "
-          f"at step {step}")
-    return new_params, new_ema
+    * Sparse: random bank vectors, rows cold-started (N/m zeroed) by
+      ``FeatureBank``.
+    * Contrast (R21): a dedicated bank and farthest-point replacement.
+      Contrast's codebooks are gradient-owned, so only a ``last_used`` clock is
+      maintained (one per layer and family, not one shared clock). A replaced
+      row is stored as ``A = new vector, W = I``: the effective codebook row is
+      exactly the selected bank vector, and the downstream gradient reaches
+      ``A``.
+
+    The banks are separate so sparse's random replacement policy cannot consume
+    contrast's farthest-point candidates, and each keeps its own capacity.
+    """
+    new_params = params
+    new_ema = ema_state
+
+    # ── Sparse ────────────────────────────────────────────────────────────
+    if len(feature_bank) and 'sparse' in ema_state and 'sparse' in params:
+        state = ema_state['sparse']
+        dead = feature_bank.dead_indices(
+            state['last_used'], step, cfg.bank_dead_threshold)
+        if dead.size:
+            C_new, state_new = feature_bank.replace_dead_sparse(
+                params['sparse']['C'], state, step, cfg.bank_dead_threshold)
+            new_params = dict(new_params)
+            new_params['sparse'] = dict(params['sparse'], C=jnp.asarray(C_new))
+            new_ema = dict(new_ema)
+            new_ema['sparse'] = jax.tree_util.tree_map(jnp.asarray, state_new)
+            print(f"[COG] feature bank: replaced {len(dead)} dead sparse rows "
+                  f"at step {step}")
+
+    # ── Contrast (R21) ────────────────────────────────────────────────────
+    if (len(contrast_bank) and loop_stats is not None
+            and 'contrast_aux' in loop_stats and 'contrast' in params):
+        contrast_aux = loop_stats['contrast_aux']
+        new_clock = {family: list(contrast_last_used[family])
+                     for family in ('a', 'b')}
+        n_replaced = 0
+        for family in ('a', 'b'):
+            for layer in range(len(params['contrast'][f'C_{family}'])):
+                last = np.array(new_clock[family][layer], copy=True)
+                selected = np.asarray(
+                    contrast_aux[family][layer]).reshape(-1)
+                last[selected] = step
+                dead = contrast_bank.dead_indices(
+                    last, step, cfg.bank_dead_threshold)
+                if dead.size:
+                    cb = params['contrast'][f'C_{family}'][layer]
+                    C = np.asarray(cb['A'] @ cb['W'])
+                    C_new, last = contrast_bank.replace_dead_contrast(
+                        C, last, step, cfg.bank_dead_threshold)
+                    new_cb = {
+                        'A': jnp.asarray(C_new),
+                        'W': jnp.eye(C_new.shape[-1], dtype=C_new.dtype),
+                    }
+                    rows = list(new_params['contrast'][f'C_{family}'])
+                    rows[layer] = new_cb
+                    new_params = dict(new_params)
+                    new_params['contrast'] = dict(
+                        new_params['contrast'], **{f'C_{family}': rows})
+                    n_replaced += len(dead)
+                new_clock[family][layer] = last
+        contrast_last_used = new_clock
+        if n_replaced:
+            print(f"[COG] feature bank: replaced {n_replaced} dead contrast "
+                  f"rows at step {step}")
+
+    return new_params, new_ema, contrast_last_used
 
 
 def _lr_decay_steps(start_step, steps):
@@ -887,7 +947,8 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     rng, init_rng = jax.random.split(rng)
     params, self_state = init_cog_params(cfg, init_rng, qwen_ckpt=qwen_ckpt,
                                           resume=resume)
-    ema_state, feature_bank, start_step = load_cog_buffers(resume, params, cfg)
+    (ema_state, feature_bank, contrast_bank, contrast_last_used,
+     start_step) = load_cog_buffers(resume, params, cfg)
     # Restored last_used values are absolute step indices from the old run, so
     # the loop continues from the saved step rather than restarting its clock.
     step = start_step
@@ -974,6 +1035,8 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
         print(f"\n[COG] Interrupt at step {step}, saving checkpoint...")
         save_cog_checkpoint(params, output_dir, step, self_state=self_state,
                             ema_state=ema_state, feature_bank=feature_bank,
+                            contrast_bank=contrast_bank,
+                            contrast_last_used=contrast_last_used,
                             run_identity=run_identity, train_cfg=cfg)
         print(f"[COG] Saved → {output_dir}/cog_params.pkl")
         sys.exit(0)
@@ -1031,16 +1094,17 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
 
         # Feature bank: collect at the check interval (loop-relative guard);
         # dead detection uses the absolute state clock.
-        # TODO(Task 6): schedule FeatureBank.replace_dead_contrast here once
-        # contrast_forward exposes per-layer indices (R21).
         if item['bank']:
             loop_stats = aux_out.get('loop_stats')
             if loop_stats is not None and 'z_in' in loop_stats:
                 # Host conversion happens only at the interval, not every step
                 # (a per-step np.asarray forces a device sync).
-                feature_bank.add(np.asarray(loop_stats['z_in']))
-            params, ema_state = _host_bank_update(
-                params, ema_state, feature_bank, abs_step, cfg)
+                z_host = np.asarray(loop_stats['z_in'])
+                feature_bank.add(z_host)
+                contrast_bank.add(z_host)
+            params, ema_state, contrast_last_used = _host_bank_update(
+                params, ema_state, feature_bank, contrast_bank,
+                contrast_last_used, loop_stats, abs_step, cfg)
 
         # Save checkpoint (only with a clean step — never on poisoned params).
         # The guard is loop-relative so resuming at step 5 with save_every=2
@@ -1050,6 +1114,8 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
             save_cog_checkpoint(params, ckpt_dir, abs_step,
                                 self_state=self_state,
                                 ema_state=ema_state, feature_bank=feature_bank,
+                                contrast_bank=contrast_bank,
+                                contrast_last_used=contrast_last_used,
                                 run_identity=run_identity, train_cfg=cfg)
 
         running_loss += loss_f
@@ -1083,6 +1149,8 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     final_dir = os.path.join(output_dir, f"step_{final_step:06d}")
     save_cog_checkpoint(params, final_dir, final_step, self_state=self_state,
                         ema_state=ema_state, feature_bank=feature_bank,
+                        contrast_bank=contrast_bank,
+                        contrast_last_used=contrast_last_used,
                         run_identity=run_identity, train_cfg=cfg)
     if sup and sup.best_params is not None:
         sup.save_best(sup.best_params, sup.best_opt_state, sup.best_step,
@@ -1090,7 +1158,9 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
                       ema_state=(sup.best_ema_state
                                  if sup.best_ema_state is not None
                                  else ema_state),
-                      feature_bank=feature_bank)
+                      feature_bank=feature_bank,
+                      contrast_bank=contrast_bank,
+                      contrast_last_used=contrast_last_used)
     print(f"[COG] Training complete → {output_dir}/")
 
 
@@ -1171,6 +1241,7 @@ def _flatten_params_for_manifest(params):
 
 def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
                         self_state=None, ema_state=None, feature_bank=None,
+                        contrast_bank=None, contrast_last_used=None,
                         allow_missing_buffers=False):
     """Save full checkpoint + export codebooks + tied readout for C engine.
 
@@ -1179,8 +1250,9 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
     train_cfg is required because the exported config feeds Python inference,
     which reshapes attention by n_heads.
 
-    ``ema_state`` and ``feature_bank`` are buffers: they live next to
-    ``self_state`` in cog_params.pkl. Training must pass them. Export/test
+    ``ema_state``, ``feature_bank``, ``contrast_bank`` and
+    ``contrast_last_used`` are buffers: they live next to ``self_state`` in
+    cog_params.pkl. Training must pass them. Export/test
     callers that do not train must opt in explicitly with
     ``allow_missing_buffers=True``; that records ``buffers_present=False`` and
     the checkpoint can never be resumed (``load_cog_state`` rejects it). This
@@ -1216,7 +1288,8 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
     save_params = {k: v for k, v in params.items() if k != 'qwen'}
     save_cog_state(output_dir, params=save_params, step=step,
                    self_state=self_state, ema_state=ema_state,
-                   feature_bank=feature_bank,
+                   feature_bank=feature_bank, contrast_bank=contrast_bank,
+                   contrast_last_used=contrast_last_used,
                    buffers_present=buffers_present)
 
     # ── C推理引擎输出格式 ──────────────────────────────────────────────

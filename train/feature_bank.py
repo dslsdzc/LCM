@@ -133,4 +133,21 @@ class FeatureBank:
         return self._replace(C, state, step, t_dead, self._farthest_replacement)
 
 
-__all__ = ['FeatureBank']
+def init_contrast_last_used(n_layers, M_contrast):
+    """Per-layer ``last_used`` clocks for the contrast feature bank (R21).
+
+    Contrast's codebooks are gradient-owned, not EMA-owned, so they have no
+    ``{'N','m','last_used'}`` state. Dead-code replacement only needs the usage
+    clock; one array per layer and family is kept as a plain buffer.
+
+    Returns:
+        ``{'a': [int32 (M,), ...], 'b': [...]}``.
+    """
+    return {
+        family: [np.zeros(int(M_contrast), dtype=np.int32)
+                 for _ in range(int(n_layers))]
+        for family in ('a', 'b')
+    }
+
+
+__all__ = ['FeatureBank', 'init_contrast_last_used']

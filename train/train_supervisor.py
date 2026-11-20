@@ -277,7 +277,8 @@ class Supervisor:
               f"cog conv={rate:.0f}%")
 
     def save_best(self, params, opt_state, step, self_state=None,
-                  run_identity=None, ema_state=None, feature_bank=None):
+                  run_identity=None, ema_state=None, feature_bank=None,
+                  contrast_bank=None, contrast_last_used=None):
         """Save the best checkpoint so far.
 
         Uses save_cog_checkpoint (cog parameter layout). The legacy
@@ -296,6 +297,8 @@ class Supervisor:
         try:
             save_cog_checkpoint(params, path, step, self_state=self_state,
                                 ema_state=ema_state, feature_bank=feature_bank,
+                                contrast_bank=contrast_bank,
+                                contrast_last_used=contrast_last_used,
                                 run_identity=run_identity, train_cfg=self.cfg)
             self.last_save_path = path
             self.saved_steps.add(step)

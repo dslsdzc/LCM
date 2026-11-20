@@ -1,10 +1,13 @@
-"""Multi-lattice fusion with global value integration.
+"""Canonical multi-lattice fusion.
 
-Combines outputs from all six specialized lattices using:
-- Routing soft masks (Gumbel-Softmax)
-- Learnable scaling factors α_i
-- Global value signals (proximity to positive/negative value anchors)
-- No β_penalty (safety handled by hard interrupt upstream)
+R4/R5: combine the lattice outputs with routing soft masks and learnable
+scaling factors only:
+
+    z_q = layer_norm(Σ_i softmask_i · α_i · o_i + self_bias · o_self)
+
+There is no value-signal soft penalty. Safety violations are handled by the
+inference engine's hard interrupt, not by down-weighting a conflicting lattice
+and continuing to reason (``b.md §4.8``, ``c.md §3``, design R5).
 """
 import jax
 import jax.numpy as jnp
@@ -26,23 +29,6 @@ def layer_norm(x, scale, bias, eps=1e-6):
     return (x - mean) / jnp.sqrt(var + eps) * scale + bias
 
 
-def compute_value_signal(gvalue, lattice_outputs, tau=0.1):
-    """Compute value signal for each lattice output.
-
-    Each lattice output is evaluated against the global value codebook:
-    signal = softmax(-d_pos/τ) - softmax(-d_neg/τ)
-
-    Args:
-        gvalue: GValueCodebook instance.
-        lattice_outputs: List of (B, d) arrays.
-        tau: Temperature for softmax.
-
-    Returns:
-        value_signals: (B, n_lattices) signals in [-1, +1].
-    """
-    return gvalue.compute_value_signal_batch(lattice_outputs, tau)
-
-
 def fuse_lattices_with_aux(lattice_outputs, soft_mask, params, gvalue=None,
                            beta_val=0.5, tau_val=0.1, self_bias_weight=None):
     """Fuse all lattice outputs, returning the fusion weights alongside z_q.
@@ -52,19 +38,21 @@ def fuse_lattices_with_aux(lattice_outputs, soft_mask, params, gvalue=None,
     as the cognitive loop's convergence criterion does) must come through here
     rather than recomputing them.
 
-    Fusion incorporates global value signals:
-      w_i = soft_mask_i · α_i · exp(β_val · value_signal_i)
+    Fusion weights are exactly ``soft_mask_i · α_i`` (normalised). The self
+    lattice output, when present, is added *before* LayerNorm:
 
-    When a self lattice output is appended (7th element), it is fused
-    with a separate learned bias rather than the routing soft mask.
+        z_q = layer_norm(Σ w_i o_i + self_bias · o_self)
 
     Args:
         lattice_outputs: List of (B, d) arrays, one per lattice.
         soft_mask: (B, n_lattices) routing weights.
         params: Fusion parameters with 'alpha' scaling.
-        gvalue: Optional GValueCodebook for value-biased fusion.
-        beta_val: Value signal strength.
-        tau_val: Temperature for value signal.
+        gvalue: DEPRECATED / ignored. Kept for API compatibility; R5 removed
+            the value-signal soft penalty from fusion.
+        beta_val: DEPRECATED / ignored, reserved for future value-conditioned
+            routing. It must not change the weights (R5).
+        tau_val: DEPRECATED / ignored temperature for the removed value
+            signal.
         self_bias_weight: Optional scalar weight for self lattice output.
 
     Returns:
@@ -86,13 +74,9 @@ def fuse_lattices_with_aux(lattice_outputs, soft_mask, params, gvalue=None,
 
     stacked = jnp.stack(routed_outputs, axis=-1)  # (B, d, n_routed)
 
-    # Base weights from routing × scaling
+    # Base weights from routing × scaling. R5: no value-signal modulation —
+    # `gvalue`/`beta_val`/`tau_val` are deliberately ignored.
     weights = soft_mask * params['alpha'][None, :]  # (B, n_routed)
-
-    # Value-biased modulation
-    if gvalue is not None and beta_val > 0:
-        value_signals = compute_value_signal(gvalue, routed_outputs, tau_val)
-        weights = weights * jnp.exp(beta_val * value_signals)
 
     weights_norm = weights / (weights.sum(axis=-1, keepdims=True) + 1e-8)
 

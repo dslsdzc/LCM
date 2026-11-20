@@ -93,6 +93,9 @@ class LCMConfig:
     n_orth_samples: int = 32    # Codebooks sampled for orth loss per step
     lambda_contrast: float = 0.1
     lambda_val: float = 0.01    # Value contrast loss weight
+    # R17/R21: contrast InfoNCE and harm-weighting temperatures.
+    tau_contrast: float = 0.1
+    tau_val: float = 0.05
 
     # EMA
     gamma_sparse: float = 0.99
@@ -112,8 +115,12 @@ class LCMConfig:
     weight_decay: float = 0.01
 
     # Value bias / signal
-    beta_val: float = 0.5        # Value signal strength in fusion
-    tau_val_signal: float = 0.1  # Temperature for value signal softmax
+    # R5: fusion no longer consumes a value signal. `beta_val` and
+    # `tau_val_signal` are deprecated/reserved; they remain because the value
+    # contrast loss and the model's diagnostic value_signals still use the
+    # temperature.
+    beta_val: float = 0.5        # DEPRECATED: fusion value signal strength
+    tau_val_signal: float = 0.1  # Temperature for value signal/contrast margin
     safety_margin_loss_weight: float = 0.001  # Mild safety margin regularization
 
     # Continual learning

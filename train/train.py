@@ -274,10 +274,12 @@ def _jitted_step(params, opt_state, gvalue_C_pos, gvalue_C_neg,
         loss_vq = sum(compute_vq_loss(p, aux, z, cfg_obj).values())
         loss_contrast = cfg_dict['lambda_contrast'] * (
             contrast_value_biased_nce_loss(
-                p['contrast'], z, gvalue_C_neg[1], tau=0.5,
-                tau_val=cfg_dict.get('tau_val_signal', 0.1))
+                p['contrast'], z, gvalue_C_neg[1],
+                tau=cfg_dict.get('tau_contrast', 0.1),
+                tau_val=cfg_dict.get('tau_val', 0.05))
             if (gvalue_C_neg is not None and cfg_dict.get('alpha_val', 0) > 0)
-            else contrast_info_nce_loss(p['contrast'], z, tau=0.5)
+            else contrast_info_nce_loss(
+                p['contrast'], z, tau=cfg_dict.get('tau_contrast', 0.1))
         )
         loss_orth = compute_orth_loss(p, aux, cfg_obj, rng=subkeys[3])
         loss_val = value_contrast_loss(

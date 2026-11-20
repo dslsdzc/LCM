@@ -203,7 +203,7 @@ def test_binding_ema_uses_value_biased_forward_indices():
     z = jnp.array([[0.1, 0.0]])
     # Row 1 has value 1; alpha=20 makes the value term dominate the distance.
     v = jnp.array([0.0, 1.0])
-    _, residuals, indices, _ = binding_forward(
+    _, residuals, indices, _, _ = binding_forward(
         params, z, V, value_scalars=v, alpha_val=20.0)
 
     key_residual = residuals['key'][0]
@@ -432,9 +432,14 @@ def test_host_bank_update_replaces_dead_rows_only():
     ema['sparse']['m'] = ema['sparse']['m'].at[0].set(jnp.ones(cfg.d_model))
     C_before = jnp.asarray(params['sparse']['C'])
 
+    from train.feature_bank import init_contrast_last_used
+    clock = init_contrast_last_used(cfg.n_contrast_layers, cfg.M_contrast)
+    contrast_bank = FeatureBank(4, cfg.d_model)
+
     # Empty bank: the dead row cannot be replenished, so nothing changes.
     empty = FeatureBank(4, cfg.d_model)
-    params_noop, ema_noop = _host_bank_update(params, ema, empty, 5, cfg)
+    params_noop, ema_noop, _ = _host_bank_update(
+        params, ema, empty, contrast_bank, clock, None, 5, cfg)
     np.testing.assert_array_equal(np.asarray(params_noop['sparse']['C']),
                                   np.asarray(C_before))
     assert float(ema_noop['sparse']['N'][0]) == 5.0
@@ -442,7 +447,8 @@ def test_host_bank_update_replaces_dead_rows_only():
 
     bank = FeatureBank(4, cfg.d_model)
     bank.add(jnp.full((1, cfg.d_model), 7.0))
-    params_new, ema_new = _host_bank_update(params, ema, bank, 5, cfg)
+    params_new, ema_new, _ = _host_bank_update(
+        params, ema, bank, contrast_bank, clock, None, 5, cfg)
     np.testing.assert_allclose(np.asarray(params_new['sparse']['C'][0]),
                                np.full(cfg.d_model, 7.0), atol=1e-6)
     np.testing.assert_array_equal(np.asarray(params_new['sparse']['C'][1:]),
@@ -538,7 +544,8 @@ def test_cog_checkpoint_roundtrips_ema_and_feature_bank(tmp_path):
     params2, _, saved_step = load_stage2_params(
         out, cfg, jax.random.PRNGKey(0))
     assert saved_step == 5, "load_stage2_params must preserve the time origin"
-    ema2, bank2, start_step = load_cog_buffers(out, params2, cfg)
+    ema2, bank2, contrast_bank2, contrast_last_used2, start_step = (
+        load_cog_buffers(out, params2, cfg))
     assert start_step == 5, "load_cog_buffers must preserve the time origin"
     np.testing.assert_allclose(np.asarray(ema2['sparse']['N']),
                                np.asarray(ema['sparse']['N']))
@@ -547,6 +554,10 @@ def test_cog_checkpoint_roundtrips_ema_and_feature_bank(tmp_path):
     np.testing.assert_array_equal(np.asarray(ema2['sparse']['last_used']),
                                   np.asarray(ema['sparse']['last_used']))
     assert isinstance(bank2, FeatureBank)
+    assert isinstance(contrast_bank2, FeatureBank)
+    assert set(contrast_last_used2) == {'a', 'b'}
+    assert len(contrast_last_used2['a']) == cfg.n_contrast_layers
+    assert np.asarray(contrast_last_used2['a'][0]).shape == (cfg.M_contrast,)
     assert len(bank2) == 2
     np.testing.assert_allclose(np.asarray(bank2.vectors),
                                np.asarray(bank.vectors))

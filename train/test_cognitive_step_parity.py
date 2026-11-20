@@ -131,7 +131,7 @@ def test_lattice_output_matches_direct_call(built, name):
                                value_scalars=vs, alpha_val=a)[0]
     else:
         want = contrast_forward(params['contrast'], z,
-                                value_scalars=vs, alpha_val=a)
+                                value_scalars=vs, alpha_val=a)[0]
 
     assert np.allclose(np.asarray(got), np.asarray(want), atol=1e-6), \
         f"{name}: step output differs from a direct forward call"
@@ -187,22 +187,14 @@ def test_retrieval_gradient_reaches_only_hrq_by_design(built):
     ``d/dz`` is the identity so z stays differentiable, and ``d/dparams`` is
     exactly zero because the codebook is detached on purpose.
 
-    The INTENDED compensating path is EMA plus explicit auxiliary losses in
-    cog_train's Stage-3 block (vq_total, contrast_info_nce_loss,
-    manifold_orth_loss). Letting gradient through the distance term instead
-    would drag every codebook toward the current batch centroid;
-    value_biased_scores' docstring states this outright.
+    R20's binding output ``v_out = NN(C_val, unbind(k_q, b_q))`` is also a hard
+    lookup. It is deliberately not an STE path: ``normalize_fft`` divides by
+    the spectrum magnitude, whose derivative is unbounded at initialization
+    scale. Binding's trainable projections get their gradient from R18's
+    commitment terms instead.
 
-    WARNING — the intended path is not currently delivered. Verified 2026-09-30:
-    cog_train.py calls no EMA (and sparse_ema_update / manifold_ema_update have
-    zero callers repo-wide), and both entry points default to joint=False
-    (lcm.py:2583 joint=(args.stage == 3), lcm.py:2668 joint=False). So in the
-    default cognitive-training configuration all five detached lattices receive
-    NO update at all — not gradient, not EMA, not an auxiliary loss. This test
-    pins the retrieval semantics, which are correct; it does NOT establish that
-    the codebooks train.
-
-    hrq is the exception: it does not use that wrapper.
+    The compensating path for the detached codebooks is EMA plus the explicit
+    R18/R21 losses in cog_train.
 
     If this test ever fails because another lattice gained gradient, that is a
     design change and should be a deliberate one.

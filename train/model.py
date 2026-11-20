@@ -60,16 +60,8 @@ def init_all_params(cfg: LCMConfig, rng):
     # Danger codebook (frozen, saved with SHA-256, never trained)
     params['danger'] = init_danger_params(keys[12], cfg.M_danger, d)
 
-    # Local value scalars
-    lattice_sizes = [
-        ('hrq', cfg.M_top),
-        ('sparse', cfg.M_sparse),
-        ('lowrank', cfg.M_lr),
-        ('manifold', cfg.M_man),
-        ('binding', cfg.M_bind),
-        ('contrast', cfg.M_contrast),
-    ]
-    params['value_scalars'] = init_value_scalars(keys[10], lattice_sizes)
+    # Local value scalars, per codebook family (R22).
+    params['value_scalars'] = init_value_scalars(cfg)
 
     # Shared low-rank base V (stored in lowrank params, used by binding)
     # Already in params['lowrank']

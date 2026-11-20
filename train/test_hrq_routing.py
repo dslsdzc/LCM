@@ -121,6 +121,23 @@ def test_value_scalars_receive_gradient():
     assert jnp.any(g != 0.0), "value_scalars got no gradient from HRQ routing"
 
 
+def test_fine_value_scalars_receive_gradient():
+    """R22: HRQ's fine layers consume ``hrq.fine`` and it must be live."""
+    p = _crafted_hrq(M_top=8)
+    z = jax.random.normal(jax.random.PRNGKey(8), (2, 8)) * 0.3
+    top = jnp.zeros(8)
+
+    def loss(v_fine):
+        o = hrq_forward(
+            p, z, value_scalars={'top': top, 'fine': v_fine},
+            alpha_val=1.0)[0]
+        return jnp.sum(o ** 2)
+
+    g = jax.grad(loss)(jnp.zeros(4))
+    assert jnp.all(jnp.isfinite(g))
+    assert jnp.any(g != 0.0), "fine value scalars got no gradient"
+
+
 def test_top_codebook_receives_gradient():
     """R1.3: the top-k proxy must give ``C_top`` a real gradient, not only v."""
     p = _crafted_hrq(M_top=8)

@@ -260,12 +260,14 @@ def _to_host(x):
 
 
 def save_cog_state(output_dir, *, params, step, self_state=None,
-                   ema_state=None, feature_bank=None, buffers_present=None):
+                   ema_state=None, feature_bank=None, contrast_bank=None,
+                   contrast_last_used=None, buffers_present=None):
     """Write ``cog_params.pkl``: params plus the non-parameter buffers.
 
-    Schema v2: EMA state (N/m/last_used) and the feature bank live next to
-    ``self_state`` in the same pickle, because they are runtime state of the
-    same training run. They are never parameters and never enter the optimizer.
+    Schema v2: EMA state (N/m/last_used), the sparse and contrast feature
+    banks, and R21's contrast dead-code clock live next to ``self_state`` in
+    the same pickle, because they are runtime state of the same training run.
+    They are never parameters and never enter the optimizer.
 
     ``buffers_present`` is recorded explicitly. A checkpoint written by an
     export/test caller with ``allow_missing_buffers=True`` stores ``False`` and
@@ -285,6 +287,11 @@ def save_cog_state(output_dir, *, params, step, self_state=None,
         'ema_state': jax.tree_util.tree_map(_to_host, ema_state)
         if ema_state is not None else None,
         'feature_bank': feature_bank,
+        # R21: contrast keeps its own bank (farthest-point policy) and
+        # dead-code clock. Contrast is gradient-owned, so the clock lives
+        # outside ema_state. Additive buffers; old v2 pickles may omit them.
+        'contrast_bank': contrast_bank,
+        'contrast_last_used': contrast_last_used,
     }
     path = os.path.join(output_dir, COG_STATE_FILE)
     with open(path, 'wb') as f:
@@ -449,19 +456,60 @@ def _save_fusion(params, path):
     ]).astype(np.float32).tofile(path)
 
 
+def _value_scalar_specs(cfg):
+    """R22's per-codebook value-scalar order, as (name, family, M)."""
+    return [
+        ('hrq', 'top', cfg.M_top),
+        ('hrq', 'fine', cfg.M_fine),
+        ('sparse', None, cfg.M_sparse),
+        ('lowrank', None, cfg.M_lr),
+        ('manifold', None, cfg.M_man),
+        ('binding', 'key', cfg.M_bind),
+        ('binding', 'val', cfg.M_bind),
+        ('binding', 'bind', cfg.M_bind),
+        ('contrast', 'a', cfg.M_contrast),
+        ('contrast', 'b', cfg.M_contrast),
+    ]
+
+
+def _legacy_value_scalar_specs(cfg):
+    """Pre-R22 layout: one vector per lattice."""
+    return [
+        ('hrq', None, cfg.M_top), ('sparse', None, cfg.M_sparse),
+        ('lowrank', None, cfg.M_lr), ('manifold', None, cfg.M_man),
+        ('binding', None, cfg.M_bind), ('contrast', None, cfg.M_contrast),
+    ]
+
+
+def _vs_leaf(value_scalars, name, family):
+    value = value_scalars.get(name)
+    if value is None or family is None:
+        return value
+    # A legacy per-lattice vector seeds every family of that lattice.
+    return value.get(family) if isinstance(value, dict) else value
+
+
 def _save_value_scalars(params, path, cfg):
-    """value_scalars: one (M_lattice,) vector per lattice, in fixed order."""
-    order = [('hrq', cfg.M_top), ('sparse', cfg.M_sparse),
-             ('lowrank', cfg.M_lr), ('manifold', cfg.M_man),
-             ('binding', cfg.M_bind), ('contrast', cfg.M_contrast)]
+    """value_scalars: R22 per-codebook vectors, in fixed order.
+
+    Order: HRQ top, HRQ fine, sparse, lowrank, manifold, binding key/val/bind,
+    contrast a/b. The header stores the number of vectors; the payload is a
+    ragged concatenation and the loader ravels it regardless.
+    """
+    specs = _value_scalar_specs(cfg)
     vs = params.get('value_scalars', {})
-    parts = [np.asarray(vs.get(name, np.zeros(M))).ravel() for name, M in order]
+    parts = []
+    for name, family, M in specs:
+        value = _vs_leaf(vs, name, family)
+        arr = np.asarray(value if value is not None else np.zeros(M)).ravel()
+        if arr.size != M:
+            # Legacy hrq's (M_top,) vector seeds (M_fine,) too; pad/truncate so
+            # the saved layout always matches the configured shape.
+            arr = (np.pad(arr, (0, M - arr.size)) if arr.size < M
+                   else arr[:M])
+        parts.append(arr)
     flat = np.concatenate(parts).astype(np.float32)
-    # n_layers=1: the payload is a ragged concatenation whose length is the sum
-    # of the per-lattice sizes in `order`, so the header's M*d*n_layers must not
-    # accidentally equal it (that would make _read_bin reshape it). The loader
-    # ravels regardless, so this only keeps the file self-describing.
-    hdr = _pack_header(len(order), cfg.d_model, 1, CB_EUCLIDEAN, 1.0)
+    hdr = _pack_header(len(specs), cfg.d_model, 1, CB_EUCLIDEAN, 1.0)
     _write_bin(path, hdr, flat.tobytes())
 
 
@@ -500,19 +548,55 @@ def _load_fusion(path, cfg):
 
 
 def _load_value_scalars(path, cfg):
-    order = [('hrq', cfg.M_top), ('sparse', cfg.M_sparse),
-             ('lowrank', cfg.M_lr), ('manifold', cfg.M_man),
-             ('binding', cfg.M_bind), ('contrast', cfg.M_contrast)]
+    """Load R22's nested value-scalar structure.
+
+    A pre-R22 file (one vector per lattice) is still readable: its hrq vector
+    seeds both top/fine, its binding vector seeds all three families and its
+    contrast vector seeds both codebooks. New files always use R22's layout.
+    """
     _, data, _ = _read_bin(path)
     flat = np.asarray(data).ravel()
-    out, pos = {}, 0
-    for name, M in order:
-        if pos + M > flat.size:
-            raise ValueError(f"value_scalars.bin truncated at {name} "
-                             f"({flat.size} floats, need {pos + M})")
-        out[name] = jnp.array(flat[pos:pos + M])
-        pos += M
-    return out
+    specs = _value_scalar_specs(cfg)
+    legacy = _legacy_value_scalar_specs(cfg)
+    total = sum(M for _, _, M in specs)
+    legacy_total = sum(M for _, _, M in legacy)
+
+    if flat.size == total:
+        raw, pos = {}, 0
+        for name, family, M in specs:
+            raw[(name, family)] = jnp.array(flat[pos:pos + M])
+            pos += M
+        return {
+            'hrq': {'top': raw[('hrq', 'top')],
+                    'fine': raw[('hrq', 'fine')]},
+            'sparse': raw[('sparse', None)],
+            'lowrank': raw[('lowrank', None)],
+            'manifold': raw[('manifold', None)],
+            'binding': {family: raw[('binding', family)]
+                        for family in ('key', 'val', 'bind')},
+            'contrast': {family: raw[('contrast', family)]
+                         for family in ('a', 'b')},
+        }
+
+    if flat.size == legacy_total:
+        raw, pos = {}, 0
+        for name, _, M in legacy:
+            raw[name] = jnp.array(flat[pos:pos + M])
+            pos += M
+        return {
+            'hrq': {'top': raw['hrq'], 'fine': raw['hrq']},
+            'sparse': raw['sparse'],
+            'lowrank': raw['lowrank'],
+            'manifold': raw['manifold'],
+            'binding': {family: raw['binding']
+                        for family in ('key', 'val', 'bind')},
+            'contrast': {family: raw['contrast']
+                         for family in ('a', 'b')},
+        }
+
+    raise ValueError(
+        f"value_scalars.bin has {flat.size} floats; expected {total} (R22) "
+        f"or {legacy_total} (legacy)")
 
 
 def _load_self(path, cfg):
@@ -645,18 +729,13 @@ def load_checkpoint(output_dir, cfg=None, rng=None, load_opt=True):
     else:
         params['route'] = init_route_params(jax.random.PRNGKey(1), cfg.n_lattices, d)
 
-    # Local value scalars
-    lattice_sizes = [
-        ('hrq', cfg.M_top), ('sparse', cfg.M_sparse),
-        ('lowrank', cfg.M_lr), ('manifold', cfg.M_man),
-        ('binding', cfg.M_bind), ('contrast', cfg.M_contrast),
-    ]
+    # Local value scalars (R22 per-codebook structure)
     vs_path = os.path.join(output_dir, "value_scalars.bin")
     if os.path.exists(vs_path):
         params['value_scalars'] = _load_value_scalars(vs_path, cfg)
     else:
         print("  [WARN] value_scalars.bin missing — re-initialising to zeros")
-        params['value_scalars'] = init_value_scalars(jax.random.PRNGKey(2), lattice_sizes)
+        params['value_scalars'] = init_value_scalars(cfg)
 
     # Self lattice params
     self_path = os.path.join(output_dir, "self_lattice.bin")

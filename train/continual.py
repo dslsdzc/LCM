@@ -219,8 +219,18 @@ def expand_ema_state(ema_state: dict, n_new: int, cfg) -> dict:
 
 
 def expand_value_scalars(value_scalars: dict, n_new: int) -> dict:
-    """Expand local value scalars for every lattice."""
-    return {k: _grow(v, n_new) for k, v in value_scalars.items()}
+    """Expand R22's nested per-codebook value scalars.
+
+    ``hrq``/``binding``/``contrast`` are dicts of vectors; the other lattices
+    are bare vectors. Recurse so every leaf grows with its codebook.
+    """
+    out = {}
+    for key, value in value_scalars.items():
+        if isinstance(value, dict):
+            out[key] = expand_value_scalars(value, n_new)
+        else:
+            out[key] = _grow(value, n_new)
+    return out
 
 
 def pad_to_shape(old: jnp.ndarray, new_shape) -> jnp.ndarray:

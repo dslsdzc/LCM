@@ -289,10 +289,11 @@ def cognitive_vq_losses(params, stats, cfg: LCMConfig, ema_paths=EMA_PATHS):
     contrast_cm = jnp.array(0.0)
     for family in ('a', 'b'):
         family_ema = _ema_owns(ema_paths, ('contrast', f'C_{family}'))
-        fam_aux = stats['contrast_aux'][family]
+        fam_residuals = stats['contrast_aux']['residuals'][family]
+        fam_indices = stats['contrast_aux'][family]
         for cb, residual, idx in zip(
                 params['contrast'][f'C_{family}'],
-                fam_aux['residuals'], fam_aux['indices']):
+                fam_residuals, fam_indices):
             C_k = cb['A'] @ cb['W']
             if not family_ema:
                 contrast_cb = contrast_cb + codebook_loss(
@@ -330,9 +331,10 @@ def compute_contrast_loss(params, z, cfg: LCMConfig, gvalue=None):
     if gvalue is not None and cfg.alpha_val > 0:
         v_harm = gvalue.C_neg[1]  # harm anchor
         return cfg.lambda_contrast * contrast_value_biased_nce_loss(
-            params['contrast'], z, v_harm, tau=0.5, tau_val=cfg.tau_val_signal)
+            params['contrast'], z, v_harm,
+            tau=cfg.tau_contrast, tau_val=cfg.tau_val)
     return cfg.lambda_contrast * contrast_info_nce_loss(
-        params['contrast'], z, tau=0.5)
+        params['contrast'], z, tau=cfg.tau_contrast)
 
 
 def compute_orth_loss(params, aux, cfg: LCMConfig, rng=None):

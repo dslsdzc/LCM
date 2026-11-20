@@ -74,9 +74,13 @@ def flatten_params(params):
             path = ".".join(str(p.key) if hasattr(p, "key") else str(p.idx)
                             for p in k)
             out[f"params.{name}.{path}"] = np.asarray(v, dtype=np.float32)
-    if params.get("value_scalars"):
-        for k, v in params["value_scalars"].items():
-            out[f"params.value_scalars.{k}"] = np.asarray(v, dtype=np.float32)
+    vs = params.get("value_scalars")
+    if vs:
+        for k, v in jax.tree_util.tree_flatten_with_path(vs)[0]:
+            path = ".".join(str(p.key) if hasattr(p, "key") else str(p.idx)
+                            for p in k)
+            out[f"params.value_scalars.{path}"] = np.asarray(
+                v, dtype=np.float32)
     return out
 
 
