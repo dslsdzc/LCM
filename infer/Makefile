@@ -32,7 +32,7 @@ LDFLAGS  += -lm -lmvec
 LCM_D    ?= 256
 CFLAGS   += -DLCM_D=$(LCM_D)
 
-SRCS     = hyp.c lattice.c lattice_layers.c gvalue.c danger.c sha256.c engine.c lcm_api.c
+SRCS     = hyp.c lattice.c lattice_layers.c gvalue.c danger.c sha256.c engine.c loops_v3.c lcm_api.c
 OBJS     = $(SRCS:.c=.o)
 
 # ── Release build (default) ──────────────────────────────────────────────────

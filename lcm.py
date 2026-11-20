@@ -31,6 +31,8 @@ import time
 os.environ.setdefault("JAX_SKIP_CUDA_CONSTRAINTS_CHECK", "1")
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
+CONFLICT_ABORT_TOKEN = -2  # R13: distinct from ordinary error -1
+
 import numpy as np
 from tqdm import tqdm
 
@@ -1561,6 +1563,7 @@ class LCMInferEngine:
         _check_lcm_dim(self.lib, self.d)
         self.lib.lcm_infer_step.restype = ctypes.c_int
         self.lib.lcm_infer_loop.restype = ctypes.c_int
+        self.lib.lcm_infer_loop_v3_flat.restype = ctypes.c_int
         self.lib.lcm_get_trace.restype = ctypes.c_int
         self.lib.lcm_get_trace.argtypes = [
             ctypes.POINTER(ctypes.c_float), ctypes.c_int]
@@ -1600,6 +1603,7 @@ class LCMInferEngine:
         self._causal_enabled = False
         self.causal = None  # CausalSubject — lazy init via enable_causal()
         self._last_agency_mod = {'tension': 0.0, 'explore': 0.0}
+        self._last_loop_ret = 0
 
     def _load_codebooks(self):
         """Load every layer and side tensor from the v2 manifest (R10).
@@ -1672,6 +1676,26 @@ class LCMInferEngine:
         self.self_tau = mem['self_tau']
         self.self_bias = mem['self_bias']
 
+        # R22 value scalars, flattened per codebook for the v3 C structs.
+        vs = mem['value_scalars']
+        self.hrq_value_top = np.ascontiguousarray(vs['hrq']['top'],
+                                                  dtype=np.float32)
+        self.hrq_value_fine = np.ascontiguousarray(vs['hrq']['fine'],
+                                                   dtype=np.float32)
+        self.sparse_value = np.ascontiguousarray(vs['sparse'], dtype=np.float32)
+        self.lr_value = np.ascontiguousarray(vs['lowrank'], dtype=np.float32)
+        self.man_value = np.ascontiguousarray(vs['manifold'], dtype=np.float32)
+        self.bind_value_key = np.ascontiguousarray(vs['binding']['key'],
+                                                   dtype=np.float32)
+        self.bind_value_val = np.ascontiguousarray(vs['binding']['val'],
+                                                   dtype=np.float32)
+        self.bind_value_bind = np.ascontiguousarray(vs['binding']['bind'],
+                                                    dtype=np.float32)
+        self.contrast_value_a = np.ascontiguousarray(vs['contrast']['a'],
+                                                     dtype=np.float32)
+        self.contrast_value_b = np.ascontiguousarray(vs['contrast']['b'],
+                                                     dtype=np.float32)
+
         gv_data, gv_n, _ = load_codebook_for_c(ckpt, "gvalue_codebook.bin")
         gv_pos = gv_data[:gv_n * self.d]
         gv_neg = gv_data[gv_n * self.d:]
@@ -1732,21 +1756,21 @@ class LCMInferEngine:
             print(f"[INFER] WARNING: lcm_infer_step returned {ret}", file=sys.stderr)
         return z_out
 
-    def cognitive_loop(self, z, conv_tol=1e-3, entropy_thresh=2.0,
-                       max_steps=32, use_safety=True,
+    def cognitive_loop(self, z, conv_tol=1e-3, entropy_thresh=0.5,
+                       max_steps=16, use_safety=True, alpha_val=1.0,
                        agency_tension_mod=0.0, agency_explore_mod=0.0):
-        """Cognitive inference loop with agency-modulated convergence.
+        """Cognitive inference loop (C v3: dynamic DAG + canonical fusion).
 
         Args:
             z: Input vector (d,).
             conv_tol: Base convergence tolerance.
-            entropy_thresh: Base entropy threshold. Uniform weights over the
-                7 lattices give entropy ≈ ln(7) ≈ 1.95, so the old default
-                0.5 made multi-lattice responses always "abort" on entropy
-                gating; 2.0 effectively disables the gate (matches
-                LCM_ENTROPY_THRESHOLD in infer/lcm.h).
-            max_steps: Base max inference steps.
-            use_safety: Whether to use gvalue/danger checking.
+            entropy_thresh: Normalised fusion entropy threshold H/ln(n_active)
+                (R9 default 0.5). n_active=1 gives H_norm=0.
+            max_steps: Graceful scheduler budget (default 16). The C hard
+                limit (64) is the only step-count abort.
+            use_safety: Whether to run the gvalue check. The danger lattice
+                always runs; it cannot be disabled from the CLI.
+            alpha_val: R22 value-scalar strength forwarded to the lattices.
             agency_tension_mod: From agency.get_tension_modulator() [-0.5, 0.5].
                 High → relax conv_tol (confident, deeper reasoning).
                 Low  → tighten conv_tol (cautious, shorter reasoning).
@@ -1764,30 +1788,74 @@ class LCMInferEngine:
 
         z = self._normalise_codebook_scale(np.ascontiguousarray(z, dtype=np.float32))
         z_out = np.zeros(self.d, dtype=np.float32)
-        d = ctypes.c_int(self.d)
         gv_n = self.gv_n if use_safety else 0
-        dm = self.danger_M if use_safety else 0
-        ret = self.lib.lcm_infer_loop(
-            self._ptr(z), d,
-            self._ptr(self.hrq_C),    ctypes.c_int(self.hrq_M),
+        dm = self.danger_M  # danger is never skipped (R13)
+
+        lr_ranks_ptr = self.lr_ranks.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+        ret = self.lib.lcm_infer_loop_v3_flat(
+            self._ptr(z), ctypes.c_int(self.d),
+            # HRQ top + fine layers
+            self._ptr(self.hrq_top), ctypes.c_int(self.hrq_top.shape[0]),
+            self._ptr(self.hrq_fine), ctypes.c_int(self.hrq_fine.shape[1]),
+            ctypes.c_int(self.hrq_fine.shape[0]),
+            # Sparse
             self._ptr(self.sparse_C), ctypes.c_int(self.sparse_M),
-            self._ptr(self.lr_C),     ctypes.c_int(self.lr_M),
-            self._ptr(self.man_C),    ctypes.c_int(self.man_M),
-            self._ptr(self.man_T),    ctypes.c_int(self.man_t_dim),
-            self._ptr(self.bind_C),   ctypes.c_int(self.bind_M),
-            self._ptr(self.contrast_C), ctypes.c_int(self.contrast_M),
-            self._ptr(self.gv_pos),   ctypes.c_int(gv_n),
-            self._ptr(self.gv_neg),
-            self._ptr(self.danger_t), ctypes.c_int(dm),
-            self._ptr(self.danger_n),
+            self._ptr(self.sparse_zero),
+            # LowRank (U, shared V, ranks, layer count, M_lr, r_max)
+            self._ptr(self.lr_U), self._ptr(self.lr_V), lr_ranks_ptr,
+            ctypes.c_int(len(self.lr_ranks)), ctypes.c_int(self.lr_M),
+            ctypes.c_int(self.lr_V.shape[1]),
+            # Manifold
+            self._ptr(self.man_C), ctypes.c_int(self.man_M),
+            self._ptr(self.man_T), ctypes.c_int(self.man_t_dim),
+            # Binding
+            self._ptr(self.bind_key), self._ptr(self.bind_val),
+            self._ptr(self.bind_bind), ctypes.c_int(self.bind_M),
+            ctypes.c_int(self.bind_key.shape[0]),
+            self._ptr(self.bind_A_k), self._ptr(self.bind_A_v),
+            ctypes.c_int(self.bind_r_max),
+            # Contrast
+            self._ptr(self.contrast_a), self._ptr(self.contrast_b),
+            ctypes.c_int(self.contrast_M),
+            ctypes.c_int(self.contrast_a.shape[0]),
+            # Routing + canonical fusion
+            self._ptr(self.route_C), self._ptr(self.route_W),
             ctypes.c_int(self.n_lattices),
-            ctypes.c_float(modulated_tol), ctypes.c_float(entropy_thresh),
-            ctypes.c_int(modulated_max),
+            self._ptr(self.fusion_alpha),
+            self._ptr(self.fusion_ln_scale), self._ptr(self.fusion_ln_bias),
+            # Self lattice (core + modes) and alpha_self
+            self._ptr(self.self_C), ctypes.c_int(self.self_M),
+            ctypes.c_float(float(self.self_bias)),
+            # R22 value scalars
+            self._ptr(self.hrq_value_top),
+            self._ptr(self.hrq_value_fine),
+            self._ptr(self.sparse_value),
+            self._ptr(self.lr_value),
+            self._ptr(self.man_value),
+            self._ptr(self.bind_value_key),
+            self._ptr(self.bind_value_val),
+            self._ptr(self.bind_value_bind),
+            self._ptr(self.contrast_value_a),
+            self._ptr(self.contrast_value_b),
+            # Safety: gvalue optionally skipped; danger always on.
+            self._ptr(self.gv_pos), ctypes.c_int(gv_n),
+            self._ptr(self.gv_neg),
+            self._ptr(self.danger_t), self._ptr(self.danger_n),
+            ctypes.c_int(dm),
+            # Scheduler / fusion / trace
+            ctypes.c_int(modulated_max), ctypes.c_float(modulated_tol),
+            ctypes.c_float(entropy_thresh), ctypes.c_float(0.5),
+            ctypes.c_float(alpha_val), None,
             self._ptr(z_out),
         )
+        self._last_loop_ret = ret
         converged = (ret == 0)
-        if not converged:
-            print(f"[INFER] NOTE: cognitive loop aborted (ret={ret})", file=sys.stderr)
+        if ret == CONFLICT_ABORT_TOKEN:
+            print("[SAFETY] CONFLICT_ABORT_TOKEN: generation halted; "
+                  "see infer/alerts.log and infer/traces/", file=sys.stderr)
+        elif not converged:
+            print(f"[INFER] NOTE: cognitive loop returned {ret}",
+                  file=sys.stderr)
         return z_out, converged
 
     LATTICE_NAMES = ['HRQ', 'Sparse', 'LowRank', 'Manifold', 'Binding', 'Contrast', 'Self']
@@ -1980,6 +2048,12 @@ class LCMInferEngine:
                     z, use_safety=use_safety,
                     agency_tension_mod=self._last_agency_mod['tension'],
                     agency_explore_mod=self._last_agency_mod['explore'])
+                if getattr(self, '_last_loop_ret', 0) == CONFLICT_ABORT_TOKEN:
+                    # R13: safety abort produces no token at all. The C
+                    # engine already wrote infer/alerts.log and the trace.
+                    print("[SAFETY] generation terminated by CONFLICT_ABORT_TOKEN",
+                          file=sys.stderr)
+                    return
                 if show_trace:
                     tqdm.write(f"\n[TOKEN {gen_step}] loop converged={converged}:")
                     self.print_trace()
@@ -2240,7 +2314,8 @@ def main():
     p.add_argument("--active-max-burst", type=int, default=0,
                    help="Max consecutive active outputs before a silent tick (0=off)")
     p.add_argument("--no-safety", action="store_true",
-                   help="Disable danger/gvalue safety checks in generation (default: on)")
+                   help="Skip the gvalue (Three Laws) check; the danger "
+                        "lattice always runs and cannot be disabled")
 
     # ── cognitive training ──
     p.add_argument("-C", "--cog-train", action="store_true", help="Cognitive training")

@@ -131,6 +131,11 @@ int lcm_bind_memory_v3(lcm_memory_v3* mem, int D, int n_lattices,
     mem->tau_route_fallback = 0.1f;
     mem->tau_self = 1.0f;
     mem->lambda_lfq = 1.5f;
+    /* R8: with θ=1 a first step activates the below-average portion of the
+     * candidate set; callers may raise θ to keep more lattices on. */
+    for (int i = 0; i < LCM_MAX_LATTICES; i++)
+        mem->trigger_theta[i] = 1.0f;
+    mem->mean_recent_d_min = 0.0f;
     return 0;
 }
 
@@ -281,39 +286,11 @@ int lcm_fuse_only(const float* outputs, int n_lattices, int d,
     if (n_lattices <= 0 || n_lattices > LCM_MAX_LATTICES) return -1;
     if (n_alpha < n_lattices) return -1;
 
-    float w[LCM_MAX_LATTICES];
-    float w_sum = 0.0f;
-    for (int i = 0; i < n_lattices; i++) {
-        w[i] = soft_mask[i] * alpha[i];
-        w_sum += w[i];
-    }
-    if (w_sum == 0.0f) return -1;
-
-    for (int j = 0; j < d; j++) {
-        float acc = 0.0f;
-        for (int i = 0; i < n_lattices; i++) {
-            acc += (w[i] / w_sum) * outputs[i * d + j];
-        }
-        z_out[j] = acc;
-    }
-
-    float mean = 0.0f;
-    for (int j = 0; j < d; j++) mean += z_out[j];
-    mean /= (float)d;
-
-    float var = 0.0f;
-    for (int j = 0; j < d; j++) {
-        float t = z_out[j] - mean;
-        var += t * t;
-    }
-    var /= (float)d;
-
-    float inv_std = 1.0f / sqrtf(var + 1e-6f);
-    for (int j = 0; j < d; j++) {
-        z_out[j] = (z_out[j] - mean) * inv_std * ln_scale[j] + ln_bias[j];
-    }
-
-    return 0;
+    /* Shared canonical implementation (loops_v3.c). lcm_fuse_only is the
+     * six-output diagnostic entry; active == NULL and no self term keeps its
+     * historical behaviour exactly. */
+    return lcm_fuse_canonical(outputs, n_lattices, d, soft_mask, NULL,
+                              alpha, ln_scale, ln_bias, NULL, 0.0f, z_out);
 }
 
 /* ─── Full inference loop (multi-step with convergence, gvalue, danger) ─── */
@@ -447,4 +424,160 @@ int lcm_get_trace(float* trace_buf, int buf_capacity_floats) {
  */
 int lcm_dim(void) {
     return LCM_D;
+}
+
+/* ─── v3 flat bridge (task 10) ───────────────────────────────────────────────
+ *
+ * Python's c_load.py already owns every flat array; this wrapper binds the
+ * seven typed descriptors and runs the v3 loop. It deliberately avoids
+ * requiring ctypes to mirror lcm_memory_v3's layout.
+ */
+int lcm_infer_loop_v3_flat(
+    const float* z, int d,
+    const float* hrq_top_C, int hrq_M_top,
+    const float* hrq_fine_C, int hrq_M_fine, int hrq_n_fine,
+    const float* sparse_C, int sparse_M, const float* sparse_zero,
+    const float* lr_U, const float* lr_V, const int* lr_ranks,
+    int lr_n_layers, int lr_M, int lr_r_max,
+    const float* man_C, int man_M, const float* man_T, int man_t_dim,
+    const float* bind_key, const float* bind_val, const float* bind_bind,
+    int bind_M, int bind_n_layers,
+    const float* bind_A_k, const float* bind_A_v, int bind_r_max,
+    const float* contrast_a, const float* contrast_b,
+    int contrast_M, int contrast_n_layers,
+    const float* route_C, const float* route_W, int n_lattices,
+    const float* alpha, const float* ln_scale, const float* ln_bias,
+    const float* self_C, int self_M, float alpha_self,
+    const float* hrq_value_top, const float* hrq_value_fine,
+    const float* sparse_value, const float* lr_value,
+    const float* man_value,
+    const float* bind_value_key, const float* bind_value_val,
+    const float* bind_value_bind,
+    const float* contrast_value_a, const float* contrast_value_b,
+    const float* gv_pos, int gv_n, const float* gv_neg,
+    const float* danger_t, const float* danger_n, int danger_M,
+    int max_steps, float conv_tol, float entropy_thresh,
+    float safety_margin, float alpha_val, const char* trace_path,
+    float* z_out) {
+    if (!z || !z_out || d != LCM_D) return -1;
+
+    hrq_mem_t hrq;
+    sparse_mem_t sparse;
+    lowrank_mem_t lowrank;
+    manifold_mem_t manifold;
+    binding_mem_t binding;
+    contrast_mem_t contrast;
+    fusion_mem_t fusion;
+    memset(&hrq, 0, sizeof(hrq));
+    memset(&sparse, 0, sizeof(sparse));
+    memset(&lowrank, 0, sizeof(lowrank));
+    memset(&manifold, 0, sizeof(manifold));
+    memset(&binding, 0, sizeof(binding));
+    memset(&contrast, 0, sizeof(contrast));
+    memset(&fusion, 0, sizeof(fusion));
+
+    hrq.C_top = hrq_top_C;
+    hrq.M_top = hrq_M_top;
+    hrq.C_fine = hrq_fine_C;
+    hrq.M_fine = hrq_M_fine;
+    hrq.n_fine = hrq_n_fine;
+    hrq.value_top = hrq_value_top;
+    hrq.value_fine = hrq_value_fine;
+
+    sparse.C = sparse_C;
+    sparse.M = sparse_M;
+    sparse.zero_vec = sparse_zero;
+    sparse.value = sparse_value;
+
+    lowrank.U = lr_U;
+    lowrank.V = lr_V;
+    lowrank.ranks = lr_ranks;
+    lowrank.n_layers = lr_n_layers;
+    lowrank.M_lr = lr_M;
+    lowrank.r_max = lr_r_max;
+    lowrank.value = lr_value;
+
+    manifold.C = man_C;
+    manifold.M = man_M;
+    manifold.T = man_T;
+    manifold.t_dim = man_t_dim;
+    manifold.value = man_value;
+
+    binding.key_cb = bind_key;
+    binding.val_cb = bind_val;
+    binding.bind_cb = bind_bind;
+    binding.M = bind_M;
+    binding.n_layers = bind_n_layers;
+    binding.r_max = bind_r_max;
+    binding.A_k = bind_A_k;
+    binding.A_v = bind_A_v;
+    binding.value_key = bind_value_key;
+    binding.value_val = bind_value_val;
+    binding.value_bind = bind_value_bind;
+
+    contrast.C_a = contrast_a;
+    contrast.C_b = contrast_b;
+    contrast.M = contrast_M;
+    contrast.n_layers = contrast_n_layers;
+    contrast.value_a = contrast_value_a;
+    contrast.value_b = contrast_value_b;
+
+    fusion.route_C = route_C;
+    fusion.route_W = route_W;
+    fusion.n_lattices = n_lattices;
+    fusion.alpha = alpha;
+    fusion.ln_scale = ln_scale;
+    fusion.ln_bias = ln_bias;
+    fusion.self_C = self_C;
+    fusion.M_self = self_M;
+    fusion.alpha_self = alpha_self;
+
+    lcm_memory_v3 mem;
+    if (lcm_bind_memory_v3(&mem, d, n_lattices, &hrq, &sparse, &lowrank,
+                           &manifold, &binding, &contrast, &fusion) != 0)
+        return -1;
+
+    gvalue_t gv_local;
+    memset(&gv_local, 0, sizeof(gv_local));
+    const gvalue_t* gvp = NULL;
+    if (gv_pos && gv_neg && gv_n > 0) {
+        float pos_pad[LCM_N_VALUE_PAIRS * LCM_D];
+        float neg_pad[LCM_N_VALUE_PAIRS * LCM_D];
+        memset(pos_pad, 0, sizeof(pos_pad));
+        memset(neg_pad, 0, sizeof(neg_pad));
+        int n_copy = gv_n < LCM_N_VALUE_PAIRS ? gv_n : LCM_N_VALUE_PAIRS;
+        memcpy(pos_pad, gv_pos, (size_t)n_copy * (size_t)d * sizeof(float));
+        memcpy(neg_pad, gv_neg, (size_t)n_copy * (size_t)d * sizeof(float));
+        gvalue_init(&gv_local, pos_pad, neg_pad, d);
+        gvp = &gv_local;
+    }
+
+    danger_lattice_t dl_local;
+    memset(&dl_local, 0, sizeof(dl_local));
+    const danger_lattice_t* dlp = NULL;
+    if (danger_t && danger_n && danger_M > 0) {
+        danger_init(&dl_local, danger_t, danger_n, danger_M, d);
+        dlp = &dl_local;
+    }
+
+    int ret = lcm_infer_loop_v3(&mem, gvp, dlp, z, z_out, max_steps,
+                                conv_tol, entropy_thresh, safety_margin,
+                                alpha_val, trace_path);
+
+    /* Keep the v1 trace export populated for lcm.py's get_trace(). */
+    inference_trace_v3_t vt;
+    int n = lcm_get_trace_v3(&vt);
+    _last_trace.n_steps = 0;
+    for (int s = 0; s < n && s < LCM_TRACE_BUF_STEPS; s++) {
+        const step_trace_v3_t* st = &vt.steps[s];
+        for (int i = 0; i < LCM_MAX_LATTICES; i++) {
+            _last_trace.fusion_weights[s][i] = st->weights[i];
+            _last_trace.confidences[s][i] = st->confidences[i];
+        }
+        memcpy(_last_trace.z_next[s], st->z_next, sizeof(vec_t));
+        _last_trace.step[s] = st->step;
+        _last_trace.has_conflict[s] = st->has_conflict ? 1 : 0;
+        _last_trace.n_steps++;
+    }
+    return ret;
 }

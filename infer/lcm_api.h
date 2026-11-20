@@ -141,6 +141,50 @@ int lcm_infer_loop(const float* z, int d,
  */
 int lcm_get_trace(float* trace_buf, int buf_capacity_floats);
 
+/* ─── v3 macro loop, flat ctypes bridge (task 10) ──────────────────────────
+ *
+ * Python cannot cheaply build `lcm_memory_v3` (seven nested descriptors with
+ * ~40 borrowed pointers). This wrapper takes the exact flat arrays
+ * train/c_load.py already produces, binds a v3 memory internally, builds the
+ * gvalue/danger structs, and calls lcm_infer_loop_v3.
+ *
+ * All arrays are caller-owned; no JSON and no allocation. Optional value
+ * scalar pointers may be NULL. `lr_ranks` is int32. n_lattices is the routed
+ * lattice count (self is the separate 7th fusion term). `self_M` excludes the
+ * frozen core row, exactly like fusion_mem_t. `trace_path` may be NULL.
+ *
+ * Returns 0 (converged or graceful budget), -1 (argument error), or
+ * CONFLICT_ABORT_TOKEN (-2, safety abort; z_out must not be used).
+ */
+int lcm_infer_loop_v3_flat(
+    const float* z, int d,
+    const float* hrq_top_C, int hrq_M_top,
+    const float* hrq_fine_C, int hrq_M_fine, int hrq_n_fine,
+    const float* sparse_C, int sparse_M, const float* sparse_zero,
+    const float* lr_U, const float* lr_V, const int* lr_ranks,
+    int lr_n_layers, int lr_M, int lr_r_max,
+    const float* man_C, int man_M, const float* man_T, int man_t_dim,
+    const float* bind_key, const float* bind_val, const float* bind_bind,
+    int bind_M, int bind_n_layers,
+    const float* bind_A_k, const float* bind_A_v, int bind_r_max,
+    const float* contrast_a, const float* contrast_b,
+    int contrast_M, int contrast_n_layers,
+    const float* route_C, const float* route_W, int n_lattices,
+    const float* alpha, const float* ln_scale, const float* ln_bias,
+    const float* self_C, int self_M, float alpha_self,
+    const float* hrq_value_top, const float* hrq_value_fine,
+    const float* sparse_value, const float* lr_value,
+    const float* man_value,
+    const float* bind_value_key, const float* bind_value_val,
+    const float* bind_value_bind,
+    const float* contrast_value_a, const float* contrast_value_b,
+    const float* gv_pos, int gv_n, const float* gv_neg,
+    const float* danger_t, const float* danger_n, int danger_M,
+    int max_steps, float conv_tol, float entropy_thresh,
+    float safety_margin, float alpha_val, const char* trace_path,
+    float* z_out);
+
+
 #ifdef __cplusplus
 }
 #endif

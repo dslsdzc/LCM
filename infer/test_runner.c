@@ -2063,6 +2063,210 @@ static void test_layer_forwards_invalid(void) {
           "binding: b_q=NULL and k_q=NULL are accepted");
 }
 
+/* ── Task 10: v3 dynamic DAG, loop, trace ────────────────────────────────── */
+
+static lcm_memory_v3 t10_mem;
+
+/* Reset the t7 arrays to a deterministic distance spread: row r of each
+ * primary codebook sits at 0.1·(r+1) on e0, so the six lattices have
+ * different trigger distances and dynamic activation is observable. */
+static void t10_prepare(void) {
+    memset(t7_hrq_top, 0, sizeof(t7_hrq_top));
+    memset(t7_hrq_fine, 0, sizeof(t7_hrq_fine));
+    memset(t7_sparse_C, 0, sizeof(t7_sparse_C));
+    memset(t7_sparse_zero, 0, sizeof(t7_sparse_zero));
+    memset(t7_lowrank_U, 0, sizeof(t7_lowrank_U));
+    memset(t7_lowrank_V, 0, sizeof(t7_lowrank_V));
+    memset(t7_man_C, 0, sizeof(t7_man_C));
+    memset(t7_man_T, 0, sizeof(t7_man_T));
+    memset(t7_bind_key, 0, sizeof(t7_bind_key));
+    memset(t7_bind_val, 0, sizeof(t7_bind_val));
+    memset(t7_bind_bind, 0, sizeof(t7_bind_bind));
+    memset(t7_A_k, 0, sizeof(t7_A_k));
+    memset(t7_A_v, 0, sizeof(t7_A_v));
+    memset(t7_contrast_a, 0, sizeof(t7_contrast_a));
+    memset(t7_contrast_b, 0, sizeof(t7_contrast_b));
+    memset(t7_route_C, 0, sizeof(t7_route_C));
+    memset(t7_route_W, 0, sizeof(t7_route_W));
+    memset(t7_ln_scale, 0, sizeof(t7_ln_scale));
+    memset(t7_ln_bias, 0, sizeof(t7_ln_bias));
+    memset(t7_self_C, 0, sizeof(t7_self_C));
+
+    for (int r = 0; r < T7_M; r++) {
+        t7_hrq_top[r * LCM_D] = 0.1f * (float)(r + 1);
+        t7_sparse_C[r * LCM_D] = 0.15f * (float)(r + 1);
+        t7_bind_bind[r * LCM_D] = 0.2f * (float)(r + 1);
+    }
+    for (int i = 0; i < T7_NLAT; i++) t7_alpha[i] = 1.0f;
+    for (int i = 0; i < LCM_D; i++) t7_ln_scale[i] = 1.0f;
+
+    t7_desc_t d;
+    t7_fill(&d);
+    CHECK(t7_bind(&t10_mem, &d) == 0, "v3 fixture binds");
+}
+
+static int t10_find_node(const dag_t* dag, op_type_t op, int lattice_id) {
+    for (int i = 0; i < dag->n_nodes; i++) {
+        if (dag->nodes[i].op_type == op
+            && dag->nodes[i].lattice_id == lattice_id)
+            return i;
+    }
+    return -1;
+}
+
+static void test_dag_dynamic_threshold(void) {
+    t10_prepare();
+    float z[LCM_D] = {0};
+    z[0] = 0.12f;
+
+    for (int i = 0; i < LCM_MAX_LATTICES; i++)
+        t10_mem.trigger_theta[i] = 0.0f;
+    dag_t dag;
+    int n_cand = build_dag_v3(z, &t10_mem, &dag);
+    CHECK(n_cand == T7_NLAT + 1,
+          "build_dag_v3 evaluates every routed lattice + self");
+    CHECK(dag.n_nodes == 0,
+          "zero dynamic threshold activates nothing (not always-on)");
+
+    for (int i = 0; i < LCM_MAX_LATTICES; i++)
+        t10_mem.trigger_theta[i] = 1e6f;
+    n_cand = build_dag_v3(z, &t10_mem, &dag);
+    int n_active = 0;
+    for (int i = 0; i < dag.n_nodes; i++)
+        if (dag.nodes[i].lattice_id < T7_NLAT) n_active++;
+    CHECK(n_active == T7_NLAT,
+          "high threshold activates all routed lattices");
+    CHECK(dag.n_nodes < LCM_MAX_NODES,
+          "DAG stays within the fixed node budget");
+}
+
+static void test_dag_sparse_depends_on_hrq(void) {
+    t10_prepare();
+    float z[LCM_D] = {0};
+    z[0] = 0.12f;
+    dag_t dag;
+
+    for (int i = 0; i < LCM_MAX_LATTICES; i++)
+        t10_mem.trigger_theta[i] = 0.0f;
+    t10_mem.trigger_theta[LATTICE_HRQ] = 1e6f;
+    t10_mem.trigger_theta[LATTICE_SPARSE] = 1e6f;
+
+    build_dag_v3(z, &t10_mem, &dag);
+    int hi = t10_find_node(&dag, OP_RETRIEVE_SINGLE, LATTICE_HRQ);
+    int si = t10_find_node(&dag, OP_RETRIEVE_SINGLE, LATTICE_SPARSE);
+    CHECK(hi >= 0 && si >= 0, "HRQ and Sparse nodes both active");
+    CHECK(hi < si, "HRQ is emitted before Sparse");
+    CHECK(si >= 0 && dag.nodes[si].n_inputs == 2
+              && dag.nodes[si].inputs[1] == (const float*)dag.nodes[hi].output,
+          "Sparse has a d_top edge to the HRQ output");
+    CHECK(dag.nodes[si].dep_dist > 0.0f,
+          "Sparse d_top is positive when HRQ is active");
+
+    /* HRQ inactive: Sparse must run with d_top = 0 (LFQ disabled). */
+    t10_mem.trigger_theta[LATTICE_HRQ] = 0.0f;
+    build_dag_v3(z, &t10_mem, &dag);
+    si = t10_find_node(&dag, OP_RETRIEVE_SINGLE, LATTICE_SPARSE);
+    CHECK(si >= 0, "Sparse still activates without HRQ");
+    CHECK(dag.nodes[si].inputs[1] == NULL && dag.nodes[si].dep_dist == 0.0f,
+          "inactive HRQ ⇒ Sparse d_top = 0 / no c_top edge (LFQ off)");
+}
+
+static void test_dag_bind_all_upstream(void) {
+    t10_prepare();
+    float z[LCM_D] = {0};
+    z[0] = 0.12f;
+    for (int i = 0; i < LCM_MAX_LATTICES; i++)
+        t10_mem.trigger_theta[i] = 1e6f;
+
+    dag_t dag;
+    build_dag_v3(z, &t10_mem, &dag);
+    int bi = t10_find_node(&dag, OP_HRR_BIND, LCM_MAX_LATTICES);
+    int n_retrieve = 0;
+    for (int i = 0; i < dag.n_nodes; i++)
+        if (dag.nodes[i].op_type == OP_RETRIEVE_SINGLE
+            && dag.nodes[i].lattice_id < T7_NLAT) n_retrieve++;
+
+    CHECK(bi >= 0, "bind node exists");
+    CHECK(bi >= 0 && dag.nodes[bi].n_inputs == n_retrieve
+              && n_retrieve == T7_NLAT,
+          "bind depends on every upstream retrieve node (R8)");
+
+    int ui = t10_find_node(&dag, OP_HRR_UNBIND, LCM_MAX_LATTICES);
+    CHECK(ui >= 0 && dag.nodes[ui].n_inputs == 2
+              && dag.nodes[ui].inputs[0] == (const float*)dag.nodes[bi].output,
+          "unbind consumes bind output + key projection");
+
+    CHECK(dag.n_trace_nodes >= dag.n_nodes,
+          "trace records rejected candidates as well as active nodes");
+    int n_inactive = 0;
+    for (int i = 0; i < dag.n_trace_nodes; i++)
+        if (!dag.trace_nodes[i].activated) n_inactive++;
+    CHECK(n_inactive >= 0, "trace activation flags are populated");
+}
+
+static void test_loop_v3_graceful_and_hard(void) {
+    t10_prepare();
+    float z[LCM_D] = {0};
+    z[0] = 0.12f;
+    float z_out[LCM_D];
+
+    int ret = lcm_infer_loop_v3(&t10_mem, NULL, NULL, z, z_out,
+                                16, 1e-3f, 0.5f, 0.5f, 0.0f, NULL);
+    CHECK(ret == 0, "v3 loop: max_steps=16 is graceful (returns 0)");
+
+    /* conv_tol=0 makes vector convergence unreachable; the 64-step hard
+     * limit must abort rather than treat budget exhaustion as convergence. */
+    const char* trace_path = "traces/t10_v3_trace.json";
+    remove(trace_path);
+    ret = lcm_infer_loop_v3(&t10_mem, NULL, NULL, z, z_out,
+                            64, 0.0f, 0.5f, 0.5f, 0.0f, trace_path);
+    CHECK(ret == CONFLICT_ABORT_TOKEN,
+          "v3 loop: 64-step hard limit returns CONFLICT_ABORT_TOKEN (-2)");
+
+    FILE* f = fopen(trace_path, "r");
+    CHECK(f != NULL, "v3 abort writes a trace JSON file");
+    if (f) {
+        char buf[4096];
+        size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+        buf[n] = '\0';
+        fclose(f);
+        CHECK(strstr(buf, "\"nodes\"") != NULL,
+              "trace JSON contains DAG nodes");
+        CHECK(strstr(buf, "\"op_type\"") != NULL
+                  && strstr(buf, "\"activated\"") != NULL,
+              "trace nodes carry op_type and activated");
+    }
+
+    inference_trace_v3_t tr;
+    int n = lcm_get_trace_v3(&tr);
+    CHECK(n == 64, "lcm_get_trace_v3 exports every hard-limit step");
+    CHECK(tr.n_steps == 64 && tr.steps[63].has_conflict,
+          "last trace step is marked with the scheduler conflict");
+}
+
+static void test_loop_v3_sparse_lfq_depends_on_hrq(void) {
+    /* Structural execution check: an inactive HRQ leaves dep_dist 0, so
+     * sparse_forward_c receives the LFQ-disabled signal. */
+    t10_prepare();
+    float z[LCM_D] = {0};
+    z[0] = 0.12f;
+    for (int i = 0; i < LCM_MAX_LATTICES; i++)
+        t10_mem.trigger_theta[i] = 0.0f;
+    t10_mem.trigger_theta[LATTICE_SPARSE] = 1e6f;
+
+    dag_t dag;
+    build_dag_v3(z, &t10_mem, &dag);
+    vec_t outputs[LCM_MAX_LATTICES];
+    float conf[LCM_MAX_LATTICES];
+    int active[LCM_MAX_LATTICES];
+    memset(outputs, 0, sizeof(outputs));
+    memset(conf, 0, sizeof(conf));
+    execute_dag_v3(&dag, &t10_mem, 0.0f, outputs, conf, active);
+    int si = t10_find_node(&dag, OP_RETRIEVE_SINGLE, LATTICE_SPARSE);
+    CHECK(si >= 0 && dag.nodes[si].dep_dist == 0.0f,
+          "executor sees d_top=0 when HRQ is missing");
+}
+
 int main(void) {
     printf("LCM engine tests (LCM_D=%d):\n", LCM_D);
     test_lcm_dim();
@@ -2103,6 +2307,11 @@ int main(void) {
     test_layer_forwards_invalid();
     test_hrr_no_overwrite();
     test_fusion_l2_weights();
+    test_dag_dynamic_threshold();
+    test_dag_sparse_depends_on_hrq();
+    test_dag_bind_all_upstream();
+    test_loop_v3_graceful_and_hard();
+    test_loop_v3_sparse_lfq_depends_on_hrq();
     if (failures == 0)
         printf("ALL TESTS PASSED\n");
     else

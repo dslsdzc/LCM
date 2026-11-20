@@ -70,9 +70,12 @@ extern "C" {
 
 /* Derived constants */
 #define LCM_CONSISTENCY_THRESHOLD 0.3f
-#define LCM_ENTROPY_THRESHOLD     2.0f  /* Max entropy for 7 lattices = ln(7) ≈ 1.95; 2.0 effectively disables entropy gating */
+#define LCM_ENTROPY_THRESHOLD     0.5f  /* R9: normalised H(w)/ln(n_active) */
 #define LCM_CONVERGENCE_TOL       1e-3f
 #define LCM_DEFAULT_SAFETY_MARGIN 0.5f
+#define LCM_MAX_INFERENCE_STEPS      16  /* R9: scheduler budget (graceful) */
+#define LCM_MAX_INFERENCE_STEPS_HARD 64  /* R9: safety hard limit (abort) */
+#define CONFLICT_ABORT_TOKEN        (-2) /* R13: distinct from -1 (error) */
 
 /* Checkpoint/export schema v2 (R10). Every header-bearing .bin file starts
  * with a 32-byte header: int32 M, d, n_layers, type; float c; uint32
@@ -262,6 +265,13 @@ typedef struct {
     float tau_route_fallback;   /* HRQ relative-gap threshold (0.1) */
     float tau_self;             /* self familiarity temperature (1.0) */
     float lambda_lfq;           /* sparse LFQ multiplier (1.5) */
+    /* R8 dynamic trigger state. The scheduler owns these fields; build_dag_v3
+     * updates mean_recent_d_min with an EMA of the current per-step mean
+     * trigger distance and uses theta[li] * scale as the node threshold.
+     * lcm_infer_loop_v3 keeps a private shallow copy, so a caller's memory
+     * descriptor is not mutated across sessions. */
+    float trigger_theta[LCM_MAX_LATTICES]; /* θ_li (default 1.0) */
+    float mean_recent_d_min;               /* EMA scale, 0 = unset */
 } lcm_memory_v3;
 
 /* ─── Global Value Lattice ───────────────────────────────────────────────── */
@@ -303,16 +313,31 @@ typedef struct op_node_s {
     op_type_t          op_type;
     int                lattice_id;
     int                n_inputs;
-    const float*       inputs[4];       /* Max 4 input pointers (decayed) */
+    /* Max inputs: one edge per routed lattice (bind consumes all upstream
+     * retrieves), plus one slot for z. The v1 layout used 4, which made the
+     * R8 "bind depends on every retrieve node" contract impossible. */
+    const float*       inputs[LCM_MAX_LATTICES + 1];
     vec_t*             output;          /* Pointer to output vector */
     float              dist;            /* Trigger distance */
+    float              dep_dist;        /* Sparse d_top edge (0 = HRQ inactive) */
     void (*execute)(struct op_node_s*); /* Execution function pointer */
 } op_node_t;
+
+/* One trace record: every candidate lattice is recorded, including those
+ * rejected by the dynamic threshold (activated = 0). */
+typedef struct {
+    int   op_type;
+    int   lattice_id;
+    float dist;
+    int   activated;
+} dag_trace_node_t;
 
 typedef struct dag_s {
     op_node_t nodes[LCM_MAX_NODES];
     vec_t     storage[LCM_MAX_NODES];   /* Output storage for all nodes — must outlive execute_dag */
     int       n_nodes;
+    dag_trace_node_t trace_nodes[LCM_MAX_NODES];
+    int       n_trace_nodes;
 } dag_t;
 
 /* ─── Trace structures (c.md §4.1/§5.2) ──────────────────────────────────── */
@@ -336,6 +361,32 @@ typedef struct {
     int          n_steps;
     char         session_id[64];
 } inference_trace_t;
+
+/* ─── v3 trace (task 10): per-step DAG topology + fusion state ─────────────
+ *
+ * `nodes` is the DAG for one macro step and includes candidates rejected by
+ * the dynamic threshold, with activated == 0. Weights are the normalised
+ * canonical-fusion weights over the routed lattices; confidences are the
+ * engine's retrieval confidences (0 for absent lattices). z_next is the fused
+ * state, and conflict is the structured safety record when has_conflict.
+ */
+typedef struct {
+    dag_trace_node_t nodes[LCM_MAX_NODES];
+    int              n_nodes;
+    float            weights[LCM_MAX_LATTICES];
+    float            confidences[LCM_MAX_LATTICES];
+    vec_t            z_next;
+    int              step;
+    bool             has_conflict;
+    conflict_t       conflict;
+    double           timestamp;
+} step_trace_v3_t;
+
+typedef struct {
+    step_trace_v3_t steps[LCM_MAX_TRACE_STEPS];
+    int             n_steps;
+    char            session_id[64];
+} inference_trace_v3_t;
 
 /* ─── Main inference state ────────────────────────────────────────────────── */
 
@@ -394,6 +445,76 @@ void halt_and_alert(const conflict_t* conflict, void (*alert_cb)(const alert_t*)
 /* DAG construction and execution */
 dag_t build_dag(const float* z, memory_t* mem, bool value_bias);
 bool  execute_dag(dag_t* dag, const memory_t* mem, vec_t* outputs, float* confidences);
+
+/* ─── v3 dynamic DAG (R8, task 10) ──────────────────────────────────────────
+ *
+ * Builds the step graph from the full v3 memory. Candidate trigger distances
+ * are collected first (never appending while iterating), and a node is added
+ * only when d_min < theta_li * mean_recent_d_min. The scale is an EMA stored
+ * in mem->mean_recent_d_min (the caller may pass a private copy; the macro
+ * loop does). HRQ is emitted before Sparse so Sparse can depend on its output;
+ * Sparse receives dep_dist = HRQ distance (0 when HRQ is inactive, disabling
+ * LFQ). Bind consumes every routed retrieve node; unbind consumes bind + the
+ * first retrieve as key. OP_DISTANCE_FUSION is never a node.
+ *
+ * Returns the number of candidate nodes (>=0), or -1 on invalid arguments.
+ * `dag` is zeroed first.
+ */
+int build_dag_v3(const float* z, lcm_memory_v3* mem, dag_t* dag);
+
+/* Execute a v3 DAG, dispatching each lattice to its full v3 forward
+ * (hrq_forward_v31 / sparse_forward_c / lowrank_forward_c /
+ * manifold_forward_c / binding_forward_c / contrast_forward_c). `active` may
+ * be NULL; otherwise it receives one flag per routed lattice plus self.
+ * Returns true on success, false on invalid arguments.
+ */
+bool execute_dag_v3(dag_t* dag, const lcm_memory_v3* mem, float alpha_val,
+                    vec_t* outputs, float* confidences, int* active);
+
+/* Canonical fusion (R9/R15), shared with lcm_fuse_only:
+ *   z = layer_norm(Σ_{active} w_i/Σw · o_i + self_bias · o_self)
+ * with w_i = soft_mask_i * alpha_i. `outputs` is a flat [n * d] array.
+ * active == NULL means every index participates (the lcm_fuse_only case).
+ * Returns 0 on success, -1 on invalid arguments or a zero weight sum.
+ */
+int lcm_fuse_canonical(const float* outputs, int n_lattices, int d,
+                       const float* soft_mask, const int* active,
+                       const float* alpha, const float* ln_scale,
+                       const float* ln_bias, const float* self_out,
+                       float self_bias, float* z_out);
+
+/* ─── v3 macro loop (R9, task 10) ───────────────────────────────────────────
+ *
+ * One step: build_dag_v3 → execute_dag_v3 → canonical fusion → conflict
+ * detection → trace → convergence. Convergence requires
+ * ||z_next-z_cur|| < conv_tol AND H(w)/ln(n_active) < entropy_thresh
+ * (n_active <= 1 ⇒ H_norm = 0).
+ *
+ * max_steps is the graceful budget (default 16): when it is exhausted without
+ * convergence the loop returns 0 with the current z. The safety hard limit
+ * LCM_MAX_INFERENCE_STEPS_HARD (64) aborts with CONFLICT_ABORT_TOKEN (-2) and
+ * an alert/trace. Any conflict also returns -2; the caller must not use
+ * z_out. Ordinary argument errors return -1.
+ *
+ * The caller's mem is not mutated: a shallow private copy carries the dynamic
+ * trigger state for this session. `trace_path` may be NULL; conflicts then
+ * write to infer/traces/. Returns 0, -1, or -2.
+ */
+int lcm_infer_loop_v3(const lcm_memory_v3* mem, const gvalue_t* gv,
+                      const danger_lattice_t* dl, const float* z_initial,
+                      float* z_out, int max_steps, float conv_tol,
+                      float entropy_thresh, float safety_margin,
+                      float alpha_val, const char* trace_path);
+
+/* Copy the last v3 trace into `out`; returns the number of steps (0 when no
+ * loop has run). Thread-local, like lcm_get_trace. */
+int lcm_get_trace_v3(inference_trace_v3_t* out);
+
+/* Write a v3 trace as JSON. Creates parent directories; returns 0 on
+ * success, -1 on failure. */
+int save_trace_v3_to_file(const inference_trace_v3_t* trace,
+                          const char* filepath);
+
 
 /* Fusion (with optional gvalue value-biased weighting) */
 void distance_weighted_fusion(const vec_t* outputs, const float* confidences,
