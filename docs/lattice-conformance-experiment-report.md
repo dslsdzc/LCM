@@ -1,7 +1,7 @@
 # 晶格规范一致性实验报告（≤100 步 smoke）
 
 日期：2026-11-21
-运行 HEAD：`c32eea91edba333426338f426f499128b165d768`（Task 15 修复前的运行 HEAD；修复与报告在同一后续提交中）
+smoke 运行 HEAD：`c32eea9`；最终代码提交：`8379d45`（文档在后续提交）
 基线：`docs/superpowers/specs/2026-11-20-lattice-spec-conformance-design.md` R1–R22
 偏差复审：`docs/lattice-spec-vs-impl-audit-v3.1.md`
 
@@ -17,7 +17,7 @@
 | Python | 3.14.10 |
 | JAX | 0.10.0 |
 | 设备 | CPU（`JAX_PLATFORMS=cpu`；GTX 1650 4GB 不参与） |
-| 运行 HEAD | `c32eea91edba333426338f426f499128b165d768` |
+| smoke 运行 HEAD | `c32eea9`（最终代码提交 `8379d45`） |
 | 总耗时 | 142.7s |
 | C 参考 | `make -C infer clean && make -C infer test`（234 PASS） |
 
@@ -338,7 +338,8 @@ Optimizer moments are deliberately not part of the v2 checkpoint (R10: params/EM
 ```bash
 JAX_PLATFORMS=cpu /home/DslsDZC/LCM/be/bin/python -m pytest \
   train/test_smoke_conformance.py train/test_parity_lattices.py \
-  train/test_c_load.py -q
+  train/test_c_load.py train/test_vq_losses.py \
+  train/test_binding_unbind.py train/test_sparse_lfq.py -q
 make -C infer clean && make -C infer test
 
 JAX_PLATFORMS=cpu /home/DslsDZC/LCM/be/bin/python scripts/build_conformance_corpus.py

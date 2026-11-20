@@ -144,8 +144,10 @@ python train/smoke_conformance.py --steps 100 --batch 1 --seq 64 \
 
 结果：
 
-- `JAX_PLATFORMS=cpu /home/DslsDZC/LCM/be/bin/python -m pytest train/test_smoke_conformance.py train/test_parity_lattices.py train/test_c_load.py -q`
-  → **36 passed in 152.75s**（1 个 3-step mini smoke + 24 个 parity + 11 个 C loader）。
+- `JAX_PLATFORMS=cpu /home/DslsDZC/LCM/be/bin/python -m pytest train/test_smoke_conformance.py train/test_parity_lattices.py train/test_c_load.py train/test_vq_losses.py train/test_binding_unbind.py train/test_sparse_lfq.py -q`
+  → **63 passed in 269.94s**（mini smoke + 24 parity + 11 C loader + R18/R20/R2 coverage）。
+- `JAX_PLATFORMS=cpu /home/DslsDZC/LCM/be/bin/python -m pytest train/test_safety_hypothesis.py -q`
+  → **12 passed in 76.19s**（formal constants now 128/0.7）。
 - `JAX_PLATFORMS=cpu /home/DslsDZC/LCM/be/bin/python -m pytest train/test_c_loop.py -q`
   → **5 passed in 2.20s**（含真实 v3 loop 的 danger abort `-2` / 无 token 路径）。
 - `make -C infer clean && make -C infer test` → **ALL TESTS PASSED**；
@@ -178,9 +180,9 @@ python train/smoke_conformance.py --steps 100 --batch 1 --seq 64 \
 - Artifact：`checkpoints/conformance_smoke/smoke_report.json` +
   `smoke_report.md` + `step_000100/`（149 MB，不提交）。
 
-> 运行时的 HEAD 是 `2558c81`（Task 15 基线）；上面这些修复与报告在同一个
-> Task 15 提交中。smoke JSON 的 `meta.git_commit` 记录的是运行时的 HEAD，
-> 不是提交后的 SHA。
+> smoke 运行时的 HEAD 是 `c32eea9`（上一轮修复提交）；最终代码提交是
+> `8379d45`。smoke JSON 的 `meta.git_commit` 记录的是运行时 HEAD；本复审
+> 与实验报告在后续文档提交中。
 
 ---
 
