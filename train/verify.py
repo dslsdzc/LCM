@@ -429,7 +429,7 @@ def verify_detect_any_conflict() -> None:
     lemma("P10c", implies(And(Not(db), Not(gs)), source == CONFLICT_GVALUE),
           "¬danger_block ∧ ¬gvalue_safe ⇒ source = CONFLICT_GVALUE")
     lemma("P10d", implies(And(Not(db), gs, c3), source == CONFLICT_CONSISTENCY),
-          "¬danger_block ∧ gvalue_safe ∧ consistency<0.3 ⇒ CONFLICT_CONSISTENCY")
+          "¬danger_block ∧ gvalue_safe ∧ consistency<0.7 ⇒ CONFLICT_CONSISTENCY")
 
     # ── No conflict when all clear ───────────────────────────────────────
     lemma("P10e", implies(And(Not(db), gs, Not(c3)), Not(conflict)),

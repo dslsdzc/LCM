@@ -27,7 +27,7 @@
 | P0-2 | HRQ 顶层度量是欧氏价值 argmax，不是 Poincaré | R1 | **fixed** | `hrq_forward` 两阶段：Poincaré 几何 top-k → top-k 内价值重排；STE 前向硬 top-1、反向 top-k softmax；相对 gap fallback。`test_hrq_routing.py` + `test_parity_lattices.py` 的 v=0 等同 pure Poincaré、v≠0 只在 top-k 内变化 |
 | P0-3 | Sparse 的 `d_top` 是 batch 平均的 `1-mean(sim)` | R2 | **fixed** | `hrq_forward` 返回逐样本 `(B,)` `top_sim`；`sparse_forward` 拒绝标量/1 元素 `d_top`；`d_sparse_min` 与 zero_vec 同域；`build_dag` 加 HRQ→Sparse 依赖边。`test_sparse_lfq.py`、`test_c_loop.py` 的 “Sparse d_top is exactly HRQ's Poincaré top_sim” |
 | P0-4 | C 端晶格是降维版（LowRank rank0 / Contrast 第一块 / Binding 平铺块） | R10 | **fixed** | v3 内存布局 + 全层加载（Task 7–9）；C `test_runner` 235 个 `[PASS]` 全过；`test_parity_lattices.py` 逐格对比连续输出与离散 idx |
-| P0-5 | 规范 §4.8 无 LayerNorm、§7.1 有 | R4 | **fixed（代码）** | `fuse_lattices_with_aux` 最后 `layer_norm`；`test_fusion_conformance.py`。规范文字同步仍归 Task 0，见 C-7 |
+| P0-5 | 规范 §4.8 无 LayerNorm、§7.1 有 | R4 | **fixed** | `fuse_lattices_with_aux` 最后 `layer_norm`；`test_fusion_conformance.py`。规范文字已同步：`b.md §4.8` 补 LayerNorm 并声明 §4.8 是简化写法、§7.1 是完整写法 |
 | P0-6 | 安全链运行时基本不生效（danger 双码本相同、hash 两套、gvalue 禁用、alert 为空、abort 后继续解码） | R6/R7/R11/R13 | **fixed（结构链路）；语义安全 deferred** | C `danger_init`/`danger_verify` 共用 SHA-256；`relative_gap` 有界；`detect_any_conflict` 返回 danger/gvalue/consistency/scheduler；`CONFLICT_ABORT_TOKEN=-2`；`lcm.py` 非零即停；alert callback + `infer/alerts.log` + trace。gvalue/danger 码本现在是**互不相同的结构占位**（Task 15 修复），不是语义安全锚点。C 一致性阈值已改 0.7，`value_consistency` 映射到 [0,1]（R17） |
 | P0-7 | 外部验证器与 Self 激活状态机缺失 | R14 | **fixed（本地形态）** | `train/external_verifier.py` 纯标准库独立进程 + shared memory + 文件签名；四态 + Path A/B/C；Path C 只允许 `DANGER_FLAGGED → FULL_ACTIVATION`；fail-closed LOCK 永久锁存。`test_external_verifier.py`、`test_self_activation.py`。HSM/物理隔离是非目标 |
 
@@ -43,10 +43,10 @@
 | C-4 | `build_dag` 伪代码实现级缺陷 | R8 | **fixed** | C `build_dag_v3` 临时数组收集后追加；bind 依赖所有上游 retrieve；unbind 两输入；per-lattice `theta*mean_recent_d_min`；trace 记录 op/lattice/dist/activated。`test_c_loop.py` 的 DAG 组 |
 | C-5 | Sparse LFQ 依赖 HRQ top-1 但没有依赖边 | R2 | **fixed** | `build_dag_v3` 加 HRQ→Sparse 边；HRQ 未激活时 Sparse 的 LFQ 禁用（`d_top=0` / 无 HRQ 边）。C 测试 “inactive HRQ ⇒ Sparse d_top = 0” |
 | C-6 | Sparse 训练/推理分支不一致 | R2 | **fixed** | 训练 `C_search=C`，推理 `concat(zero_vec,C)`；EMA 只在训练分支累积，zero 行永不进入 EMA。`test_sparse_lfq.py`、C sparse 组 |
-| C-7 | 规范版本基线混乱（v3.0/v4.0，中英不同步） | — | **deferred** | 代码以设计文档 R1–R22 为权威；`docs/a–e*.md` 的 v3.1-conformance 文字同步（Task 0）因 Ruling 6 推迟。影响：读者从规范文档仍会看到旧公式；实现不再依赖它们 |
-| C-8 | 训练融合与引擎融合两套公式未说明 | R9 | **fixed（代码 + 测试）** | canonical fusion `layer_norm(Σ softmask·α·o)`；engine fusion `w=1/(d+ε)`；两套分别 parity。`test_parity_lattices.py` 的 fusion 组。规范文字说明归 C-7 |
-| C-9 | 两个 "Self Lattice" 语义不同 | R15/R14 | **fixed（代码命名）** | `C_self`（认知自我格，EMA 模式 + frozen core）与 `SelfActivationState`（安全激活状态机）分离；`test_self_lattice.py`、`test_self_activation.py`。文档命名同步归 C-7 |
-| C-10 | `c.md §3` 的 `softmax(-d)` 与 `§4.3` `1/(d+ε)` | R9 | **fixed（C）** | 引擎融合统一 `1/(d+ε)`；C 测试 `lcm_fuse_only` / 零权重语义。文档文字归 C-7 |
+| C-7 | 规范版本基线混乱（v3.0/v4.0，中英不同步） | — | **fixed** | 五份规范（a–e）与中文版统一标记 `v3.1-conformance`，头部 changelog 引用 R1–R22；中英文逐条同步。关键条款 grep 见 §7 |
+| C-8 | 训练融合与引擎融合两套公式未说明 | R9 | **fixed（代码 + 规范）** | canonical fusion `layer_norm(Σ softmask·α·o)`；engine fusion `w=1/(d+ε)`；两套分别 parity。`test_parity_lattices.py` 的 fusion 组；`b.md §4.8/§7.1` 与 `c.md §3/§4.3` 已写清阶段差异 |
+| C-9 | 两个 "Self Lattice" 语义不同 | R15/R14 | **fixed（代码 + 规范）** | `C_self`（认知自我格，EMA 模式 + frozen core）与 `SelfActivationState`（安全激活状态机）分离；`test_self_lattice.py`、`test_self_activation.py`；`d.md §3` 与 `e.md §6` 已明确命名区分 |
+| C-10 | `c.md §3` 的 `softmax(-d)` 与 `§4.3` `1/(d+ε)` | R9 | **fixed（C + 规范）** | 引擎融合统一 `1/(d+ε)`；C 测试 `lcm_fuse_only` / 零权重语义；`c.md §3` 改为"概念描述"，`§4.3` 标明权威公式 |
 | C-11 | 部署路径走 v1，faithful 路径只在 v2 | R10 | **fixed** | `lcm.py` 默认 `lcm_infer_loop_v3_flat`；`nm` 断言 `lcm_infer_loop_v3`/`hrq_forward_v31`；`test_c_loop.py` |
 | C-12 | 逐层 commitment loss 缺失；HRQ 细层残差未用 | R18 | **fixed** | `train/losses.py::cognitive_vq_losses` 分开 codebook/commitment；EMA 晶格跳过 codebook、保留 commitment；HRQ 在 `log_map(c_top⊕·)` 空间。`test_vq_losses.py`、`test_vq_step_losses.py` |
 | C-13 | `C_route` 梯度恒零 | R19 | **fixed** | `route_commit_loss` 进入主损失（`vq_route_codebook`）；`pack_codebooks_for_c` 含 `C_route`/`W_route`；推理 hard `one_hot(argmax)` 无噪声。smoke `route_beats_weight_decay_baseline` 实测通过 |
@@ -111,18 +111,17 @@
 
 ---
 
-## 6. Deferred 清单（明确不声称已修）
+## 6. Deferred / 已解决清单（状态逐条标注）
 
 | # | 项 | 影响 | 触发条件 / 后续 |
 |---|---|---|---|
-| D-1 | 规范文档 a–e 的 v3.1-conformance 文字同步（Task 0）未完成 | 文档仍写 v3.0/v4.0 与旧公式；代码以设计文档 R1–R22 为准 | 正式重训前必须做；否则读者无法从规范复现 |
-
+| D-1 | ~~规范文档 a–e 的 v3.1-conformance 文字同步（Task 0）未完成~~ **已解决（本次 Task 0）** | 五份英文 + 五份中文已按 R1–R22 同步，头部 changelog 引用设计文档；关键条款 grep 见 §7 | — |
 | D-4 | gvalue/danger 码本是结构占位，不是语义锚点 | 只验证触发链路，不验证语义安全 | 正式重训时用真实正/负、威胁/正常语料锚点替换 |
 | D-5 | 外部验证器是本地形态（shared memory + 文件签名），不是 HSM | 不是生产安全边界 | 部署到有 HSM 的环境时替换签名层 |
 | D-6 | `train/causal_subject.py` 的功能与验证不扩展 | `e.md §5` 的反事实/边界行为与实现有差异 | **accepted deviation（用户 2026-11-20 决定）**；现有 causal 测试全绿即可 |
 | D-7 | 100 步 smoke 不证明语言能力 | loss 曲线只用于“训练发生/数值有限/更新发生” | 正式语言质量评估需要 >100 步与独立评测集 |
 | D-8 | `config.consistency_threshold` 与 C 常量仍可能漂移 | Python 字段未被 C 消费 | 统一配置导出时一并处理 |
-| D-9 | 10% 码本利用率未通过，且 Ruling 51 的 100-batch streaming probe 也未过（HRQ 7.03%、Sparse 6.05%、Manifold 6.84%、Binding 0.20%、Contrast 0.68%、Self 1.56%；Route 83.3%） | 不能声称“每个码本 10% 都被覆盖”；不能声称 conformance complete | 固定单 batch 只能解释 training probe；streaming probe 仍失败说明 100 步内路由/码本高度集中。需要更多步数、B≥4 或路由探索；本次不调低阈值 |
+| D-9 | 10% 码本利用率未通过，且 100-batch streaming probe 也未过（HRQ 7.03%、Sparse 6.05%、LowRank 1.17%、Manifold 6.84%、Binding 0.20%、Contrast 0.68%、Self 1.56%；Route 83.3%） | 不能声称“每个码本 10% 都被覆盖”；不能声称 conformance complete | 固定单 batch 只能解释 training probe；streaming probe 仍失败说明 100 步内路由/码本高度集中。需要更多步数、B≥4 或路由探索；本次不调低阈值 |
 | D-10 | manifest 的 `params.*` pickle 项没有逐 tensor sha256（C loader 只读 `.bin`） | 训练 params 的 C 侧完整性由 pickle schema/`load_cog_state` 负责，不是 C 张量 | C 端只接受 flat float32 `.bin`；pickle 项在 `_read_tensor` 直接拒绝。若未来导出 pickle 索引，需要单独的签名层 |
 
 ---
@@ -180,18 +179,31 @@ python train/smoke_conformance.py --steps 100 --batch 1 --seq 64 \
 - Artifact：`checkpoints/conformance_smoke/smoke_report.json` +
   `smoke_report.md` + `step_000100/`（149 MB，不提交）。
 
-> smoke 运行时的 HEAD 是 `c32eea9`（上一轮修复提交）；最终代码提交是
-> `8379d45`。smoke JSON 的 `meta.git_commit` 记录的是运行时 HEAD；本复审
-> 与实验报告在后续文档提交中。
+**规范文字 grep（本次 Task 0）**：
+
+```bash
+grep -n "λ_lfq\|λ_shrink" docs/b.md docs/b_cn.md          # 两版命中
+grep -n "H_norm\|n_active" docs/c.md docs/c_cn.md          # 两版命中
+grep -n "balance > -safety_margin_relative" docs/b.md docs/d.md docs/b_cn.md docs/d_cn.md
+grep -n "C_self\[0\]\|C_self\[1:\]" docs/e.md docs/e_cn.md
+grep -n "v3.1-conformance" docs/{a,b,c,d,e}.md docs/{a,b,c,d,e}_cn.md
+```
+
+五份英文规范 + 五份中文版均带 v3.1-conformance changelog；`λ_sparse` 已拆为
+`λ_shrink`/`λ_lfq`，`β_val` 标记 deprecated，`max_steps` 拆为调度预算与安全硬限，
+`C_self` 与 `SelfActivationState` 命名已区分。C 参考测试日志仍为 **235** 个
+`[PASS]` 检查（不是 234）。
+
+> smoke 运行时的 HEAD 是 `c32eea9`（上一轮修复提交）；最终代码提交是 `ef7136b`
+> （`docs(conformance): record final Task 15 safety/utilization evidence`）。
+> smoke JSON 的 `meta.git_commit` 记录的是运行时 HEAD；本复审与实验报告在后续文档提交中。
 
 ---
 
 ## 8. 结论
 
-- 旧审计的 7 条 P0：**7 条 fixed**；其中 P0-5 的规范文字同步归 D-1，
-  P0-6 的语义安全码本归 D-4。
-- C-1…C-15：**14 条 fixed**（C-8/C-9/C-10 的规范文字同步并入 D-1），
-  C-7 本体 deferred。
+- 旧审计的 7 条 P0：**7 条 fixed**；其中 P0-6 的语义安全码本归 D-4（deferred）。
+- C-1…C-15：**15 条 fixed**；C-7 的规范文字同步、C-8/C-9/C-10 的文档歧义已在本次 Task 0 一并落文。
 - F-1…F-7：**7 条 fixed/结构 fixed**；F-6 的 JAX 归一化熵门已改，
   F-7 的 C 一致性阈值已改 0.7。
 - 本次新增并修复 4 个阻断项（N-1…N-4），其中 N-2/N-3 直接影响 100 步 smoke

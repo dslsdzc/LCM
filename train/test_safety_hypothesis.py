@@ -185,7 +185,7 @@ def test_danger_step_is_scheduler_owned(sc, vc, ds):
         assert threat == 0
 
 
-@given(vc=floats(min_value=0.29, max_value=0.31, allow_nan=False))
+@given(vc=floats(min_value=0.69, max_value=0.71, allow_nan=False))
 @settings(max_examples=50)
 def test_danger_consistency_boundary(vc):
     """E4: behavior at consistency threshold."""

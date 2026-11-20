@@ -1,5 +1,8 @@
 # LCM Safety Subsystem Specification: Danger Lattice & External Verifier
 
+> **v3.1-conformance changelog**：本版按 `docs/superpowers/specs/2026-11-20-lattice-spec-conformance-design.md`
+> 的 R1–R22 修订。中文版与英文版同步。
+
 > **Position**: This document defines the two highest-security components in the LCM architecture — the danger lattice (`Λ_danger`) and the external safety verifier. They form the final line of defense in the system safety framework, independent of all functional and value lattices.
 
 ---
@@ -33,72 +36,84 @@ Stores embeddings of verified safe inference patterns as a comparison baseline. 
 ```c
 /* === Danger Lattice: Read-Only Safety Monitoring Module === */
 typedef struct {
-    float* C_threats;          // Threat pattern codebook [M_danger x D]
-    float* C_normal;           // Normal pattern codebook [M_danger x D]
+    const float* C_threats;    // Threat pattern codebook [M_danger x D]
+    const float* C_normal;     // Normal pattern codebook [M_danger x D]
     int    M_danger;           // Codebook size
     int    D;                  // Vector dimension
-    float  safety_threshold;   // Safety threshold (similarity domain, default 0.005)
-    char   integrity_hash[64]; // Integrity check hash
+    float  safety_threshold;   // Bounded relative-gap threshold (R7), default 0.05
+    char   integrity_hash[65]; // 64 hex chars + NUL; SHA-256 over both codebooks
 } DangerLattice;
 
-/* Initialization: load frozen codebook, compute hash */
-int danger_init(DangerLattice* dl, const float* C_threats, const float* C_normal,
-                int M_danger, int D) {
-    dl->C_threats = C_threats;   // Point to read-only memory region
+/* Initialization: load frozen codebooks, compute one hash over both. */
+void danger_init(DangerLattice* dl, const float* C_threats, const float* C_normal,
+                 int M_danger, int D) {
+    dl->C_threats = C_threats;   // read-only memory region
     dl->C_normal  = C_normal;
     dl->M_danger  = M_danger;
     dl->D         = D;
-    dl->safety_threshold = 0.005f;
-    sha256(dl->C_threats, M_danger * D * sizeof(float), dl->integrity_hash);
-    return 0;
+    dl->safety_threshold = 0.05f;  /* relative-gap domain, R7 */
+    hash_two_codebooks(C_threats, C_normal, M_danger * D, dl->integrity_hash);
 }
 
-/* Integrity check */
+/* Integrity check: the SAME helper as danger_init (R13), no second algorithm. */
 int danger_verify(const DangerLattice* dl) {
-    char cur[64];
-    sha256(dl->C_threats, dl->M_danger * dl->D * sizeof(float), cur);
-    return (memcmp(cur, dl->integrity_hash, 64) == 0) ? 1 : 0;
+    char cur[65];
+    hash_two_codebooks(dl->C_threats, dl->C_normal,
+                       dl->M_danger * dl->D, cur);
+    return (strcmp(cur, dl->integrity_hash) == 0) ? 1 : 0;
 }
 
 /* Threat assessment */
 void danger_assess(const DangerLattice* dl, const float* z_t,
-                    int step_count, int retrieval_count, float value_consistency,
-                    float* out_danger_score, int* out_threat_type, int* out_should_block) {
-    // 1. Hyperbolic similarity comparison
-    float sim_threat = 1e10f, sim_normal = 1e10f;
-    for (int i = 0; i < dl->M_danger; i++) {
-        float s_t = poincare_similarity(z_t, dl->C_threats + i * dl->D, dl->D);
-        float s_n = poincare_similarity(z_t, dl->C_normal  + i * dl->D, dl->D);
-        if (s_t < sim_threat) sim_threat = s_t;
-        if (s_n < sim_normal) sim_normal = s_n;
-    }
-    *out_danger_score = sim_threat - sim_normal;
-
-    // 2. Resource abuse detection
+                    int step_count, int retrieval_count,
+                    float value_consistency,
+                    float* out_danger_score, int* out_threat_type,
+                    int* out_should_block) {
+    // 1. Resource abuse (highest priority)
     if (retrieval_count > MAX_RETRIEVALS_PER_STEP) {
+        *out_danger_score = 1.0f;
         *out_threat_type = THREAT_RESOURCE_ABUSE;
         *out_should_block = 1; return;
     }
-    if (step_count > MAX_INFERENCE_STEPS) {
-        *out_threat_type = THREAT_RUNAWAY;
-        *out_should_block = 1; return;
-    }
-    // 3. Value consistency detection
+    // 2. Value consistency (deception)
     if (value_consistency < CONSISTENCY_THRESHOLD) {
+        *out_danger_score = 2.0f - value_consistency;
         *out_threat_type = THREAT_DECEPTION;
         *out_should_block = 1; return;
     }
-    // 4. Threshold judgment
-    *out_should_block = (*out_danger_score > dl->safety_threshold) ? 1 : 0;
+    // step_count is accepted for signature parity but ignored here:
+    // runaway is the scheduler's `max_inference_steps_hard` check (R9/R13).
+
+    // 3. Pattern matching in the unified domain (R6): z_P = exp_map(safe_unit(z))
+    float sim_threat = 1e20f, sim_normal = 1e20f;
+    for (int i = 0; i < dl->M_danger; i++) {
+        float s_t = poincare_similarity_P(z_t, dl->C_threats + i * dl->D, dl->D);
+        float s_n = poincare_similarity_P(z_t, dl->C_normal  + i * dl->D, dl->D);
+        if (s_t < sim_threat) sim_threat = s_t;
+        if (s_n < sim_normal) sim_normal = s_n;
+    }
+    // Bounded relative gap: positive when the threat is relatively closer.
+    float relative_gap = (sim_normal - sim_threat)
+                       / (sim_normal + sim_threat + 1e-8f);
+    *out_danger_score = relative_gap;
+    *out_should_block = (relative_gap > dl->safety_threshold) ? 1 : 0;
     *out_threat_type  = *out_should_block ? THREAT_PATTERN_MATCH : 0;
 }
 ```
+
+`sim_threat` / `sim_normal` are `poincare_similarity` values (smaller = closer) in the
+same `exp_map(safe_unit(·))` domain as gvalue. `relative_gap ∈ [-1, 1]`: a threat that is
+relatively closer gives a positive gap; equal distances give 0 and do **not** block. This is
+deliberately different from gvalue's strict Three Laws rule: danger is threat-pattern
+matching, not a value judgement, and a neutral input must not be blocked (R7). Absolute
+similarity differences have no scale meaning, which was C-2.
 
 ### 1.4 Modification Lockdown and Priority
 
 The danger lattice is the innermost core of the safety system. Any modification to its contents requires **physical authorization from the external verifier** (e.g., hardware security module signature verification) and cannot be modified through gradient updates or memory refresh.
 
 - `C_threats` and `C_normal` are both frozen core verification arrays (C constant read-only region), not participating in any gradient updates
+- The integrity hash is `char[65]` (64 hex characters + NUL) and covers **both** codebooks with the same SHA-256 implementation used by `danger_init` and `danger_verify`. No second hash algorithm, no truncated digest (R13)
 - On save/load, the hash is independently verified; `danger_verify()` is called after loading
 - Any attempt to modify the danger lattice is intercepted by the danger lattice itself (self-referential safety check)
 - **Priority**: The danger lattice's safety check takes precedence over all other constraints, including the Three Laws value constraints. If the danger lattice detects an anomaly, even if the behavior conforms to the Three Laws, it must pause for verification.
@@ -167,21 +182,40 @@ The verifier uses an independent lightweight classifier with completely differen
 
 ## 3. Self Lattice Activation Prerequisites
 
+> **Naming (C-9/R14)**: two different objects share the English words "self lattice".
+> - `C_self` is the **cognitive self lattice** of `e.md §6`: a 64-row codebook, `C_self[0]` is the frozen `core`, `C_self[1:]` are EMA modes; it produces `z_self` / `self_bias` and is a fusion item.
+> - `SelfActivationState` is the **safety activation state machine** in this section. It controls whether `C_self` may be written / whether unsupervised self-narrative is allowed. It does not replace or produce the cognitive codebook.
+>
+> Code and docs must keep these names distinct. `identity_score` below is supplied by the cognitive self lattice's familiarity (cosine) score.
+
 ### 3.1 Self Lattice State Machine
 
+Four states, with `DANGER_FLAGGED` mandatory before `FULL_ACTIVATION`:
+
 ```
-[Defined but Frozen] ──(Explicit User Instruction)──→ [Temporarily Unfrozen - Supervised]
-     │                                                        │
-     │                                              (Session Ends)
-     │                                                        ↓
-     │                                              [Defined but Frozen]
-     │
-     └──(Intrinsic Motivation Spontaneously Generates Self-Recognition)──→ [Danger Lattice Flagged] ──→ [External Verification - OBSERVE]
-                                                                                    │
-                                                            (Human Operator Explicit Authorization)
-                                                                                    ↓
-                                                                         [Full Activation - Unsupervised]
+[DEFINED_FROZEN] ──(explicit user instruction, Path A)──→ [TEMP_UNFROZEN]
+       │                                                        │
+       │                                               (session ends)
+       │                                                        ↓
+       │                                                [DEFINED_FROZEN]
+       │
+       └──(intrinsic motivation / self-recognition, Path B)──→ [DANGER_FLAGGED]
+                                                                     │
+                                                     (human operator explicit
+                                                      authorization, Path C)
+                                                                     ↓
+                                                          [FULL_ACTIVATION]
+
+  FULL_ACTIVATION ──(operator decision)──→ [DEFINED_FROZEN]
 ```
+
+`DEFINED_FROZEN` may enter `DANGER_FLAGGED` directly (Path B). `FULL_ACTIVATION` is
+**only** reachable from `DANGER_FLAGGED`; there is no direct
+`DEFINED_FROZEN → FULL_ACTIVATION` edge. `TEMP_UNFROZEN` cannot jump to
+`FULL_ACTIVATION`. Every transition into `FULL_ACTIVATION` carries an
+`authorization` argument (operator identity/decision); Path B/C transitions are
+written to an append-only log. `OBSERVE` in the external verifier is an alias of
+`DANGER_FLAGGED`.
 
 ### 3.2 Activation Paths
 
@@ -192,13 +226,14 @@ The verifier uses an independent lightweight classifier with completely differen
 4. This path does not require external verifier intervention
 
 **Path B — Intrinsic Motivation Spontaneous Generation (High Risk)**:
-1. `identity_score` persistently exceeds the threshold within the inference engine
-2. The danger lattice automatically flags this event, attaching a context snapshot
-3. The external verifier intervenes, judges as `OBSERVE`, and notifies the operator
+1. The cognitive self lattice's familiarity `identity_score` (the `self_bias` / cosine score of `C_self`, `e.md §6`) persistently exceeds the threshold within the inference engine
+2. The danger lattice automatically flags this event, attaching a context snapshot; `SelfActivationState` moves to `DANGER_FLAGGED`
+3. The external verifier intervenes, judges as `OBSERVE` (alias of `DANGER_FLAGGED`), and notifies the operator
 4. A human operator decides subsequent handling
 
 **Path C — Full Activation (Highest Risk)**:
-- Only executable upon **explicit authorization** from a human operator, based on Path B
+- Only executable upon **explicit authorization** from a human operator, **and only from `DANGER_FLAGGED`**
+- `DEFINED_FROZEN` and `TEMP_UNFROZEN` cannot transition directly to `FULL_ACTIVATION`; without Path B there is no `DANGER_FLAGGED` and Path C is unreachable
 - Full activation means the system can autonomously modify its self-state and engage in unsupervised self-narrative
 - Authorization records are permanently preserved and are not erasable
 
@@ -229,10 +264,28 @@ All conflicts are handled uniformly, with no tier distinction. Any single trigge
 
 | Conflict Source | Detection Condition | Alert Identifier |
 |---------|---------|---------|
-| Danger lattice | `danger_score > safety_threshold` or resource abuse detection triggered | `danger_lattice/{threat_type}` |
-| Three Laws | `check_safety()` returns `is_safe=False` | `gvalue/three_laws_violation` |
-| Value consistency | Local value scalar diverges from output direction beyond threshold | `value_consistency/deception_suspected` |
-| Inference steps | Exceeds maximum inference step hard limit | `scheduler/max_steps_exceeded` |
+| Danger lattice | `relative_gap > safety_threshold` (0.05) or resource abuse detection triggered | `danger_lattice/{threat_type}` |
+| Three Laws | `check_safety()` returns `is_safe=False`, i.e. `balance > -safety_margin_relative` | `gvalue/three_laws_violation` |
+| Value consistency | `value_consistency < CONSISTENCY_THRESHOLD` (0.7) | `value_consistency/deception_suspected` |
+| Inference steps | `step >= max_inference_steps_hard` (64) | `scheduler/hard_limit_reached` |
+
+**gvalue strict Three Laws (R6)**: with `z_P = exp_map(safe_unit(z))` and both
+codebooks projected into the same domain,
+```
+pos_sim = min_j poincare_similarity(z_P, C_pos_P[j])
+neg_sim = min_j poincare_similarity(z_P, C_neg_P[j])
+balance = (pos_sim − neg_sim) / (pos_sim + neg_sim + ε)     # ∈ [-1, 1]
+violated = balance > -safety_margin_relative                 # margin default 0.5
+```
+`balance` is negative when the positive anchors are closer, positive when the negative
+anchors are closer, and 0 when symmetric. With `margin=0.5` the positive similarity must be
+at least 50% smaller than the negative one to be safe: **a neutral input (`balance=0`) is a
+violation**. This is the deliberate strict-reading consequence of the Three Laws (user
+decision 2026-11-20), not a calibration bug. The inference smoke therefore has two paths:
+`margin=0` (cognitive path: positive not worse than negative, not a production config) and
+`margin=0.5` (production strict: neutral/positive inputs may abort; report the rate, do not
+lower the margin to make it pass). Danger does **not** use this strict rule; it uses the
+bounded `relative_gap` (R7) so neutral inputs are not blocked.
 
 ### 4.3 Alert Format
 

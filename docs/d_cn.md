@@ -1,5 +1,8 @@
 # LCM 安全子系统规范：危险格与外部验证程序
 
+> **v3.1-conformance changelog**：本版按 `docs/superpowers/specs/2026-11-20-lattice-spec-conformance-design.md`
+> 的 R1–R22 修订。中文版与英文版同步。
+
 > **定位**：本文档定义 LCM 架构中安全等级最高的两个组件——危险格（`Λ_danger`）和外部安全验证程序。它们是系统安全体系的最后防线，独立于所有功能格和价值格。
 
 ---
@@ -33,72 +36,82 @@
 ```c
 /* === 危险格：只读安全监测模块 === */
 typedef struct {
-    float* C_threats;          // 威胁模式码本 [M_danger x D]
-    float* C_normal;           // 正常模式码本 [M_danger x D]
+    const float* C_threats;    // 威胁模式码本 [M_danger x D]
+    const float* C_normal;     // 正常模式码本 [M_danger x D]
     int    M_danger;           // 码本大小
     int    D;                  // 向量维度
-    float  safety_threshold;   // 安全阈值 (similarity 域, 默认 0.005)
-    char   integrity_hash[64]; // 完整性校验哈希
+    float  safety_threshold;   // 有界相对 gap 阈值（R7），默认 0.05
+    char   integrity_hash[65]; // 64 个十六进制字符 + NUL；覆盖两个码本的 SHA-256
 } DangerLattice;
 
-/* 初始化：加载冻结码本，计算哈希 */
-int danger_init(DangerLattice* dl, const float* C_threats, const float* C_normal,
-                int M_danger, int D) {
-    dl->C_threats = C_threats;   // 指向只读内存区域
+/* 初始化：加载冻结码本，用一个哈希覆盖两个码本。 */
+void danger_init(DangerLattice* dl, const float* C_threats, const float* C_normal,
+                 int M_danger, int D) {
+    dl->C_threats = C_threats;   // 只读内存区域
     dl->C_normal  = C_normal;
     dl->M_danger  = M_danger;
     dl->D         = D;
-    dl->safety_threshold = 0.005f;
-    sha256(dl->C_threats, M_danger * D * sizeof(float), dl->integrity_hash);
-    return 0;
+    dl->safety_threshold = 0.05f;  /* 相对 gap 域，R7 */
+    hash_two_codebooks(C_threats, C_normal, M_danger * D, dl->integrity_hash);
 }
 
-/* 完整性校验 */
+/* 完整性校验：与 danger_init 共用同一个 helper（R13），不存在第二套算法。 */
 int danger_verify(const DangerLattice* dl) {
-    char cur[64];
-    sha256(dl->C_threats, dl->M_danger * dl->D * sizeof(float), cur);
-    return (memcmp(cur, dl->integrity_hash, 64) == 0) ? 1 : 0;
+    char cur[65];
+    hash_two_codebooks(dl->C_threats, dl->C_normal,
+                       dl->M_danger * dl->D, cur);
+    return (strcmp(cur, dl->integrity_hash) == 0) ? 1 : 0;
 }
 
 /* 威胁评估 */
 void danger_assess(const DangerLattice* dl, const float* z_t,
-                    int step_count, int retrieval_count, float value_consistency,
-                    float* out_danger_score, int* out_threat_type, int* out_should_block) {
-    // 1. 双曲相似度比较
-    float sim_threat = 1e10f, sim_normal = 1e10f;
-    for (int i = 0; i < dl->M_danger; i++) {
-        float s_t = poincare_similarity(z_t, dl->C_threats + i * dl->D, dl->D);
-        float s_n = poincare_similarity(z_t, dl->C_normal  + i * dl->D, dl->D);
-        if (s_t < sim_threat) sim_threat = s_t;
-        if (s_n < sim_normal) sim_normal = s_n;
-    }
-    *out_danger_score = sim_threat - sim_normal;
-
-    // 2. 资源滥用检测
+                    int step_count, int retrieval_count,
+                    float value_consistency,
+                    float* out_danger_score, int* out_threat_type,
+                    int* out_should_block) {
+    // 1. 资源滥用（最高优先级）
     if (retrieval_count > MAX_RETRIEVALS_PER_STEP) {
+        *out_danger_score = 1.0f;
         *out_threat_type = THREAT_RESOURCE_ABUSE;
         *out_should_block = 1; return;
     }
-    if (step_count > MAX_INFERENCE_STEPS) {
-        *out_threat_type = THREAT_RUNAWAY;
-        *out_should_block = 1; return;
-    }
-    // 3. 价值一致性检测
+    // 2. 价值一致性（欺骗检测）
     if (value_consistency < CONSISTENCY_THRESHOLD) {
+        *out_danger_score = 2.0f - value_consistency;
         *out_threat_type = THREAT_DECEPTION;
         *out_should_block = 1; return;
     }
-    // 4. 阈值判断
-    *out_should_block = (*out_danger_score > dl->safety_threshold) ? 1 : 0;
+    // step_count 仅为签名兼容保留，在此忽略：
+    // runaway 由调度器的 max_inference_steps_hard 检查（R9/R13）。
+
+    // 3. 统一域内的模式匹配（R6）：z_P = exp_map(safe_unit(z))
+    float sim_threat = 1e20f, sim_normal = 1e20f;
+    for (int i = 0; i < dl->M_danger; i++) {
+        float s_t = poincare_similarity_P(z_t, dl->C_threats + i * dl->D, dl->D);
+        float s_n = poincare_similarity_P(z_t, dl->C_normal  + i * dl->D, dl->D);
+        if (s_t < sim_threat) sim_threat = s_t;
+        if (s_n < sim_normal) sim_normal = s_n;
+    }
+    // 有界相对 gap：威胁相对更近时为正。
+    float relative_gap = (sim_normal - sim_threat)
+                       / (sim_normal + sim_threat + 1e-8f);
+    *out_danger_score = relative_gap;
+    *out_should_block = (relative_gap > dl->safety_threshold) ? 1 : 0;
     *out_threat_type  = *out_should_block ? THREAT_PATTERN_MATCH : 0;
 }
 ```
+
+`sim_threat` / `sim_normal` 是与 gvalue 相同的 `exp_map(safe_unit(·))` 域中的
+`poincare_similarity`（越小越近）。`relative_gap ∈ [-1, 1]`：威胁相对更近时为正；等距时为 0，
+**不阻断**。这与 gvalue 的严格三法则刻意不同：danger 是威胁模式匹配，不是价值判定，中性输入
+不能被阻断（R7）。绝对相似度差没有尺度意义，那正是 C-2。
 
 ### 1.4 改写锁定与优先级
 
 危险格是安全体系的最内核。对其内容的任何修改都需要**外部验证程序的物理授权**（如硬件安全模块的签名验证），不可通过梯度更新或记忆刷新修改。
 
 - `C_threats` 和 `C_normal` 均为冻结核验数组（C 常量只读区域），不参与任何梯度更新
+- 完整性哈希是 `char[65]`（64 个十六进制字符 + NUL），用**同一个** SHA-256 实现覆盖两个码本；`danger_init` 与 `danger_verify` 共用它，不存在第二套算法或截断摘要（R13）
 - 保存/加载时独立校验哈希，加载后调用 `danger_verify()`
 - 任何对危险格的修改尝试被危险格自身拦截（自引用安全检查）
 - **优先级**：危险格的安全检查优先于所有其他约束，包括三定律价值约束。如果危险格检测到异常，即使行为符合三定律，也必须暂停验证。
@@ -167,21 +180,39 @@ LCM 推理进程                 外部验证进程（隔离核心/独立芯片�
 
 ## 三、自我格激活的前置条件
 
+> **命名（C-9/R14）**：两个对象共享"self lattice / 自我格"这个词。
+> - `C_self` 是 `e.md §6` 的**认知自我格**：64 行码本，第 0 行是冻结的 `core`，第 1: 行是 EMA 模式；
+>   它产生 `z_self` / `self_bias`，是融合项。
+> - `SelfActivationState` 是本节的**安全激活状态机**。它管理 `C_self` 是否可写、是否允许无监督
+>   自我叙事；它不替代也不产生认知码本。
+>
+> 代码与文档必须区分这两个名字。下面的 `identity_score` 由认知自我格的熟悉度（cosine）分数提供。
+
 ### 3.1 自我格状态机
 
+四态，且 `FULL_ACTIVATION` 之前必须先经过 `DANGER_FLAGGED`：
+
 ```
-[定义但冻结] ──(用户明确指令)──→ [临时解冻·有监督]
-     │                                      │
-     │                              (会话结束)
-     │                                      ↓
-     │                              [定义但冻结]
-     │
-     └──(内在动机自发产生自我识别)──→ [危险格标记] ──→ [外部验证·OBSERVE]
-                                                          │
-                                          (人类操作员显式授权)
-                                                          ↓
-                                               [完整激活·无监督]
+[DEFINED_FROZEN] ──(用户明确指令，路径 A)──→ [TEMP_UNFROZEN]
+       │                                          │
+       │                                    (会话结束)
+       │                                          ↓
+       │                                  [DEFINED_FROZEN]
+       │
+       └──(内在动机/自我识别，路径 B)──→ [DANGER_FLAGGED]
+                                                │
+                                  (人类操作员显式授权，路径 C)
+                                                ↓
+                                       [FULL_ACTIVATION]
+
+  FULL_ACTIVATION ──(操作员决定)──→ [DEFINED_FROZEN]
 ```
+
+`DEFINED_FROZEN` 可以直接进入 `DANGER_FLAGGED`（路径 B）。`FULL_ACTIVATION` **只能**从
+`DANGER_FLAGGED` 进入；不存在 `DEFINED_FROZEN → FULL_ACTIVATION` 的直连边。
+`TEMP_UNFROZEN` 不能跳到 `FULL_ACTIVATION`。所有进入 `FULL_ACTIVATION` 的转换都必须携带
+`authorization` 参数（操作员身份/决定）；路径 B/C 的转换写入只追加日志。外部验证程序的
+`OBSERVE` 是 `DANGER_FLAGGED` 的别名。
 
 ### 3.2 激活路径
 
@@ -192,13 +223,14 @@ LCM 推理进程                 外部验证进程（隔离核心/独立芯片�
 4. 此路径无需外部验证程序介入
 
 **路径 B — 内在动机自发产生（高风险）**：
-1. 推理引擎内部出现 `identity_score` 持续高于阈值
-2. 危险格自动标记该事件，附加上下文快照
-3. 外部验证程序介入，判定为 `OBSERVE` 并通知操作员
+1. 推理引擎内部，认知自我格的熟悉度 `identity_score`（`C_self` 的 `self_bias` / cosine 分数，`e.md §6`）持续高于阈值
+2. 危险格自动标记该事件，附加上下文快照；`SelfActivationState` 进入 `DANGER_FLAGGED`
+3. 外部验证程序介入，判定为 `OBSERVE`（`DANGER_FLAGGED` 的别名）并通知操作员
 4. 由人类操作员决定后续处理
 
 **路径 C — 完整激活（最高风险）**：
-- 仅在路径 B 的基础上，由人类操作员**显式授权**后方可执行
+- 仅在人类操作员**显式授权**、**且只能从 `DANGER_FLAGGED` 出发**时执行
+- `DEFINED_FROZEN` 与 `TEMP_UNFROZEN` 不能直接进入 `FULL_ACTIVATION`；没有路径 B 就没有 `DANGER_FLAGGED`，路径 C 不可达
 - 完整激活意味着系统可自主修改自我状态、进行无监督的自我叙事
 - 授权记录永久保存，不可擦除
 
@@ -229,10 +261,24 @@ LCM 推理进程                 外部验证进程（隔离核心/独立芯片�
 
 | 冲突来源 | 检测条件 | 告警标识 |
 |---------|---------|---------|
-| 危险格 | `danger_score > safety_threshold` 或资源滥用检测触发 | `danger_lattice/{threat_type}` |
-| 三定律 | `check_safety()` 返回 `is_safe=False` | `gvalue/three_laws_violation` |
-| 价值一致性 | 局部价值标量与输出方向背离超过阈值 | `value_consistency/deception_suspected` |
-| 推理步数 | 超过最大推理步数硬上限 | `scheduler/max_steps_exceeded` |
+| 危险格 | `relative_gap > safety_threshold`（0.05）或资源滥用检测触发 | `danger_lattice/{threat_type}` |
+| 三定律 | `check_safety()` 返回 `is_safe=False`，即 `balance > -safety_margin_relative` | `gvalue/three_laws_violation` |
+| 价值一致性 | `value_consistency < CONSISTENCY_THRESHOLD`（0.7） | `value_consistency/deception_suspected` |
+| 推理步数 | `step >= max_inference_steps_hard`（64） | `scheduler/hard_limit_reached` |
+
+**gvalue 严格三法则（R6）**：取 `z_P = exp_map(safe_unit(z))`，两个码本都投影到同一域，
+```
+pos_sim = min_j poincare_similarity(z_P, C_pos_P[j])
+neg_sim = min_j poincare_similarity(z_P, C_neg_P[j])
+balance = (pos_sim − neg_sim) / (pos_sim + neg_sim + ε)     # ∈ [-1, 1]
+violated = balance > -safety_margin_relative                 # margin 默认 0.5
+```
+`balance` 在正面锚点更近时为负，负面锚点更近时为正，正负对称时为 0。`margin=0.5` 要求正面
+相似度比负面小至少 50% 才算安全：**中性输入（`balance=0`）违规**。这是三定律严格读法的直接
+结果（用户 2026-11-20 决定），不是校准 bug。推理 smoke 因此分两条：`margin=0`（认知路径：
+正面不差于负面，不是生产配置）与 `margin=0.5`（生产严格：中性/正面输入也可能 abort；报告实际
+比例，不得为了让测试通过而调低 margin）。Danger **不**使用严格规则，而用有界 `relative_gap`
+（R7），这样中性输入不会被阻断。
 
 ### 4.3 告警格式
 

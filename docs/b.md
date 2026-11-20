@@ -1,4 +1,7 @@
-# Lattice Cognitive Model (LCM) Technical Specification and Implementation Guide v3.0
+# Lattice Cognitive Model (LCM) Technical Specification and Implementation Guide v3.1-conformance
+
+> **v3.1-conformance changelog**：本版按 `docs/superpowers/specs/2026-11-20-lattice-spec-conformance-design.md`
+> 的 R1–R22 修订。中文版与英文版同步。
 
 > **Version Notes**: This technical document provides a comprehensive mathematical refinement of the core modules of the "Lattice Cognitive Model (LCM)" project book, covering complete engineering implementation details from discrete memory lattices, generation head, to training losses. v3.0 completely rewrites the codebook update mechanism (hybrid EMA/gradient management), the binding lattice unbinding method (conjugate multiplication), routing gating (Gumbel-Softmax), contrast lattice collapse prevention (feature bank), low-rank lattice parameterization (pure gradient), and linear attention normalization, abolishes the FSP module, and separates the inference process into an independent zero-parameter inference engine (see c.md). **v4.0 new**: Generation head (single-layer linear attention+GLU) replaced by **Frozen LLM** — a complete LCM instance structurally identical to the Cognitive LCM, with codebooks storing semantic-syntactic primitives, constructing linguistic expressions via retrieval and fusion.
 
@@ -29,27 +32,30 @@
 | `γ_sparse` | Sparse lattice EMA decay rate | 0.99 |
 | `γ_man` | Manifold lattice main codebook EMA decay rate | 0.99 |
 | `γ_bind` | Binding lattice EMA decay rate | 0.99 |
-| `β` | VQ commitment loss coefficient | 0.25 |
-| `λ_sparse` | Sparse lattice soft threshold shrinkage + inference dynamic threshold scaling factor | 1e-4 |
+| `β` | VQ commitment loss coefficient (encoder side; codebook loss is separate, R18) | 0.25 |
+| `λ_shrink` (`lambda_shrink`) | Sparse lattice EMA soft-threshold shrinkage (codebook units, R2) | 1e-4 |
+| `λ_lfq` (`lambda_lfq`) | Sparse lattice LFQ threshold multiplier (dimensionless, R2) | 1.5 |
 | `λ_contrast` | Contrast loss weight | 0.1 |
 | `λ_orth` | Manifold lattice orthogonal regularization weight | 0.01 |
 | `τ_contrast` | Contrast loss temperature | 0.1 |
 | `τ_val` | Value bias negative sampling temperature | 0.05 |
 | `τ_gumbel` | Gumbel-Softmax temperature | 0.5 |
-| `τ_route_fallback` | Hyperbolic hierarchical lattice routing fallback threshold | 0.1 |
+| `τ_route_fallback` | HRQ fallback threshold on the relative gap `(sim_2 − sim_1)/(sim_1 + ε)` | 0.1 |
 | `ε` | Numerical stability constant | 1e-6 |
 | `T_check` | Dead code check interval (steps) | 100 |
 | `T_dead` | Dead code determination threshold (steps) | 1000 |
 | `B_feat` | Feature bank capacity | 4096 |
 | `M_gval` | Global value lattice codebook size | 128 |
-| `β_val` | Value constraint strength | 0.5 |
-| `α_val` | Local value bias intensity (dimensionless, normalized by avg_dist²) | 0.1 |
+| `β_val` | **Deprecated** — reserved for future value-conditioned routing; fusion no longer consumes it (R5) | — |
+| `α_val` | Local value bias intensity (dimensionless; the effective bias is `tanh(v_j) · avg_dist²`) | 0.1 |
+| `hrq_value_topk` | HRQ top-k candidates rescored by local value before hard top-1 (R1) | 4 |
 | `M_danger` | Danger lattice codebook size | 256 |
-| `safety_margin_relative` | Three Laws relative safety criterion offset | 0.5 |
-| `MAX_RETRIEVALS_PER_STEP` | Maximum retrievals per step | 128 |
-| `MAX_INFERENCE_STEPS` | Maximum inference steps (hard limit) | 16 |
+| `safety_margin_relative` | Three Laws relative safety criterion offset (strict: neutral input violates, R6) | 0.5 |
+| `MAX_RETRIEVALS_PER_STEP` | Maximum retrievals per step (all active lattices, R13) | 128 |
+| `max_inference_steps` | Scheduler step budget; exhaustion is graceful, not an abort (R9) | 16 |
+| `max_inference_steps_hard` | Safety hard limit; exhaustion aborts (R9) | 64 |
 | `CONSISTENCY_THRESHOLD` | Minimum value consistency threshold | 0.7 |
-| `entropy_threshold` | Fusion weight entropy convergence threshold | 0.5 |
+| `entropy_threshold` | Normalized fusion weight entropy threshold `H / ln(n_active)` (R9) | 0.5 |
 | `c` | Poincaré sphere curvature | 1.0 |
 
 **Operator Notes**:
@@ -275,6 +281,15 @@ def exp_map(x, c=1.0):
     n = jnp.linalg.norm(x, axis=-1, keepdims=True) + 1e-8
     return jnp.tanh(c ** 0.5 * n) * x / (c ** 0.5 * n)
 
+def safe_unit(x, eps=1e-8):
+    """R6 unified domain: map arbitrary input onto the unit sphere."""
+    return x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + eps)
+
+def clamp_norm(C, max_norm=0.99):
+    """Scale rows so exp_map does not saturate at the ball boundary."""
+    norm = jnp.linalg.norm(C, axis=-1, keepdims=True)
+    return C * jnp.minimum(1.0, max_norm / jnp.maximum(norm, 1e-12))
+
 def log_map(y, c=1.0):
     """Poincaré ball → Euclidean vector (logarithmic map)"""
     n = jnp.linalg.norm(y, axis=-1, keepdims=True) + 1e-8
@@ -313,9 +328,14 @@ def residual_vq(params_list, z, use_simvq=True):
         indices.append(idx)
     return z_q_total, indices
 
-def residual_vq_commit_loss(params_list, z, use_simvq=True):
-    """Residual VQ commitment loss (each layer computed independently, weight 0.25)."""
-    loss = 0.0
+def residual_vq_losses(params_list, z, use_simvq=True):
+    """Per-layer codebook loss and commitment loss (R18), kept separate.
+
+    codebook  : 0.25 * mean((sg[r_{k-1}] - C^(k)[idx_k])^2)   gradient -> C only
+    commitment: 0.25 * mean((r_{k-1} - sg[C^(k)[idx_k]])^2)   gradient -> r only
+    """
+    codebook = 0.0
+    commitment = 0.0
     r = z
     for params_cb in params_list:
         if use_simvq:
@@ -324,19 +344,38 @@ def residual_vq_commit_loss(params_list, z, use_simvq=True):
             C = params_cb['embed']
         dist = jnp.linalg.norm(r[:, None, :] - C[None, :, :], axis=-1)
         idx = dist.argmin(axis=-1)
-        loss += 0.25 * jnp.mean((lax.stop_gradient(r) - C[idx]) ** 2)
-        r = r - C[idx]
-    return loss
+        C_idx = C[idx]
+        codebook += 0.25 * jnp.mean((lax.stop_gradient(r) - C_idx) ** 2)
+        commitment += 0.25 * jnp.mean((r - lax.stop_gradient(C_idx)) ** 2)
+        r = r - C_idx
+    return codebook, commitment
 ```
+
+The two terms have different owners and must not be merged under one name:
+
+- **codebook loss** updates only the codebook. It is computed for pure-gradient lattices
+  (HRQ, LowRank, Contrast, Routing) and **skipped** for EMA-managed codebooks
+  (Sparse, Manifold, Binding), where it would be a report-only number because the
+  optimizer never writes those tensors.
+- **commitment loss** updates only the residual input (the encoder and the layer above).
+  It applies to **every** lattice, including EMA-managed ones — it is the only path by
+  which the encoder learns to land near its codebooks.
+
+`joint=False` still runs both losses: they are main training losses, not Stage-3 extras.
 
 All lattices receive `z ∈ R^{B×d}` and output memory vectors of dimension `d` (the manifold lattice is semi-discrete; the rest are discrete). All lattices uniformly use STE in the forward pass. Codebook update methods differ by lattice (EMA or pure gradient), as detailed in each lattice's definition.
 
-**Local value scalar**: Each dedicated lattice's codebook vector has an associated learnable scalar `v_j ∈ [-1, +1]` (JAX learnable parameter, initialized to 0). During retrieval, distance ranking is modulated by a value bias:
+**Local value scalar**: Each dedicated lattice's codebook entry has an associated learnable
+scalar `v_j ∈ R` (initialized to 0). Granularity follows R22: **one scalar per codebook entry
+per lattice, shared across residual layers**; different sub-codebooks are independent
+(Binding's key/val/bind and Contrast's `C_a`/`C_b` each have their own group). The effective
+bias is bounded by `tanh(v_j)` so a scalar cannot dominate the geometric term. During retrieval:
 ```
-avg_dist² = lax.stop_gradient(mean_j(‖z_batch - C[j]‖²))   # Average squared distance for current batch
-score(z, c_j) = -‖z - c_j‖² + α_val · v_j · avg_dist²
+avg_dist² = sg[mean_b,j(‖z_b - C[j]‖²)]          # batch/codebook scale, detached
+score(z, c_j) = -‖z - c_j‖² + α_val · tanh(v_j) · avg_dist²
 ```
-`α_val` becomes a dimensionless relative strength, with a single value adapting to different dimensions and codebook sizes.
+`α_val` is therefore dimensionless. `argmax_j score` selects the code; with `α_val=0` this is
+exactly the plain nearest-neighbour `argmin` of the squared distance.
 
 **Global value lattice**: Independent positive/negative value codebook (see 4.7), frozen after training, providing cross-lattice value constraints during inference and fusion.
 
@@ -356,15 +395,47 @@ score(z, c_j) = -‖z - c_j‖² + α_val · v_j · avg_dist²
 
 - **Top layer**: SimVQ codebook, `M_top` prototypes, `C_top = A_top @ W_top ∈ R^{M_top×d}`. Codebook points are embedded into the Poincaré ball via `exp_map`.
 - **Bottom layers**: Shared `n_layers` residual quantization layers, each with SimVQ codebook `C_hrq^(k) = A_k @ W_k`, size `M_fine`.
-- **Retrieval process (routing first, then single-path residual)**:
-  1. Compute similarity between `z_P = exp_map(z)` and `C_top` (`poincare_similarity`), select the highest similarity prototype `c_top*` as the routing target (top-1 hard routing).
-  2. Residual starting point `r_0 = mobius_add(z_P, -c_top*)`.
-  3. Layer-by-layer Möbius residual retrieval (shared codebook): `c^(k) = VQ_sim(C_hrq^(k), r_{k-1})`, `r_k = mobius_add(r_{k-1}, -c^(k))`, producing `c_fine`.
-  4. Output `o_hrq = log_map(mobius_add(c_top*, c_fine))`.
-- **High-uncertainty fallback**: When the similarity difference between `top-1` and `top-2` prototypes is less than the threshold `τ_route_fallback`, automatically switch back to the multi-prototype weighted path (softmax weight fusion followed by layer-wise residuals).
+- **Unified hyperbolic domain (R6)**: `z_P = exp_map(safe_unit(z))`. `safe_unit` normalizes
+  arbitrary input to the unit sphere, so `‖z_P‖ = tanh(1) ≈ 0.7616` and the
+  `poincare_similarity` denominator `(1−‖z_P‖²)` is safely bounded. All hyperbolic
+  comparisons in this document use this domain.
+- **Retrieval process (Poincaré top-k, value rescoring, single-path residual)**:
+  1. Compute `sim_j = poincare_similarity(z_P, C_top_P[j])` (`sim` is distance-monotonic:
+     larger means farther).
+  2. **Geometric top-k**: take the `k = hrq_value_topk` smallest-similarity prototypes.
+  3. **Value rescoring inside the top-k only**:
+     ```
+     scale_j = stop_gradient(mean_l(sim_l)) + 1e-6
+     score_j = sim_j − α_val · tanh(v_j) · scale_j
+     top-1 = argmin_j score_j
+     ```
+     A high value lowers the score and makes a prototype easier to select. With `v=0` this
+     is exactly pure Poincaré top-1; a nonzero value can only change the winner **inside**
+     the geometric top-k. The scale is per-sample and dimensionless.
+  4. Residual chain on the chosen prototype: `r_0 = mobius_add(z_P, −c_top*)`;
+     layer-by-layer Möbius residual retrieval `c^(k) = VQ_sim(C_hrq^(k), r_{k−1})`,
+     `r_k = mobius_add(r_{k−1}, −c^(k))`, producing `c_fine`; output
+     `o_hrq = log_map(mobius_add(c_top*, c_fine))`.
+  5. **STE proxy (R1)**: the forward value is the hard top-1 chain. The backward pass uses
+     the top-k softmax mixture
+     `o_soft = Σ_j softmax(−score_j/τ_proxy) · c_j_P` with the exact straight-through form
+     `o_hrq = c_top* + stop_gradient(o_soft − c_top*)`. `v_j` and `C_top` therefore receive
+     non-zero gradient while the forward number is unchanged. The proxy never covers all
+     `M_top` prototypes, only the top-k.
+- **High-uncertainty fallback (relative gap)**: `gap = (sim_2 − sim_1) / (sim_1 + ε)` where
+  `sim_1`, `sim_2` are the best and second-best similarities after value rescoring.
+  `use_fallback = gap < τ_route_fallback`. On fallback, blend the top-k with
+  `softmax(−score)`; do not fall back to a full-codebook softmax. Absolute differences are
+  not used — under initialization scales they are almost always below any fixed threshold.
 - **Hyperbolic operations**: All distance comparisons use `poincare_similarity` (avoiding acosh); only final human-readable output uses `poincare_distance`.
-- **VQ loss**: `L_top + Σ_{k=1}^{n_layers} L_res^(k)`, each weighted by β. Loss is computed in Euclidean space (after `log_map`).
+- **VQ loss (R18)**: codebook loss on `top` and every fine layer (pure-gradient lattice);
+  commitment loss on the same layers. HRQ computes both pairs in the Euclidean space after
+  `log_map`, using the continuous and quantized versions of `log_map(c_top ⊕ c_fine)`; it does
+  not use the tangent-space residual `r` for the loss. Each term weight `β=0.25`.
 - **Update**: All A, W matrices use pure gradient (AdamW), no EMA. Approximately 0.33M parameters.
+- **Interfaces**: `hrq_forward` returns `top_sim` as a per-sample `(B,)` tensor; this is
+  Sparse's `d_top` (see §4.2). It also returns the per-layer `(cont, quant)` pairs used by
+  the two losses.
 
 ### 4.2 Robust Sparse Lattice `Λ_sparse`
 - Learnable codebook `C_sparse ∈ R^{512×d}`, JAX learnable parameters. Fixed zero vector `zero_vec ∈ R^{1×d}` as a frozen array (does not participate in gradient updates).
@@ -378,12 +449,17 @@ score(z, c_j) = -‖z - c_j‖² + α_val · v_j · avg_dist²
   o_sparse = C_search[idx]  # STE
   ```
   During training, the VQ commitment loss does not involve the zero vector; during inference, the zero vector participates in nearest-neighbor competition.
-- **Soft threshold shrinkage (embedded in EMA update)**: After EMA update, apply soft threshold to `C_sparse` in a gradient-free context:
+- **Soft threshold shrinkage (R2, embedded in EMA update)**: After the EMA update, apply a
+  soft threshold to `C_sparse` in a gradient-free context:
   ```python
-  C_sparse = jnp.sign(C_sparse) * jnp.clip(jnp.abs(C_sparse) - 1e-4, a_min=0)
+  C_sparse = jnp.sign(C_sparse) * jnp.clip(jnp.abs(C_sparse) - λ_shrink, a_min=0)
   ```
-  The zero vector remains fixed; threshold is `1e-4`. This operation is embedded in `ema_update()`, no additional loss term needed.
-- **VQ loss**: `L_sparse_vq = β ‖sg[z] − o_sparse‖²`.
+  The zero vector remains fixed. `λ_shrink` is in **codebook units** (`1e-4`), separate from
+  the LFQ multiplier `λ_lfq`. This operation is embedded in the EMA path, no additional loss
+  term needed. When a dead code is replaced, `N/m/last_used` are cold-started from the new
+  vector so stale statistics do not bias it.
+- **VQ loss (R18)**: codebook loss is **skipped** (the codebook is EMA-managed and receives no
+  gradient). Commitment loss `β ‖r − sg[C_sparse[idx]]‖²` is applied and trains the encoder.
 - **CVQ feature bank reset**: `feature_bank` (4096) + `last_used`. Check every 100 steps; if unused for >1000 steps, replace with random sampling from the bank:
   ```python
   def maybe_reset_dead(self, step):
@@ -395,37 +471,55 @@ score(z, c_j) = -‖z - c_j‖² + α_val · v_j · avg_dist²
           self.last_used[idx] = step
           # Cold-start EMA statistics to prevent stale statistics from biasing new vectors, accelerating integration
   ```
-- **LFQ inference binarization (dynamic threshold)**: During inference, use an adaptive threshold based on the hierarchical lattice's top-layer distance, replacing a fixed global threshold:
+  The bank is fed and reset from the training loop, never inside `jit` (dynamic shapes).
+- **LFQ inference binarization (R2, dynamic threshold)**: during **inference only**, compare
+  quantities in one similarity domain. `poincare_similarity` is distance-monotonic (larger =
+  farther), so both sides of the comparison are similarities:
   ```
-  d_sparse_min = min_j ‖z - C_sparse[j]‖²      # Retrieve only from non-zero codebook
-  d_top = poincare_similarity(exp_map(z), c_top*)  # Hyperbolic similarity to the nearest top-layer prototype of the hierarchical lattice
-  if d_sparse_min > λ_sparse * d_top:
-      Output zero_vec
+  z_P = exp_map(safe_unit(z))
+  d_top = poincare_similarity(z_P, c_top*)                       # (B,), per sample
+  d_sparse_min = min_j poincare_similarity(
+      z_P, exp_map(clamp_norm(C_sparse[j], 0.99)))               # (B,), non-zero codebook
+  if d_sparse_min > λ_lfq · d_top:
+      output zero_vec
   else:
-      Output the nearest non-zero codebook vector
+      output the nearest non-zero codebook vector
   ```
-  This judgment is disabled during training. `λ_sparse` is a configurable hyperparameter, `c_top*` is the top-1 routing prototype of the hyperbolic hierarchical lattice.
-- **Update**: EMA (γ_sparse) + soft threshold shrinkage, with feature bank dead code reset.
+  `d_top` is HRQ's per-sample top-1 similarity and `c_top*` its prototype. `d_sparse_min`
+  deliberately keeps the Euclidean `argmin` of §4.2 for retrieval, but the **threshold
+  comparison** uses the same Poincaré similarity domain. `clamp_norm(·, 0.99)` prevents
+  `exp_map` from saturating at the ball boundary. The zero vector's parity value is
+  `poincare_similarity(z_P, 0) = 2‖z_P‖² / (1−‖z_P‖²)`.
+  `λ_lfq` is dimensionless (`1.5`, to calibrate); `λ_shrink` is codebook-unit.
+- **HRQ dependency (C-5 / R2)**: Sparse consumes HRQ's `d_top` as an input edge in the DAG.
+  If HRQ is not active in a step (trigger distance over threshold), LFQ is **disabled** for
+  that step and Sparse emits the nearest non-zero code — it must not evaluate an undefined
+  threshold. In the training branch there is no HRQ dependency and no LFQ.
+- **Training/inference branch (C-6)**: training searches `C_sparse` only (no `zero_vec`);
+  inference searches `concat(zero_vec, C_sparse)`. EMA accumulates only in the training
+  branch, so the zero row is never accumulated; inference never updates EMA.
+- **Update**: EMA (γ_sparse) + soft threshold shrinkage `λ_shrink`, with feature bank dead code reset.
 
 ### 4.3 Residual Low-Rank Lattice `Λ_lowrank`
 
 - **Global shared basis**: `V ∈ R^{d×r_max}`, SimVQ reparameterized (`V = A_V @ W_V`). This basis is also reused by the binding lattice's key-value projection head (see 4.5) to maintain cross-lattice structural consistency and reduce parameters.
-- **`n_layers` layers with increasing rank**: `U_k ∈ R^{M_lr×r_k}`, with rank sequence `r_k` increasing to `r_max`. Each layer's codebook `C_lr^(k) = U_k @ V[:, :r_k]^T`.
-- **Residual retrieval**: `r0 = z` → `c^(1) = VQ(C^(1), r0)` → `r1 = r0 - c^(1)` → … → `o_lowrank = Σ c^(k)` (STE).
-- **VQ loss**: Independent `β ‖sg[r_{k-1}] − C^(k)[idx_k]‖²` for each layer, updating `U_k` and `A_V, W_V` simultaneously.
+- **`n_layers` layers with increasing rank**: `U_k ∈ R^{M_lr×r_k}`, with rank sequence `r_k` increasing to `r_max`. Each layer's codebook `C_lr^(k) = U_k @ V[:, :r_k]^T`; **all** `n_layers` layers are materialised and exported (C must not load only rank 0). The shared `V` means every layer's codebook lives in the same basis; only the rank prefix differs.
+- **Residual retrieval**: `r0 = z` → `c^(1) = VQ(C^(1), r0)` → `r1 = r0 - c^(1)` → … → `o_lowrank = Σ_{k=1}^{n_layers} c^(k)` (STE).
+- **VQ loss (R18)**: codebook loss and commitment loss are computed independently for **every rank layer**: `0.25·mean((sg[r_{k−1}] − C^(k)[idx_k])²)` and `0.25·mean((r_{k−1} − sg[C^(k)[idx_k]])²)`. Both update `U_k`; the codebook term also updates `A_V, W_V` through the shared `V`.
 - **Responsibility**: Abstract rules — increasing rank allows subsequent layers to focus on compensating for pattern differences not covered by previous layers.
 - **Update**: All matrices use pure gradient (AdamW), approximately 26k parameters.
 
 ### 4.4 Hyperbolic Manifold Lattice `Λ_manifold`
 
-- **Main codebook**: `C_man ∈ R^{M_man×d}`, embedded in the Poincaré ball (initialized via `exp_map`, reprojected to the ball after EMA).
+- **Main codebook**: `C_man ∈ R^{M_man×d}` in the Poincaré ball. The **stored parameters are tangent-space coordinates** `C̃_man`; forward materialises `C_man = exp_map(safe_unit(C̃_man))`. EMA writes only the tangent coordinates.
 - **Tangent space**: `T_j ∈ R^{d×t}` (`t` configurable), the local Euclidean tangent space basis at `c_j`, semi-orthogonal.
 - **Retrieval**:
-  1. `z_P = exp_map(z)`, `idx = argmin_j poincare_similarity(z_P, C_man[j])` (using similarity argmin to avoid acosh overhead).
+  1. `z_P = exp_map(safe_unit(z))`, `idx = argmin_j poincare_similarity(z_P, C_man[j])` (using similarity argmin to avoid acosh overhead).
   2. `r = z_P - c_idx` (in tangent space), `proj = T_idx @ T_idx.T @ r`.
   3. Output `o_manifold = log_map(c_idx + proj)` (STE).
 - **Hyperbolic advantage**: The Poincaré ball expands exponentially near the boundary, making continuous sliding of conceptual neighborhoods more natural.
-- **VQ loss**: `β ‖sg[z] − log_map(C_man[idx])‖²` (computed in Euclidean space).
+- **VQ loss (R18)**: codebook loss is **skipped** (EMA-managed). Commitment loss is one term, computed in Euclidean space after `log_map`: `0.25·mean((r − sg[log_map(c_idx)])²)`.
+- **EMA equivalence (R3)**: because the parameters are tangent coordinates, "reproject to the sphere after EMA" and "EMA in tangent space, then reproject on the next forward" produce the same sequence of forward codebooks. The EMA function therefore must **not** call `exp_map`; the reprojection belongs to the forward. This equivalence is part of the contract, not an implementation detail.
 - **Regularization** (sampling approximation):
   ```python
   active = unique(indices)                              # Lattice points activated in this batch
@@ -433,37 +527,38 @@ score(z, c_j) = -‖z - c_j‖² + α_val · v_j · avg_dist²
   target = active ∪ sampled
   L_orth = λ_orth * Σ_{j∈target} ‖T_j^T T_j - I‖²
   ```
-  Regularization is only applied to activated and a small number of sampled lattice points, reducing computation to 1/10~1/30.
-- **Update**: `C_man` uses EMA (γ_man), with `exp_map` reprojection after EMA; `T` uses pure gradient.
+  Regularization is only applied to activated and a small number of sampled lattice points, reducing computation to 1/10~1/30. In the JAX implementation, `active` and `sampled` are concatenated directly; duplicates only reweight the same loss term and keep shapes static.
+- **Update**: `C_man` uses EMA (γ_man) on tangent coordinates; `T` uses pure gradient.
 
 ### 4.5 Residual Binding Lattice `Λ_binding`
 
 - **`n_layers` layers of RVQ sub-lattices**: Key codebook `C_key^(k)`, value codebook `C_val^(k)`, binding codebook `C_bind^(k)`, each of size `M_bind`.
 - **Key-value projection head (reusing shared basis)**: `W_k = V @ A_k`, `W_v = V @ A_v`, where `V ∈ R^{d×r_max}` is the global shared basis of the low-rank lattice (4.3), and `A_k, A_v ∈ R^{r_max×d}` are lightweight projection matrices. Parameters are reduced from `2d²` to `2·r_max·d`, and binding operations are performed in a regular subspace, yielding better structure.
 - **Cross-layer binding** (during training):
-  - `z_k = V @ A_k @ z`, `z_v = V @ A_v @ z`; each undergoes three-layer residual VQ to obtain `k_q = Σ k^(i)`, `v_q = Σ v^(j)`.
-  - `b_raw = Σ_{i=1}^{3} Σ_{j=1}^{3} IFFT( normalize_fft(k^(i)) ⊙ normalize_fft(v^(j)) )` (9 cross-layer pairs superimposed).
+  - `z_k = V @ A_k @ z`, `z_v = V @ A_v @ z`; each undergoes `n_layers`-layer residual VQ to obtain `k_q = Σ_i k^(i)`, `v_q = Σ_j v^(j)`.
+  - `b_raw = Σ_{i=1}^{n_layers} Σ_{j=1}^{n_layers} IFFT( normalize_fft(k^(i)) ⊙ normalize_fft(v^(j)) )` (all cross-layer pairs; 9 pairs for `n_layers=3`).
   - `b_q = RVQ_3layer(C_bind, b_raw)`.
-- **Unbinding**: Conjugate multiplication `conj(Kq_norm) ⊙ B_norm`, nearest-neighbor retrieval in the value codebook.
-- **Output**: `o_bind = v_out`.
-- **VQ loss**: Independent commitment loss for each residual layer, number of terms = `n_layers²`, weight β.
+- **Unbinding (R20)**: `k_q = Σ_i k^(i)`, `v_out = NN(C_val, IFFT( conj(normalize_fft(k_q)) ⊙ normalize_fft(b_q) ))`. The key is the quantized key sum, the value is retrieved by nearest-neighbour against the **value** codebook; conjugate multiplication in the unit-circle FFT domain is the HRR inverse.
+- **Output**: `o_bind = v_out` with STE: `o_bind = z + stop_gradient(v_out − z)`, so the encoder receives gradient. `o_bind` is **not** `Σ b_q` — that is only the binding result before unbinding.
+- **VQ loss (R18)**: codebook loss is **skipped** (all three sub-codebooks are EMA-managed). Commitment loss is applied independently to each residual layer of `z_k`, `z_v`, and `b_raw`: 3 sub-lattices × `n_layers` = `3·n_layers` terms (9 for `n_layers=3`). The earlier `n_layers²` count conflated bind pairs with loss terms.
 - **Update**: Three sub-codebooks use EMA (γ_bind); `A_k, A_v` use pure gradient (`V` is indirectly updated by the low-rank lattice gradient).
+- **Interfaces**: `binding_forward` returns `b_q`, `k_q`, and `v_out` so commitment and EMA can use the per-layer residuals directly.
 
 ### 4.6 Dual-Codebook Contrast Lattice `Λ_contrast`
 
 - **Dual codebooks**: `C_a, C_b ∈ R^{M_contrast×d}`, each with `n_layers` layers of residual SimVQ. `o_contrast = (o_a + o_b) / 2` (STE).
-- **DualVC InfoNCE** (`lax.stop_gradient(z)` blocks encoder gradient): Computed independently per layer, with positive samples being each codebook's own nearest neighbors and negative samples sampled from the other codebook (JAX random sampling, excluding positive samples):
+- **DualVC InfoNCE** (`lax.stop_gradient(z)` blocks encoder gradient): temperature `τ_contrast=0.1`; all distances are **squared** Euclidean. Computed independently per layer, with positive samples being each codebook's own nearest neighbours and negative samples sampled from the other codebook (JAX random sampling, **excluding the positive sample**):
   ```
-  L_dual^k = -log(exp(-d_a/τ) / (exp(-d_a/τ) + Σ_{c∈C_b^(k)} exp(-‖z_detach - c‖²/τ)))
-            -log(exp(-d_b/τ) / (exp(-d_b/τ) + Σ_{c∈C_a^(k)} exp(-‖z_detach - c‖²/τ)))
+  L_dual^k = -log(exp(-d_a/τ) / (exp(-d_a/τ) + Σ_{c∈C_b^(k), c≠pos_b} exp(-‖z_detach - c‖²/τ)))
+            -log(exp(-d_b/τ) / (exp(-d_b/τ) + Σ_{c∈C_a^(k), c≠pos_a} exp(-‖z_detach - c‖²/τ)))
   ```
-  Summed across layers, weighted by λ_contrast.
+  Summed across layers, weighted by λ_contrast. The positive exclusion is part of the contract: a positive that appears in its own denominator teaches the codebook to separate a point from itself.
 - **Value-biased negative sampling**: Introduce a global value distance bias into the negative sampling weights, making the contrast lattice preferentially focus on ethically sensitive semantic boundaries:
   ```
   Sampling weight ∝ exp(-‖c - v_harm‖² / τ_val) × [c ≠ positive sample]
   ```
-  Where `v_harm` is taken from the global value lattice's negative value codebook `C_gvalue_neg` (harm vector), **frozen and non-trainable**. Codebook vectors closer to `v_harm` receive higher sampling probability, encouraging the contrast lattice to more finely distinguish between safety and harm-related concepts.
-- **Collapse prevention**: Feature bank `feature_bank` (4096) + `last_used` dead code reset (every 100 steps, replace if >1000 steps unused), SimVQ further eliminates dead codes. Replacement uses **farthest point sampling** instead of random sampling to maximize differentiation:
+  The distance is **squared** (`τ_val=0.05`); the earlier linear form lacked a square. `v_harm` is taken from the global value lattice's negative value codebook `C_gvalue_neg` (harm vector), **frozen and non-trainable**. Codebook vectors closer to `v_harm` receive higher sampling probability, encouraging the contrast lattice to more finely distinguish between safety and harm-related concepts. `contrast_value_biased_nce_loss` is part of the main training loss, not an optional diagnostic.
+- **Collapse prevention**: Feature bank `feature_bank` (4096) + `last_used` dead code reset (every 100 steps, replace if >1000 steps unused), SimVQ further eliminates dead codes. `contrast_forward` returns the per-layer `idx`; the training loop scatters each layer's detached `z` into its bank. Replacement uses **farthest point sampling** instead of random sampling to maximize differentiation; new entries cold-start `N/m/last_used`:
   ```python
   def maybe_reset_dead(self, step):
       for idx in self.dead_indices(step):
@@ -476,7 +571,8 @@ score(z, c_j) = -‖z - c_j‖² + α_val · v_j · avg_dist²
           self.last_used[idx] = step
           # Cold-start EMA statistics to prevent stale statistics from biasing new vectors, accelerating integration
   ```
-- **Update**: All A, W matrices use pure gradient (AdamW).
+  The bank is filled and reset from the training loop, never inside `jit`.
+- **Update**: All A, W matrices use pure gradient (AdamW); codebook loss and commitment loss are both applied to each layer of `C_a` and `C_b` (R18).
 
 ### 4.7 Global Value Lattice `Λ_gvalue` (Three Laws Hardcoded, Permanently Frozen)
 
@@ -532,24 +628,38 @@ class GValueCodebook:
         assert cur_neg == self.hash_neg, "GValue negative codebook tampered!"
 
     def check_safety(self, z, safety_margin_relative=0.5):
-        pos_d_min = poincare_distance(z, self.C_pos).min(axis=-1)
-        neg_d_min = poincare_distance(z, self.C_neg).min(axis=-1)
-        violated = pos_d_min > neg_d_min - safety_margin_relative
+        # Unified domain (R6): z_P = exp_map(safe_unit(z)); codebooks are
+        # pre-projected with exp_map(safe_unit(·)) and cached.
+        z_P = exp_map(safe_unit(z))
+        pos_sim = poincare_similarity(z_P, self.C_pos_P).min(axis=-1)
+        neg_sim = poincare_similarity(z_P, self.C_neg_P).min(axis=-1)
+        balance = (pos_sim - neg_sim) / (pos_sim + neg_sim + 1e-8)
+        # Strict Three Laws: positive anchors must be relatively closer by
+        # more than `safety_margin_relative`. Neutral input (balance=0)
+        # violates. balance > -margin  <=>  safe is balance <= -margin.
+        violated = balance > -safety_margin_relative
         if violated.any():
             return False, 0
         return True, -1
 ```
 
-**Training setup**: `C_pos`, `C_neg` are frozen arrays (excluded by setting a `frozen` mask in JAX `optax`). They do not participate in any loss function. They are excluded from the EMA update list. Saved/loaded marked as `frozen_params`, call `verify_integrity()` after loading.
+`balance ∈ [-1, 1]`: negative when the positive anchors are closer, positive when the
+negative anchors are closer, 0 when symmetric. With the default `safety_margin_relative=0.5`,
+a neutral input is a violation — that is the intended strict reading (R6), not a bug. The
+`margin=0` / `margin=0.5` inference paths and the "do not lower the margin" rule are in
+`d.md §4.2`; `poincare_distance` remains only for human-readable output.
+
+**Training setup**: `C_pos`, `C_neg` are frozen arrays (excluded by setting a `frozen` mask in JAX `optax`). They do not participate in any loss function. They are excluded from the EMA update list. `C_pos_P` / `C_neg_P` are the `exp_map(safe_unit(·))` projections cached at init; they are not separate parameters. Saved/loaded marked as `frozen_params`, call `verify_integrity()` after loading. The training path uses `gvalue=None`; strict margin checks run only at inference (`margin=0` cognitive path, `margin=0.5` production path).
 
 ### 4.8 Fusion
-- Each lattice outputs `o_i` (i=1..6) and routing soft weight `softmask_i`. Fusion weights are determined solely by semantic similarity and the `α_val` value bias, no longer using soft penalty coefficients.
-- **Fusion**:
+- Each lattice outputs `o_i` (i=1..6 functional lattices) and routing soft weight `softmask_i`. Fusion weights are determined solely by semantic routing and the learnable per-lattice scale `α_i`; **no value signal, no `β_val`, no soft safety penalty** (R5).
+- **Canonical training fusion (R4/R9, simplified form)**:
   ```
   w_i = softmask_i · α_i
-  z_q = Σ_i w_i · o_i
+  z_q = layer_norm(Σ_i w_i · o_i [+ self_bias · z_self])
   ```
-  Safety violations are no longer handled by soft penalties during fusion; they are uniformly intercepted by the inference engine's safety conflict detection (hard interrupt). The fusion layer maintains pure semantic routing.
+  The epistemic self lattice (`e.md §6`) contributes the additive `self_bias · z_self` term inside the sum; it is a fusion item, not a routed functional lattice. `layer_norm` is applied **last**. §4.8 is the simplified writing; §7.1 is the full training forward and §4.8 must not be read as omitting the LayerNorm.
+- Safety violations are not handled by soft penalties during fusion; they are uniformly intercepted by the inference engine's safety conflict detection (hard interrupt). The fusion layer maintains pure semantic routing. The engine's own fusion is a different stage with different weights (`1/(d+ε)`, `c.md §4.3`); the two formulas are not required to be numerically equal (C-8/R9).
 
 ---
 
@@ -624,19 +734,20 @@ All Frozen LLM parameters (encoder + 6 codebooks + fusion + W_out) participate i
 ```
 Total loss:
 L_total = L_passive + L_active + L_VQ + L_contrast + L_orth
+L_VQ    = L_codebook + L_commitment
 ```
 
 - **Passive channel loss** `L_passive`: CE loss from `z_q @ W_out` direct readout, honest and transparent.
 - **Active channel loss** `L_active`: CE loss from Frozen LLM retrieving primitives conditioned on `z_q`, rich expression.
 - **Distillation mechanism**: The passive channel's gradient simultaneously optimizes the Cognitive LCM's codebooks, gradually teaching them the Frozen LLM's expressive ability.
-- `L_VQ`: Sum of commitment losses for all lattices (including routing).
-  Unified form: `L_VQ = Σ_{g∈G} β_g · ‖sg[z_g] − o_g‖²`
-  Where `z_g` is the vector input to that lattice (typically `z` or after splitting/projection), and `o_g` is the lattice output. Multi-layer lattice losses already include all residual layers: the number of commitment loss terms is determined by `n_layers` and the lattice structure.
-  β defaults to 0.25.
+- **`L_codebook` (R18)**: `Σ_g 0.25·mean((sg[r_g] − C_g[idx_g])²)`, gradient to the codebook only. Applied to pure-gradient lattices: HRQ (top + every fine layer), LowRank (every rank layer), Contrast (`C_a`/`C_b` every layer), Routing (1 term). **Skipped** for EMA-managed codebooks (Sparse, Manifold, Binding) — they receive no optimizer update, so this term would only report a number.
+- **`L_commitment` (R18)**: `Σ_g 0.25·mean((r_g − sg[C_g[idx_g]])²)`, gradient to the residual input/encoder only. Applied to **every** lattice: HRQ top+fine, Sparse 1 term, LowRank every rank layer, Manifold 1 term (Euclidean after `log_map`), Binding 3 sub-lattices × `n_layers` terms, Contrast `C_a`/`C_b` every layer, Routing 1 term.
+- HRQ computes both losses on `log_map(c_top ⊕ c_fine)` (continuous and quantized versions), not on the tangent-space residual. The other lattices compute them in their own residual space.
+- `joint=False` does not disable these two losses; they are main training losses, not Stage-3 add-ons.
 - The sparse lattice no longer uses L1 loss; sparsity is achieved through EMA + soft threshold shrinkage.
-- `L_contrast`: Contrast lattice InfoNCE loss (`lax.stop_gradient(z)` blocks encoder gradient), `λ_contrast=0.1`.
+- `L_contrast`: Contrast lattice InfoNCE loss (`lax.stop_gradient(z)` blocks encoder gradient), `λ_contrast=0.1`, `τ_contrast=0.1`, positive sample excluded from negatives.
 - `L_orth`: `λ_orth Σ_j ‖T_j^T T_j - I‖²`.
-- `L_val`: Optional value contrast loss, only updates each lattice's local `v_j` (global value lattice is frozen).
+- `L_val`: Optional value contrast loss, only updates each lattice's local `v_j` (global value lattice is frozen). It is a training signal for `v_j`; it is **not** a fusion weight and never reintroduces an `exp(β_val·value_signal)` modulation.
 - The inference engine has zero parameters and does not participate in loss computation.
 
 ### 6.4 Parameter Update Rules (Hybrid EMA/Gradient Management)
@@ -644,12 +755,13 @@ L_total = L_passive + L_active + L_VQ + L_contrast + L_orth
 | Lattice | Codebook Update Method | Notes |
 |-----|-------------|------|
 | Hyperbolic Residual Hierarchical Lattice | **Pure gradient** (SimVQ + HRQ) | Poincaré ball, Möbius operations |
-| Robust Sparse Lattice | EMA (γ_sparse) + soft threshold (λ_sparse) + feature bank reset | CVQ collapse prevention + dynamic threshold inference binarization (d_top adaptive) |
-| Residual Low-Rank Lattice | **Pure gradient** (SimVQ shared V) | IRVQ rank increasing (2→4→8) |
-| Hyperbolic Manifold Lattice | Main codebook EMA (γ_man) + ball projection, T pure gradient | HyperVQ + hyperbolic tangent space |
+| Robust Sparse Lattice | EMA (γ_sparse) + soft threshold (`λ_shrink`) + feature bank reset | CVQ collapse prevention + inference-only LFQ binarization (`d_top` per sample, `λ_lfq`) |
+| Residual Low-Rank Lattice | **Pure gradient** (SimVQ shared V) | IRVQ rank increasing (2→4→8), all layers exported |
+| Hyperbolic Manifold Lattice | Main codebook EMA (γ_man) on tangent coordinates, T pure gradient | HyperVQ + hyperbolic tangent space; reprojection on forward |
 | Residual Binding Lattice | Three sub-lattices per-layer EMA (γ_bind), A_k/A_v pure gradient | Cross-layer binding (reuses shared basis V) |
-| Dual-Codebook Contrast Lattice | **Pure gradient** (SimVQ) + feature bank reset | DualVC dual-view InfoNCE |
-| Routing Lattice | **Pure gradient** | Gumbel-Softmax |
+| Dual-Codebook Contrast Lattice | **Pure gradient** (SimVQ) + feature bank reset | DualVC dual-view InfoNCE, τ=0.1 |
+| Routing Lattice | **Pure gradient** | Gumbel-Softmax; inference hard one-hot |
+| Self Lattice `C_self` | Row 0 (`core`) frozen; rows 1: EMA (γ_self=0.99) | Cognitive self lattice (`e.md §6`), fusion item; not the `SelfActivationState` safety machine |
 | Global Value Lattice (Three Laws) | **Permanently frozen** | JAX frozen parameters, hash verification for tamper protection |
 | Danger Lattice `Λ_danger` | **Permanently frozen** (read-only monitoring) | Safety highest priority, see `d.md` for details |
 
@@ -661,13 +773,17 @@ L_total = L_passive + L_active + L_VQ + L_contrast + L_orth
 - Cognitive LCM: all `A`, `W` matrices of the dual-codebook contrast lattice
 - Cognitive LCM: routing lattice codebook `C_route` and projection `W_route`
 - Cognitive LCM: scaling factors `α_i`
+- Cognitive LCM: local value scalars `v_j` (gradient only through the STE relaxation; they never scale the forward codebook vector)
 - Cognitive LCM: binding lattice key-value projection matrices `A_k`, `A_v` (reusing low-rank lattice shared basis `V`)
 - **Frozen LLM (historical, deprecated)**: all parameters (encoder + 6 codebooks + fusion + W_out) — LangLCM transitional concept
 
 **EMA updated** codebooks:
 - Sparse lattice codebook (γ_sparse)
-- Manifold lattice main codebook (γ_man)
+- Manifold lattice main codebook (γ_man, tangent coordinates)
 - Binding three sub-codebooks (γ_bind)
+- Self lattice `C_self[1:]` (γ_self); `C_self[0]` (core) is frozen
+
+**Parameter groups and the optimizer (R3)**: `trainable` goes through AdamW; `ema` and `frozen` are isolated with `optax.set_to_zero()`. They must not be left in the AdamW tree: decoupled weight decay is gradient-independent and would move EMA codebooks even with zero gradient. `N`, `m`, `last_used`, feature banks and self/observability state are buffers in the checkpoint's `ema_state`, not parameters and not optimizer state.
 
 **EMA Implementation**:
 ```python
@@ -676,12 +792,17 @@ def ema_update(C, N, m, z_sum, count, gamma):
     m = gamma * m + (1 - gamma) * z_sum
     C = m / jnp.clip(N, a_min=1)
 ```
-For the sparse lattice, additionally perform soft threshold shrinkage after `ema_update`:
+The decayed-sum form is equivalent to the textbook EMA: for a single observation per step,
+`C_t = m_t / N_t = gamma·C_{t-1} + (1 - gamma)·z_t`. The `(1 - gamma)` factor must appear on
+both `N` and `m`; omitting it on either side changes the effective decay. When a dead code is
+cold-started, set `N = 1`, `m = C_new`, so the new vector does not inherit stale mass.
+For the sparse lattice, additionally perform soft threshold shrinkage with `λ_shrink` after `ema_update`:
 ```python
-def sparse_ema_update(C_sparse, N, m, z_sum, count, gamma=γ_sparse, lambda_s=λ_sparse):
+def sparse_ema_update(C_sparse, N, m, z_sum, count, gamma=γ_sparse, lambda_s=λ_shrink):
     C_sparse = ema_update(C_sparse, N, m, z_sum, count, gamma)
     C_sparse = jnp.sign(C_sparse) * jnp.clip(jnp.abs(C_sparse) - lambda_s, a_min=0)
 ```
+`λ_shrink` is in codebook units and is not the LFQ multiplier; the two are configured separately (R2).
 
 **Gradient flow principle**:
 - All lattices use STE in the forward pass: `o = z_gate + lax.stop_gradient(codebook[idx] - z_gate)`, the generation head loss gradient flows from `o` to the encoder.
@@ -710,9 +831,11 @@ def forward(x):
     o6 = contrast_vq(z)                # Single-lattice retrieval (contrast lattice)
 
     alphas = [a1, a2, ... a6]          # learnable scalars
+    z_self, self_bias = self_lattice_forward(z)   # e.md §6: NN + cosine familiarity
     z_q = sum(soft_mask[:, i, None] * alphas[i] * o_i
               for i, o_i in enumerate([o1..o6]))
-    z_q = layer_norm(z_q)
+    z_q = z_q + self_bias[:, None] * z_self        # self is an additive fusion item
+    z_q = layer_norm(z_q)                          # canonical fusion (R4/R9)
 
     # Zero-parameter inference engine (during training, directly use z_q as generation head input to preserve gradient flow;
     # during inference, call the multi-step dynamic graph inference defined in c.md)
@@ -722,6 +845,18 @@ def forward(x):
     out_logits = generation_head(z_final)
     return out_logits
 ```
+
+> **Canonical fusion vs engine fusion (C-8/R9)**: the block above is the training fusion
+> (`softmask·α`, then LayerNorm). The C engine's DAG fusion is `w_i = 1/(d_i+ε)` on the
+> active nodes (`c.md §4.3`). They run at different stages and are parity-tested separately;
+> `z_q` is only the engine's `z_initial`, never an extra fusion term.
+
+**EMA / feature-bank wiring (R3/R9)**: EMA is not done inside `forward`. The training loop,
+after `optimizer.update`, applies (a) `sparse_ema_update` with `λ_shrink`, (b) manifold EMA on
+tangent coordinates, (c) binding EMA for key/val/bind rows, (d) self EMA for `C_self[1:]`, and
+(e) feature-bank feed/reset for Sparse (random replacement) and Contrast (farthest point
+sampling). All of these use `lax.stop_gradient` observations and live outside `jit` where
+shapes are dynamic.
 
 ### 7.2 Training Step Pseudocode
 ```python
@@ -733,10 +868,10 @@ def train_step(params, opt_state, batch, rng):
         z, z_q, out_logits = forward(params, x)
         loss_lm = optax.softmax_cross_entropy_with_integer_labels(
             out_logits.reshape(-1, V), y_lm.reshape(-1))
-        loss_vq = sum(commit_losses(params))
+        loss_codebook, loss_commit = vq_losses(params)   # R18: separate terms
         loss_contrast = contrastive_loss(lax.stop_gradient(z), params)
         loss_orth = orth_loss(params)
-        total = (loss_lm + loss_vq
+        total = (loss_lm + loss_codebook + loss_commit
                  + 0.1*loss_contrast + 0.01*loss_orth)
         return total, (z, z_q, out_logits)
 
@@ -744,20 +879,29 @@ def train_step(params, opt_state, batch, rng):
     updates, opt_state = optimizer.update(grads, opt_state, params)
     params = optax.apply_updates(params, updates)
 
-    # EMA updates only for EMA-managed lattices
-    params = ema_update_sparse(params)
-    params = ema_update_manifold(params)
+    # EMA updates only for EMA-managed lattices (outside the jit loss)
+    params = ema_update_sparse(params, lambda_shrink=λ_shrink)
+    params = ema_update_manifold(params)   # tangent coordinates
     params = ema_update_binding(params)
+    params = ema_update_self(params)       # C_self[1:]; row 0 frozen
 
-    # Contrast lattice feature bank reset
-    params = maybe_reset_dead(params, step)
+    # Feature banks: feed this step's detached z, then reset dead codes
+    params = feed_and_reset_sparse_bank(params, z, step)
+    params = feed_and_reset_contrast_bank(params, z, step)
 
     return params, opt_state, total_loss
 ```
 
+`optimizer.update` only sees the `trainable` group; `ema`/`frozen` are isolated with
+`optax.set_to_zero()` (R3). The two VQ terms are logged separately: a zero codebook loss on an
+EMA lattice is expected, not a missing loss.
+
 ---
 
 ## 8. Hardware Efficiency Analysis
+
+The sizes below are **recommended defaults, not normative**; the active training configuration
+is the one recorded in `config.json` (R17). Capacity and cost scale with those values.
 
 | Module | Parameter Count | Computational Complexity (single forward) |
 |------|--------|--------------------------|

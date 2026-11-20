@@ -1,4 +1,7 @@
-# Zero-Parameter Cognitive Inference Engine Design v2.0 — Dynamic Dataflow Graph Architecture
+# Zero-Parameter Cognitive Inference Engine Design v3.1-conformance — Dynamic Dataflow Graph Architecture
+
+> **v3.1-conformance changelog**：本版按 `docs/superpowers/specs/2026-11-20-lattice-spec-conformance-design.md`
+> 的 R1–R22 修订。中文版与英文版同步。
 
 ## 1. From "Executing a Program" to "Dynamic Topology"
 
@@ -30,12 +33,13 @@ All operations are deterministic mathematical functions with no learnable parame
 | **HRR Bind** | — | multi-layer keys `k^(i)`, multi-layer values `v^(j)` | cross-layer binding vector `b` | `b = Σ_{i,j} IFFT( fft_norm(k^(i)) ⊙ fft_norm(v^(j)) )` | Cross-layer association superposition, building multi-level associative memories |
 | **HRR Unbind** | — | binding vector `b`, query key `k` | retrieved value `v` | `v = NN( C_val, IFFT( conj(fft_norm(k)) ⊙ fft_norm(b) ) )` | Extract the best-matching value from cross-layer associations |
 | **Tangent Space Slide** | target lattice_id | `z`, manifold lattice spherical point `c`, tangent space `T` | semi-discrete point | `z_P=exp_map(z)`; `idx=argmin d_P(z_P, c)`; `o=log_map(c + T T^T(z_P − c))` | Continuous gradual reasoning along geodesics in hyperbolic space |
-| **Distance-Weighted Fusion** | — | output vectors from each operation and their corresponding distances | fused vector `z_q`, weight vector `w` | `z_q = Σ_i (1/(d_i+ε)) * o_i / Σ_i (1/(d_i+ε))`, `w_i = softmax(-d_i)` | Soft integration of multi-cue parallel processing; weights used for macro scheduler entropy convergence judgment |
+| **Distance-Weighted Fusion** | — | output vectors from each operation and their corresponding distances | fused vector `z_q`, weight vector `w` | `w_i = (1/(d_i+ε)) / Σ_j (1/(d_j+ε))`, `z_fused = Σ_i w_i o_i` | Soft integration of multi-cue parallel processing; weights used for macro scheduler entropy convergence judgment |
 
 > **Design Notes**:
 > - Lattice-specific primitives (hyperbolic hierarchical retrieval, residual low-rank retrieval, robust sparse retrieval, etc.) are consolidated into "Single Lattice Retrieve", with the target lattice specified by parameters. During `build_dag`, the target lattice of an operation is dynamically selected based on distance routing, rather than fixing a primitive for each lattice.
-> - The hyperbolic hierarchical lattice uses **top-1 hard routing** during the routing phase (selecting the top-level prototype with the highest similarity), then performs layer-by-layer Mobius residual retrieval along a single path; when routing uncertainty (difference between top-1 and top-2) falls below a threshold, it automatically falls back to a multi-prototype weighted path.
-> - The inference binarization threshold for sparse lattices uses **dynamic adaptive determination**: the threshold is `lambda_sparse * d_top`, where `d_top` is the distance from the current vector to the nearest top-level prototype of the hierarchical lattice, replacing a fixed global threshold.
+> - The hyperbolic hierarchical lattice uses **Poincaré top-k routing followed by value rescoring inside the top-k** (R1). The geometric top-k is selected by `poincare_similarity`; a value term `−α_val·tanh(v_j)·scale` picks the hard top-1 inside it; the backward pass uses a top-k softmax proxy; fallback is triggered by the relative gap `(sim_2−sim_1)/(sim_1+ε)`. This does not replace §4.1's Poincaré geometry: with `v=0` it is exactly pure top-1.
+> - The inference binarization threshold for sparse lattices uses **dynamic adaptive determination** in a single similarity domain (R2): `d_sparse_min` and `d_top` are both `poincare_similarity` values; the threshold is `λ_lfq · d_top` with `λ_lfq` dimensionless. Sparse **depends on HRQ's top-1** (`d_top`): the DAG carries an HRQ→Sparse edge, and LFQ is disabled when HRQ is inactive (C-5).
+> - `w_i = 1/(d_i+ε)` is the **authoritative** engine fusion formula (C-10/R9). The `softmax(-d_i)` wording that previously appeared here was only a conceptual description of "closer memories weigh more"; it is not used. This engine fusion is distinct from the training fusion `layer_norm(Σ softmask·α·o)`; the two are not required to agree numerically (C-8).
 > - Safety monitoring (danger lattice detection, Three Laws interception) is executed uniformly by the macro scheduler after each fusion step (see Section 4.1) and does not occupy primitive slots. Safety violations uniformly adopt **hard abort** -- there is no longer a beta_penalty soft penalty at the fusion level; all safety decisions are directly adjudicated by Three Laws interception and danger lattice detection.
 
 ## 4. Construction and Execution of the Dynamic Dataflow Graph
@@ -43,21 +47,26 @@ All operations are deterministic mathematical functions with no learnable parame
 ### 4.1 Macro Flow (with Scheduler)
 ```c
 float* dynamic_inference(float* z_initial, Memory* mem, GValue* gv,
-                          DangerLattice* dl, int max_steps,
+                          DangerLattice* dl,
+                          int max_inference_steps,       /* scheduler budget, default 16 */
+                          int max_inference_steps_hard,  /* safety hard limit, default 64 */
                           float tol, float entropy_threshold,
                           float safety_margin_relative,
                           void (*alert_cb)(Alert*),
                           const char* session_id) {
     float* z_cur = z_initial;
-    for (int step = 0; step < max_steps; step++) {
+    float* z_out = z_initial;
+    int limit = min(max_inference_steps, max_inference_steps_hard);
+    for (int step = 0; step < limit; step++) {
         // 1. Dynamic graph construction
         DAG* dag = build_dag(z_cur, mem, /*value_bias=*/true);
         // 2. Execute graph
         float* outputs; float* confidences;
         execute_dag(dag, &outputs, &confidences);
-        // 3. Fusion
-        float* z_next; float weights[6];
-        distance_weighted_fusion(outputs, confidences, gv, &z_next, weights);
+        // 3. Fusion: w_i = 1/(d_i+eps), see §4.3
+        float* z_next; float weights[6]; int n_active;
+        distance_weighted_fusion(outputs, confidences, gv, &z_next, weights,
+                                 &n_active);
 
         // 4. Conflict detection and hard abort
         Conflict conflict;
@@ -70,25 +79,50 @@ float* dynamic_inference(float* z_initial, Memory* mem, GValue* gv,
             return CONFLICT_ABORT_TOKEN;
         }
 
-        // 5. Convergence check (vector stable + fusion weight entropy below threshold)
+        // 5. Convergence check (vector stable + NORMALIZED fusion entropy)
         float diff = 0.0f;
         for (int i = 0; i < D; i++) diff += (z_next[i] - z_cur[i]) * (z_next[i] - z_cur[i]);
         float weight_entropy = 0.0f;
-        for (int i = 0; i < 6; i++) {
+        for (int i = 0; i < n_active; i++) {
             float w = weights[i] + 1e-12f;
             weight_entropy -= w * logf(w);
         }
-        if (sqrtf(diff) < tol && weight_entropy < entropy_threshold)
-            return z_cur;
+        float H_norm = (n_active > 1)
+                     ? weight_entropy / logf((float)n_active)
+                     : 0.0f;
+        if (sqrtf(diff) < tol && H_norm < entropy_threshold) {
+            memcpy(z_out, z_next, sizeof(vec_t));
+            return 0;                                   /* converged */
+        }
         z_cur = z_next;
     }
-    // Max steps exceeded
-    Conflict alert = {.source = CONFLICT_SCHEDULER, .type = MAX_STEPS_EXCEEDED,
-                      .detail = "max_steps_exceeded", .step = max_steps};
-    halt_and_alert(&alert, alert_cb, session_id, max_steps, NULL);
-    return CONFLICT_ABORT_TOKEN;
+    // Scheduler budget exhausted.
+    if (limit >= max_inference_steps_hard) {
+        // Safety hard limit: abort, z_out is not written.
+        Conflict alert = {.source = CONFLICT_SCHEDULER, .type = MAX_STEPS_EXCEEDED,
+                          .detail = "hard_limit_reached", .step = limit};
+        halt_and_alert(&alert, alert_cb, session_id, limit, NULL);
+        return CONFLICT_ABORT_TOKEN;
+    }
+    // Graceful budget exhaustion: return current state, no abort.
+    memcpy(z_out, z_cur, sizeof(vec_t));
+    return 0;
 }
+```
 
+**Step-limit semantics (R9)**: `max_inference_steps` is a *scheduler budget*
+(default 16). Exhausting it is a normal outcome — return the current `z_cur` so the
+caller can still produce a token. `max_inference_steps_hard` (default 64) is the
+safety limit; only reaching it aborts with `CONFLICT_ABORT_TOKEN` and saves a trace.
+Convergence failure is not a safety conflict. The effective loop is
+`min(budget, hard)`, so a caller cannot raise the budget past the hard limit.
+`z_out` is written only on convergence or graceful exhaustion; after an abort the
+caller must not read it.
+
+**Entropy gate (R9)**: `H_norm = H(w) / ln(n_active)` uses the **active** nodes of
+this step, not a fixed 6 or 7; `n_active = 1` gives `H_norm = 0`. The threshold is
+0.5. Raw nats (`H < 0.5`) would be unreachable for a 6-way fusion (`ln 6 ≈ 1.79`) and
+was the F-6 defect.
 
 ```c
 /* === Conflict type enum and struct === */
@@ -186,20 +220,28 @@ void halt_and_alert(const Conflict* conflict,
 
 ### 4.2 Single-Step Graph Construction (build_dag)
 
-Input `z_current`, iterate over all possible operation primitives (not necessarily all lattices; it can be a configured list of primitives). For each primitive, compute the trigger distance (e.g., the minimum distance to the relevant lattice codebook).
+Input `z_current`. The builder runs in three phases so that it never appends to a
+container while iterating it (C-4/R8):
 
-If this distance is less than a threshold (or dynamic threshold, such as one based on historical average distance), the operation node is added to the DAG. Edges between nodes are determined by data dependencies: some primitives require outputs from other primitives as input (for example, unbinding requires the binding output and a key vector); these dependencies are specified in a predefined primitive dependency table.
+1. **Collect** every candidate into a temporary array. For each functional lattice,
+   compute its trigger distance (minimum distance to the relevant codebook); Self,
+   when enabled, is appended as its own candidate. `n_lattices=7` must not overflow
+   the fixed candidate array.
+2. **Decide activation** for every candidate in the array: `threshold[li]` is
+   dynamic — `threshold[li] = θ_li · mean_recent_d_min[li]`, with `θ_li` configured
+   per lattice and `mean_recent_d_min` maintained by the scheduler (exponential
+   moving average). The first step falls back to the configured initial threshold.
+   A zero/negative `θ_li` disables that lattice.
+3. **Append in dependency order**: routed retrieve nodes first, then `bind`, then
+   `unbind`. `bind` consumes **all** upstream retrieve outputs (`n_inputs =
+   n_retrieve`), not only the first. `unbind` has `n_inputs=2`: `inputs[0]` is the
+   bind output, `inputs[1]` is the retrieve output used as the key. Sparse carries
+   an extra input edge from HRQ's output so its LFQ can read `d_top`; if HRQ is not
+   active, that pointer is NULL and LFQ stays disabled (C-5).
 
-Define the primitive layer ordering:
-```c
-/* Primitive layer order — defined by dependency hierarchy */
-#define NUM_PRIMITIVE_LAYERS 4
-const char* PRIMITIVE_LAYERS[NUM_PRIMITIVE_LAYERS][4] = {
-    [0] = {"retrieve_single", "slide_manifold", NULL},  // Independent retrieve/slide
-    [1] = {"bind", NULL},                                 // Depends on retrieval results
-    [2] = {"unbind", NULL},                               // Depends on binding output
-    [3] = {"distance_weighted_fusion", NULL}              // Depends on all upstream
-};
+`distance_weighted_fusion` does **not** occupy a primitive node; `execute_dag`
+performs it after the DAG has run. Trace records `op_type`, `lattice_id`, `dist`,
+and `activated` for every candidate, including inactive ones.
 
 ```c
 /* Op node — atomic unit of the dataflow DAG */
@@ -207,9 +249,10 @@ typedef struct OpNode {
     int    op_type;            // Primitive type identifier
     int    lattice_id;         // Target lattice identifier
     int    n_inputs;
-    float* inputs[MAX_INPUTS]; // Input vector pointers
+    const float* inputs[MAX_INPUTS]; // Input vector pointers
     float* output;             // Output vector
     float  dist;               // Trigger distance to query
+    float  dep_dist;           // Dependency gate (e.g. d_top), 0 = disabled
 } OpNode;
 
 typedef struct {
@@ -217,70 +260,103 @@ typedef struct {
     int    n_nodes;
 } DAG;
 
-/* Build DAG in layer order, ensuring dependencies are satisfied automatically */
 DAG build_dag(const float* z, Memory* mem, int value_bias) {
     DAG dag = {0};
-    for (int layer = 0; layer < NUM_PRIMITIVE_LAYERS; layer++) {
-        for (int p = 0; PRIMITIVE_LAYERS[layer][p] != NULL; p++) {
-            const char* prim = PRIMITIVE_LAYERS[layer][p];
+    Candidate cand[MAX_LATTICES + 1];
+    int n_cand = 0;
 
-            if (strcmp(prim, "retrieve_single") == 0 ||
-                strcmp(prim, "slide_manifold") == 0) {
-                // Iterate over all lattices, activate based on distance routing
-                for (int li = 0; li < mem->n_lattices; li++) {
-                    float d_min; int idx;
-                    lattice_nearest_dist(&mem->lattices[li], z, value_bias, &d_min, &idx);
-                    if (d_min < threshold[li]) {
-                        OpNode* node = &dag.nodes[dag.n_nodes++];
-                        node->op_type = primitive_id(lattice_type(mem, li), prim);
-                        node->lattice_id = li;
-                        node->n_inputs = 1;
-                        node->inputs[0] = (float*)z;
-                        node->dist = d_min;
-                    }
-                }
-            } else if (strcmp(prim, "bind") == 0) {
-                // Bind: depends on existing retrieval nodes
-                for (int ni = 0; ni < dag.n_nodes; ni++) {
-                    if (dag.nodes[ni].op_type == OP_RETRIEVE) {
-                        OpNode* node = &dag.nodes[dag.n_nodes++];
-                        node->op_type = OP_HRR_BIND;
-                        node->n_inputs = 2;
-                        node->inputs[0] = dag.nodes[ni].output;
-                        node->inputs[1] = (float*)z;
-                        break;
-                    }
-                }
-            } else if (strcmp(prim, "unbind") == 0) {
-                // Unbind: depends on binding node + key projection node
-                OpNode* bind_node = NULL;
-                OpNode* key_node  = NULL;
-                for (int ni = 0; ni < dag.n_nodes; ni++) {
-                    if (dag.nodes[ni].op_type == OP_HRR_BIND) bind_node = &dag.nodes[ni];
-                    // Look for retrieval-type nodes as keys
-                }
-                if (bind_node) {
-                    OpNode* node = &dag.nodes[dag.n_nodes++];
-                    node->op_type = OP_HRR_UNBIND;
-                }
-            }
-            // Fusion is handled internally by execute_dag
-        }
+    /* Phase 1: collect only. Never touch dag here. */
+    for (int li = 0; li < mem->n_routed_lattices; li++) {
+        cand[n_cand].lattice_id = li;
+        cand[n_cand].op_type = OP_RETRIEVE_SINGLE;
+        cand[n_cand].dist = lattice_nearest_dist(&mem->lattices[li], z,
+                                                 value_bias);
+        n_cand++;
     }
-    return dag;
+    if (mem->self_enabled) {
+        cand[n_cand].lattice_id = LATTICE_SELF;
+        cand[n_cand].op_type = OP_SELF_CHECK;
+        cand[n_cand].dist = self_nearest_dist(&mem->self, z);
+        n_cand++;
+    }
+
+    /* Phase 2: activation with dynamic thresholds. */
+    int active[MAX_LATTICES] = {0};
+    for (int i = 0; i < n_cand; i++) {
+        int li = cand[i].lattice_id;
+        float theta = mem->trigger_theta[li];
+        float thr = (mem->mean_recent_d_min[li] > 0.0f)
+                  ? theta * mem->mean_recent_d_min[li]
+                  : mem->trigger_initial[li];
+        active[li] = (theta > 0.0f)
+                   && (cand[i].dist < thr || cand[i].dist <= 1e-12f);
+        scheduler_update_mean_recent(&mem->mean_recent_d_min[li], cand[i].dist);
+        trace_push(&dag, cand[i].op_type, li, cand[i].dist, active[li]);
+    }
+
+    /* Phase 3: append in dependency order. */
+    OpNode* retrieve[MAX_LATTICES];
+    int n_retrieve = 0;
+    OpNode* hrq_node = NULL;
+    OpNode* bind_node = NULL;
+
+    for (int i = 0; i < n_cand; i++) {
+        int li = cand[i].lattice_id;
+        if (!active[li]) continue;
+        if (li == LATTICE_SELF) {
+            dag_push(&dag, OP_SELF_CHECK, li, cand[i].dist, z);
+            continue;
+        }
+        OpNode* node = dag_push(&dag, OP_RETRIEVE_SINGLE, li,
+                                cand[i].dist, z);
+        if (!node) continue;
+        if (li == LATTICE_HRQ) {
+            hrq_node = node;
+        } else if (li == LATTICE_SPARSE) {
+            /* C-5: Sparse reads HRQ's d_top; NULL means HRQ inactive. */
+            node->n_inputs = 2;
+            node->inputs[1] = hrq_node ? hrq_node->output : NULL;
+            node->dep_dist = 0.0f;
+        }
+        retrieve[n_retrieve++] = node;
+    }
+
+    /* Bind depends on ALL upstream retrieve nodes. */
+    if (n_retrieve > 0) {
+        bind_node = dag_push(&dag, OP_HRR_BIND, /*lattice_id=*/ALL,
+                             0.0f, z);
+        bind_node->n_inputs = n_retrieve;
+        for (int i = 0; i < n_retrieve; i++)
+            bind_node->inputs[i] = retrieve[i]->output;
+    }
+
+    /* Unbind: inputs[0] = bind output, inputs[1] = query key. */
+    if (bind_node) {
+        OpNode* node = dag_push(&dag, OP_HRR_UNBIND, /*lattice_id=*/ALL,
+                                0.0f, z);
+        node->n_inputs = 2;
+        node->inputs[0] = bind_node->output;
+        node->inputs[1] = retrieve[0]->output;  /* same key bind consumed */
+    }
+
+    return dag;  /* execute_dag performs distance_weighted_fusion */
 }
 ```
 
-Building in layer order ensures that upstream nodes are created first, dependencies are satisfied automatically without runtime dynamic lookups. This makes the DAG structure predictable and easy to debug.
+Because all decisions are made before any append, the DAG cannot iterate a container
+whose length is changing. Building in dependency order still lets `execute_dag` run
+nodes topologically; the dynamic threshold state is per-session, so two sessions do
+not share `mean_recent_d_min`.
 
 ### 4.3 Fusion Mechanism
 
-Uses the reciprocal of distance as weights, no softmax needed, entirely determined by geometric relationships:
+Uses the reciprocal of distance as weights, no softmax needed, entirely determined by geometric relationships. **This is the authoritative engine fusion formula (C-10/R9)**:
 ```
 weight_i = 1 / (d_i + ε)
-z_fused = sum(weight_i * o_i) / sum(weight_i)
+w_i     = weight_i / Σ_j weight_j
+z_fused = Σ_i w_i * o_i
 ```
-This fusion is purely mathematical and interpretable: memories closer to the current context contribute more.
+This fusion is purely mathematical and interpretable: memories closer to the current context contribute more. The normalized `w_i` is what the entropy gate consumes. The `softmax(-d_i)` phrasing in §3 is only a conceptual description of "closer weighs more"; it is not a second formula. Training fusion `layer_norm(Σ softmask·α·o)` is a different stage; the two are not required to agree numerically (C-8).
 
 ---
 
@@ -290,7 +366,7 @@ This fusion is purely mathematical and interpretable: memories closer to the cur
 
 | Input | Source | Shape | Description |
 |:---|:---|:---|:---|
-| `z_q` | Multi-lattice memory fusion output | `(B, d)` | Main input to the inference engine, the soft-weighted fusion result of each lattice's memory vectors |
+| `z_q` | Multi-lattice memory fusion output | `(B, d)` | Initial state `z_initial` of the inference engine (not an extra fusion term inside the loop); the soft-weighted fusion result of each lattice's memory vectors |
 | `z` (optional) | Perception encoder bottleneck vector | `(B, d)` | Raw context vector, can be used to initialize the inference context or as additional primitive input |
 | `memory` | All codebooks of the multi-lattice memory | — | Contains codebook matrices and metadata (tangent spaces, zero vectors, etc.) for all lattices, all read-only buffers |
 
@@ -305,10 +381,10 @@ This fusion is purely mathematical and interpretable: memories closer to the cur
 ### 5.3 Operating Modes
 
 - All operations of the inference engine execute in gradient-free mode (C implementation, no automatic differentiation tracing).
-- Macro scheduler parameters: maximum inference steps `max_steps`, convergence tolerance `tol`, fusion weight entropy threshold `entropy_threshold`, relative safety margin offset `safety_margin_relative`, value threshold `value_threshold` (global configuration, passed in by the caller).
-- **Convergence criterion**: vector stability `||z_next - z_current|| < tol` **and** fusion weight entropy `H({w_i}) < entropy_threshold`. The dual condition prevents false convergence when fusion weights have not consolidated (multi-lattice ambiguity competition still exists) but the vector happens to be stable by coincidence. Conflict detection is independent of convergence judgment -- any triggered conflict causes an abort, regardless of whether convergence has been reached.
+- Macro scheduler parameters: scheduler budget `max_inference_steps` (default 16, graceful on exhaustion), safety hard limit `max_inference_steps_hard` (default 64, abort on exhaustion), convergence tolerance `tol`, normalized fusion weight entropy threshold `entropy_threshold` (0.5), relative safety margin offset `safety_margin_relative`, value threshold `value_threshold` (global configuration, passed in by the caller).
+- **Convergence criterion**: vector stability `||z_next - z_current|| < tol` **and** normalized fusion weight entropy `H_norm = H({w_i}) / ln(n_active) < 0.5`. `w_i = 1/(d_i+ε)` is normalized over the **active** nodes of the step; `n_active` is not a fixed 6 or 7, and `n_active=1` gives `H_norm=0`. The dual condition prevents false convergence when fusion weights have not consolidated (multi-lattice ambiguity competition still exists) but the vector happens to be stable by coincidence. Raw nats (`H<0.5`) is not the criterion: it would be unreachable for a 6-way fusion (`ln 6≈1.79`), which was the F-6 defect. Conflict detection is independent of convergence judgment -- any triggered conflict causes an abort, regardless of whether convergence has been reached.
 - **Hard abort principle**: any conflict detected -> HALT_AND_ALERT() -> immediate stop. No backtracking, no rerouting, no down-weighting fusion, no attempted self-repair. All conflicts are equally fatal; there is no distinction between "recoverable" and "unrecoverable". **beta_penalty soft penalty has been removed** -- safety violations are no longer handled through fusion weight decay, but are uniformly adjudicated by hard abort.
-- **Step limit handling**: `max_steps` serves as a scheduler-level hard limit; after the loop ends naturally, HALT_AND_ALERT is triggered, not conflated with other logical conflicts.
+- **Step limit handling**: the scheduler budget `max_inference_steps=16` is **not** a safety limit. Exhausting it returns the current `z_cur` gracefully (`ret=0`), so deployment still produces a token. Only the safety hard limit `max_inference_steps_hard=64` triggers `HALT_AND_ALERT` and returns `CONFLICT_ABORT_TOKEN`. The loop length is `min(budget, hard)`. Convergence failure is a normal state, not a safety conflict.
 - **User-visible alerts**: each abort generates a structured alert (source, type, detail, step, timestamp), with persistent logging + callback notification + full trace saving.
 - **Intrinsic motivation bound by safety**: local curiosity drives retrieval, global improvement drive pushes reasoning depth, but both are truncated by the Three Laws safety margin.
 - All intermediate states during inference (graph topology, primitive execution traces, value signal history, safety interception records) can be externally accessed for interpretability analysis.

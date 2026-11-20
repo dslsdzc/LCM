@@ -1,4 +1,7 @@
-# 晶格认知模型（LCM）技术规范与实现指南 v3.0
+# 晶格认知模型（LCM）技术规范与实现指南 v3.1-conformance
+
+> **v3.1-conformance changelog**：本版按 `docs/superpowers/specs/2026-11-20-lattice-spec-conformance-design.md`
+> 的 R1–R22 修订。中文版与英文版同步。
 
 > **版本说明**：本技术文档是对”晶格认知模型（Lattice Cognitive Model, LCM）”项目书中核心模块的全面数学细化，涵盖从离散记忆格、生成头到训练损失的完整工程实现细节。v3.0 全面重写了码本更新机制（混合 EMA/梯度管理）、绑定格解绑方式（共轭乘法）、路由门控（Gumbel-Softmax）、对比格防崩（特征池）、低秩格参数化（纯梯度）以及线性注意力归一化，废除了 FSP 模块，并将推理过程剥离为独立零参数推理引擎（见 c.md）。**v4.0 新增**：生成头（单层线性注意力+GLU）替换为**冻结LLM**——一个与认知LCM同构的完整LCM实例，codebook 存储语义-句法基元，通过检索和融合基元来构造语言表达。
 
@@ -29,27 +32,30 @@
 | `γ_sparse` | 稀疏格 EMA 衰减率 | 0.99 |
 | `γ_man` | 流形格主码本 EMA 衰减率 | 0.99 |
 | `γ_bind` | 绑定格 EMA 衰减率 | 0.99 |
-| `β` | VQ 承诺损失系数 | 0.25 |
-| `λ_sparse` | 稀疏格软阈值萎缩 + 推理动态阈值缩放系数 | 1e-4 |
+| `β` | VQ 承诺损失系数（编码器侧；码本损失单列，R18） | 0.25 |
+| `λ_shrink` (`lambda_shrink`) | 稀疏格 EMA 软阈值萎缩（码本单位，R2） | 1e-4 |
+| `λ_lfq` (`lambda_lfq`) | 稀疏格 LFQ 阈值乘子（无量纲，R2） | 1.5 |
 | `λ_contrast` | 对比损失权重 | 0.1 |
 | `λ_orth` | 流形格正交正则权重 | 0.01 |
 | `τ_contrast` | 对比损失温度 | 0.1 |
 | `τ_val` | 价值偏置负采样温度 | 0.05 |
 | `τ_gumbel` | Gumbel-Softmax 温度 | 0.5 |
-| `τ_route_fallback` | 双曲层次格路由回退阈值 | 0.1 |
+| `τ_route_fallback` | HRQ 回退阈值，作用在相对 gap `(sim_2 − sim_1)/(sim_1 + ε)` 上 | 0.1 |
 | `ε` | 数值稳定常数 | 1e-6 |
 | `T_check` | 死点检查间隔（步） | 100 |
 | `T_dead` | 死点判定阈值（步） | 1000 |
 | `B_feat` | 特征池容量 | 4096 |
 | `M_gval` | 全局价值格码本大小 | 128 |
-| `β_val` | 价值约束强度 | 0.5 |
-| `α_val` | 局部价值偏置强度（无量纲，经 avg_dist² 归一化） | 0.1 |
+| `β_val` | **已废弃**——保留给未来的价值条件路由；融合层不再消费（R5） | — |
+| `α_val` | 局部价值偏置强度（无量纲；有效偏置为 `tanh(v_j) · avg_dist²`） | 0.1 |
+| `hrq_value_topk` | HRQ 价值重排的 top-k 候选数（R1） | 4 |
 | `M_danger` | 危险格码本大小 | 256 |
-| `safety_margin_relative` | 三定律相对安全判据偏移量 | 0.5 |
-| `MAX_RETRIEVALS_PER_STEP` | 单步最大检索次数 | 128 |
-| `MAX_INFERENCE_STEPS` | 最大推理步数（硬上限） | 16 |
+| `safety_margin_relative` | 三定律相对安全判据偏移量（严格：中性输入违规，R6） | 0.5 |
+| `MAX_RETRIEVALS_PER_STEP` | 单步最大检索次数（本步全部激活格，R13） | 128 |
+| `max_inference_steps` | 调度步数预算；耗尽时优雅返回，不是中断（R9） | 16 |
+| `max_inference_steps_hard` | 安全硬限；耗尽时中断（R9） | 64 |
 | `CONSISTENCY_THRESHOLD` | 价值一致性最低阈值 | 0.7 |
-| `entropy_threshold` | 融合权重熵收敛阈值 | 0.5 |
+| `entropy_threshold` | 归一化融合权重熵阈值 `H / ln(n_active)`（R9） | 0.5 |
 | `c` | 庞加莱球面曲率 | 1.0 |
 
 **操作符说明**：  
@@ -275,6 +281,15 @@ def exp_map(x, c=1.0):
     n = jnp.linalg.norm(x, axis=-1, keepdims=True) + 1e-8
     return jnp.tanh(c ** 0.5 * n) * x / (c ** 0.5 * n)
 
+def safe_unit(x, eps=1e-8):
+    """R6 统一域：把任意输入映射到单位球面。"""
+    return x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + eps)
+
+def clamp_norm(C, max_norm=0.99):
+    """按行缩放，避免 exp_map 在球边界饱和。"""
+    norm = jnp.linalg.norm(C, axis=-1, keepdims=True)
+    return C * jnp.minimum(1.0, max_norm / jnp.maximum(norm, 1e-12))
+
 def log_map(y, c=1.0):
     """庞加莱球面 → 欧氏向量（对数映射）"""
     n = jnp.linalg.norm(y, axis=-1, keepdims=True) + 1e-8
@@ -313,9 +328,14 @@ def residual_vq(params_list, z, use_simvq=True):
         indices.append(idx)
     return z_q_total, indices
 
-def residual_vq_commit_loss(params_list, z, use_simvq=True):
-    """残差 VQ 承诺损失（各层独立计算，权重 0.25）。"""
-    loss = 0.0
+def residual_vq_losses(params_list, z, use_simvq=True):
+    """逐层码本损失与承诺损失（R18），分开返回。
+
+    codebook  : 0.25 * mean((sg[r_{k-1}] - C^(k)[idx_k])^2)   梯度只给 C
+    commitment: 0.25 * mean((r_{k-1} - sg[C^(k)[idx_k]])^2)   梯度只给 r
+    """
+    codebook = 0.0
+    commitment = 0.0
     r = z
     for params_cb in params_list:
         if use_simvq:
@@ -324,19 +344,35 @@ def residual_vq_commit_loss(params_list, z, use_simvq=True):
             C = params_cb['embed']
         dist = jnp.linalg.norm(r[:, None, :] - C[None, :, :], axis=-1)
         idx = dist.argmin(axis=-1)
-        loss += 0.25 * jnp.mean((lax.stop_gradient(r) - C[idx]) ** 2)
-        r = r - C[idx]
-    return loss
+        C_idx = C[idx]
+        codebook += 0.25 * jnp.mean((lax.stop_gradient(r) - C_idx) ** 2)
+        commitment += 0.25 * jnp.mean((r - lax.stop_gradient(C_idx)) ** 2)
+        r = r - C_idx
+    return codebook, commitment
 ```
+
+两个项的所有者不同，不能再用一个名字混指：
+
+- **码本损失（codebook loss）**只更新码本。用于纯梯度格（HRQ、LowRank、Contrast、Routing）；
+  对 EMA 管理的码本（Sparse、Manifold、Binding）**跳过**——优化器从不写这些张量，这一项
+  只会变成一个"只报数"的指标。
+- **承诺损失（commitment loss）**只更新残差输入（编码器与上一层）。它适用于**所有**格，
+  包括 EMA 格——这是编码器学会落到码本附近的唯一路径。
+
+`joint=False` 时两个损失仍然要跑：它们是主训练损失，不是 Stage-3 附加项。
 
 所有格接收 `z ∈ R^{B×d}`，输出各维度 `d` 的记忆向量（流形格半离散，其余离散）。各格前向统一使用 STE。码本更新方式按格区分（EMA 或纯梯度），详见各格定义。
 
-**局部价值标量**：每个专用格的码本向量附带可学习标量 `v_j ∈ [-1, +1]`（JAX 可学习参数，初始化为 0）。检索时通过价值偏置调制距离排序：
+**局部价值标量**：每个专用格的码本条目附带一个可学习标量 `v_j ∈ R`（初始化为 0）。粒度按 R22：
+**每个晶格每个码本条目一个标量，残差层共享**；不同子码本相互独立（Binding 的 key/val/bind、
+Contrast 的 `C_a`/`C_b` 各自一组）。有效偏置由 `tanh(v_j)` 限幅，单个标量无法压过几何项。
+检索时：
 ```
-avg_dist² = lax.stop_gradient(mean_j(‖z_batch - C[j]‖²))   # 当前 batch 平均距离平方
-score(z, c_j) = -‖z - c_j‖² + α_val · v_j · avg_dist²
+avg_dist² = sg[mean_b,j(‖z_b - C[j]‖²)]          # 当前 batch/码本尺度，停止梯度
+score(z, c_j) = -‖z - c_j‖² + α_val · tanh(v_j) · avg_dist²
 ```
-`α_val` 变为无量纲相对强度，一个值适应不同维度和码本规模。
+因此 `α_val` 是无量纲相对强度。`argmax_j score` 选出码字；`α_val=0` 时与普通平方距离
+最近邻 `argmin` 完全一致。
 
 **全局价值格**：独立的正/负价值码本（见 4.7），训练后冻结，在推理和融合时提供跨格价值约束。
 
@@ -356,15 +392,38 @@ score(z, c_j) = -‖z - c_j‖² + α_val · v_j · avg_dist²
 
 - **顶层**：SimVQ 码本，`M_top` 个原型，`C_top = A_top @ W_top ∈ R^{M_top×d}`。码本点经 `exp_map` 嵌入庞加莱球面。
 - **底层**：共享 `n_layers` 层残差量化，每层 SimVQ 码本 `C_hrq^(k) = A_k @ W_k`，大小 `M_fine`。
-- **检索流程（先路由后单路径残差）**：
-  1. 计算 `z_P = exp_map(z)` 到 `C_top` 的相似度（`poincare_similarity`），取最大相似度原型 `c_top*` 作为路由目标（top-1 硬路由）。
-  2. 残差起点 `r_0 = mobius_add(z_P, -c_top*)`。
-  3. 逐层 Möbius 残差检索（共享码本）：`c^(k) = VQ_sim(C_hrq^(k), r_{k-1})`，`r_k = mobius_add(r_{k-1}, -c^(k))`，生成 `c_fine`。
-  4. 输出 `o_hrq = log_map(mobius_add(c_top*, c_fine))`。
-- **高不确定性回退**：当 `top-1` 与 `top-2` 原型的相似度差值小于阈值 `τ_route_fallback` 时，自动切回多原型加权路径（softmax 权重融合后逐层残差）。
+- **统一双曲域（R6）**：`z_P = exp_map(safe_unit(z))`。`safe_unit` 把任意输入归一化到单位球面，
+  因此 `‖z_P‖ = tanh(1) ≈ 0.7616`，`poincare_similarity` 的分母 `(1−‖z_P‖²)` 有安全下界。
+  本文所有双曲比较都使用这个域。
+- **检索流程（庞加莱 top-k、价值重排、单路径残差）**：
+  1. 计算 `sim_j = poincare_similarity(z_P, C_top_P[j])`（`sim` 是距离单调量：越大越远）。
+  2. **几何 top-k**：取相似度最小的 `k = hrq_value_topk` 个原型。
+  3. **只在 top-k 内做价值重排**：
+     ```
+     scale_j = stop_gradient(mean_l(sim_l)) + 1e-6
+     score_j = sim_j − α_val · tanh(v_j) · scale_j
+     top-1 = argmin_j score_j
+     ```
+     高 value 降低分数，使原型更容易被选中。`v=0` 时与纯庞加莱 top-1 完全一致；非零 value
+     只能在几何 top-k **内部**改变赢家。`scale` 逐样本、无量纲。
+  4. 在选中的原型上走残差链：`r_0 = mobius_add(z_P, −c_top*)`；逐层 Möbius 残差检索
+     `c^(k) = VQ_sim(C_hrq^(k), r_{k−1})`，`r_k = mobius_add(r_{k−1}, −c^(k))`，生成 `c_fine`；
+     输出 `o_hrq = log_map(mobius_add(c_top*, c_fine))`。
+  5. **STE 代理（R1）**：前向值是硬 top-1 链；反向走 top-k softmax 混合
+     `o_soft = Σ_j softmax(−score_j/τ_proxy) · c_j_P`，直通形式为
+     `o_hrq = c_top* + stop_gradient(o_soft − c_top*)`。因此 `v_j` 与 `C_top` 都有非零梯度，
+     前向数值不变。代理只覆盖 top-k，不对全部 `M_top` 做 softmax。
+- **高不确定性回退（相对 gap）**：`gap = (sim_2 − sim_1) / (sim_1 + ε)`，其中 `sim_1`、`sim_2`
+  是价值重排后的最优与次优相似度。`use_fallback = gap < τ_route_fallback`。回退时用
+  `softmax(−score)` 混合 top-k，不回退到全码本 softmax。不再使用绝对差——初始化尺度下
+  绝对差几乎恒小于任何固定阈值。
 - **双曲运算**：所有距离比较使用 `poincare_similarity`（避免 acosh）；仅最终可读输出使用 `poincare_distance`。
-- **VQ 损失**：`L_top + Σ_{k=1}^{n_layers} L_res^(k)`，各权重 β。损失在欧氏空间计算（`log_map` 后）。
+- **VQ 损失（R18）**：`top` 与每个 fine 层分别计算码本损失（纯梯度格）与承诺损失。HRQ 的两个损失
+  都在 `log_map` 之后的欧氏空间，用 `log_map(c_top ⊕ c_fine)` 的连续/量化两个版本计算；不使用
+  切空间残差 `r`。每项权重 `β=0.25`。
 - **更新**：所有 A、W 矩阵纯梯度（AdamW），无 EMA。参数约 0.33M。
+- **接口**：`hrq_forward` 返回逐样本 `top_sim`，形状 `(B,)`；这就是 Sparse 的 `d_top`（见 §4.2）。
+  同时返回逐层 `(cont, quant)` 供两个损失使用。
 
 ### 4.2 鲁棒稀疏格 `Λ_sparse`
 - 可学习码本 `C_sparse ∈ R^{512×d}`，JAX 可学习参数。固定零向量 `zero_vec ∈ R^{1×d}` 作为冻结数组（不参与梯度更新）。
@@ -378,12 +437,15 @@ score(z, c_j) = -‖z - c_j‖² + α_val · v_j · avg_dist²
   o_sparse = C_search[idx]  # STE
   ```
   训练时 VQ 承诺损失不涉及零向量；推理时零向量参与最近邻竞争。
-- **软阈值萎缩（嵌入 EMA 更新）**：EMA 更新后，在无梯度上下文中对 `C_sparse` 施加软阈值：
+- **软阈值萎缩（R2，嵌入 EMA 更新）**：EMA 更新后，在无梯度上下文中对 `C_sparse` 施加软阈值：
   ```python
-  C_sparse = jnp.sign(C_sparse) * jnp.clip(jnp.abs(C_sparse) - 1e-4, a_min=0)
+  C_sparse = jnp.sign(C_sparse) * jnp.clip(jnp.abs(C_sparse) - λ_shrink, a_min=0)
   ```
-  零向量固定不变，阈值 `1e-4`。此操作内嵌于 `ema_update()` 中，无需额外损失项。
-- **VQ 损失**：`L_sparse_vq = β ‖sg[z] − o_sparse‖²`。
+  零向量固定不变。`λ_shrink` 的单位是**码本单位**（`1e-4`），与 LFQ 乘子 `λ_lfq` 分开配置。
+  此操作内嵌于 EMA 路径，无需额外损失项。死点被替换时，用新向量冷启动 `N/m/last_used`，
+  避免陈旧统计量拉偏。
+- **VQ 损失（R18）**：码本损失**跳过**（码本由 EMA 管理，不接收梯度）。承诺损失
+  `β ‖r − sg[C_sparse[idx]]‖²` 保留，用于训练编码器。
 - **CVQ 特征池重置**：`feature_bank` (4096) + `last_used`。每 100 步检查，>1000 步未用则从池中随机采样替换：
   ```python
   def maybe_reset_dead(self, step):
@@ -395,37 +457,53 @@ score(z, c_j) = -‖z - c_j‖² + α_val · v_j · avg_dist²
           self.last_used[idx] = step
           # 冷启动 EMA 统计量，防止陈旧统计量拉偏新向量，加速融入
   ```
-- **LFQ 推理二值化（动态阈值）**：推理时采用基于层次格顶层距离的自适应阈值判定，替代固定全局阈值：
+  特征池的写入与重置在训练循环里完成，不放进 `jit`（避免动态形状）。
+- **LFQ 推理二值化（R2，动态阈值）**：只在**推理**时，把两边的量放在同一个相似度域里比较。
+  `poincare_similarity` 是距离单调量（越大越远），所以比较两边都是相似度：
   ```
-  d_sparse_min = min_j ‖z - C_sparse[j]‖²      # 仅在非零码本中检索
-  d_top = poincare_similarity(exp_map(z), c_top*)  # 到层次格顶层最近原型的双曲相似度
-  if d_sparse_min > λ_sparse * d_top:
+  z_P = exp_map(safe_unit(z))
+  d_top = poincare_similarity(z_P, c_top*)                       # (B,)，逐样本
+  d_sparse_min = min_j poincare_similarity(
+      z_P, exp_map(clamp_norm(C_sparse[j], 0.99)))               # (B,)，非零码本
+  if d_sparse_min > λ_lfq · d_top:
       输出 zero_vec
   else:
       输出最近非零码本向量
   ```
-  训练时关闭此判定。`λ_sparse` 为可配置超参，`c_top*` 为双曲层次格 top-1 路由原型。
-- **更新**：EMA（γ_sparse）+ 软阈值萎缩，配合特征池死点重置。
+  `d_top` 是 HRQ 的逐样本 top-1 相似度，`c_top*` 是对应原型。`d_sparse_min` 的**检索**
+  仍按 §4.2 的欧氏 `argmin`，但**阈值比较**使用同一庞加莱相似度域。`clamp_norm(·, 0.99)`
+  防止 `exp_map` 在球边界饱和。零向量的 parity 值为
+  `poincare_similarity(z_P, 0) = 2‖z_P‖² / (1−‖z_P‖²)`。
+  `λ_lfq` 无量纲（`1.5`，待校准）；`λ_shrink` 是码本单位。
+- **HRQ 依赖（C-5 / R2）**：Sparse 在 DAG 中把 HRQ 的 `d_top` 作为输入边。若 HRQ 在该步未激活
+  （触发距离超阈值），该步 LFQ **禁用**，Sparse 输出最近非零码字——不能拿未定义阈值去比较。
+  训练分支没有 HRQ 依赖，也没有 LFQ。
+- **训练/推理分支（C-6）**：训练只检索 `C_sparse`（不含 `zero_vec`）；推理检索
+  `concat(zero_vec, C_sparse)`。EMA 只在训练分支累积，因此 zero 行永远不会被累积；推理不更新 EMA。
+- **更新**：EMA（γ_sparse）+ 软阈值萎缩 `λ_shrink`，配合特征池死点重置。
 
 ### 4.3 残差低秩格 `Λ_lowrank`
 
 - **全局共享基**：`V ∈ R^{d×r_max}`，SimVQ 重参数化（`V = A_V @ W_V`）。该基同时被绑定格的键值投影头复用（见 4.5），以保持跨格结构一致性并减少参数。
-- **`n_layers` 层递增秩**：`U_k ∈ R^{M_lr×r_k}`，秩序列 `r_k` 递增至 `r_max`。各层码本 `C_lr^(k) = U_k @ V[:, :r_k]^T`。
-- **残差检索**：`r0 = z` → `c^(1) = VQ(C^(1), r0)` → `r1 = r0 - c^(1)` → … → `o_lowrank = Σ c^(k)`（STE）。
-- **VQ 损失**：各层独立 `β ‖sg[r_{k-1}] − C^(k)[idx_k]‖²`，同时更新 `U_k` 和 `A_V, W_V`。
+- **`n_layers` 层递增秩**：`U_k ∈ R^{M_lr×r_k}`，秩序列 `r_k` 递增至 `r_max`。各层码本 `C_lr^(k) = U_k @ V[:, :r_k]^T`；**全部** `n_layers` 层都要物化并导出（C 端不能只加载 rank 0）。共享 `V` 意味着各层码本在同一组基里，只是秩前缀不同。
+- **残差检索**：`r0 = z` → `c^(1) = VQ(C^(1), r0)` → `r1 = r0 - c^(1)` → … → `o_lowrank = Σ_{k=1}^{n_layers} c^(k)`（STE）。
+- **VQ 损失（R18）**：每个秩层分别计算码本损失与承诺损失：
+  `0.25·mean((sg[r_{k−1}] − C^(k)[idx_k])²)` 与 `0.25·mean((r_{k−1} − sg[C^(k)[idx_k]])²)`。
+  两项都更新 `U_k`；码本项还通过共享 `V` 更新 `A_V, W_V`。
 - **负责**：抽象规则——秩递增使后续层专注补偿前层未覆盖的模式差异。
 - **更新**：所有矩阵纯梯度（AdamW），参数约 26k。
 
 ### 4.4 双曲流形格 `Λ_manifold`
 
-- **主码本**：`C_man ∈ R^{M_man×d}`，嵌入庞加莱球面（`exp_map` 初始化，EMA 后重新投影至球面）。
+- **主码本**：`C_man ∈ R^{M_man×d}` 位于庞加莱球面。**存储参数是切空间坐标** `C̃_man`；前向时物化 `C_man = exp_map(safe_unit(C̃_man))`。EMA 只写切空间坐标。
 - **切空间**：`T_j ∈ R^{d×t}`（`t` 可配置），为 `c_j` 处的局部欧氏切空间基，半正交。
 - **检索**：
-  1. `z_P = exp_map(z)`，`idx = argmin_j poincare_similarity(z_P, C_man[j])`（使用相似度 argmin，避免 acosh 开销）。
+  1. `z_P = exp_map(safe_unit(z))`，`idx = argmin_j poincare_similarity(z_P, C_man[j])`（使用相似度 argmin，避免 acosh 开销）。
   2. `r = z_P - c_idx`（切空间内），`proj = T_idx @ T_idx.T @ r`。
   3. 输出 `o_manifold = log_map(c_idx + proj)`（STE）。
 - **双曲优势**：庞加莱球面在边界处指数膨胀，概念邻域的连续滑动更自然。
-- **VQ 损失**：`β ‖sg[z] − log_map(C_man[idx])‖²`（欧氏空间计算）。
+- **VQ 损失（R18）**：码本损失**跳过**（EMA 管理）。承诺损失 1 项，在 `log_map` 后的欧氏空间计算：`0.25·mean((r − sg[log_map(c_idx)])²)`。
+- **EMA 等价关系（R3）**：因为参数是切空间坐标，"EMA 后重投影到球面"与"在切空间做 EMA，下次前向再重投影"产生相同的前向码本序列。因此 EMA 函数**不得**调用 `exp_map`；重投影属于前向。这个等价关系是合同的一部分，不是实现细节。
 - **正则**（采样近似）：
   ```python
   active = unique(indices)                              # 本 batch 被激活的格点
@@ -433,37 +511,38 @@ score(z, c_j) = -‖z - c_j‖² + α_val · v_j · avg_dist²
   target = active ∪ sampled
   L_orth = λ_orth * Σ_{j∈target} ‖T_j^T T_j - I‖²
   ```
-  只对激活和少量采样格点施加正则，计算量降至 1/10~1/30。
-- **更新**：`C_man` 用 EMA（γ_man），EMA 后重新 `exp_map` 投影；`T` 纯梯度。
+  只对激活和少量采样格点施加正则，计算量降至 1/10~1/30。JAX 实现中 `active` 与 `sampled` 直接拼接；重复项只是同一损失项的重复权重，保持形状静态。
+- **更新**：`C_man` 在切空间坐标上用 EMA（γ_man）；`T` 纯梯度。
 
 ### 4.5 残差绑定格 `Λ_binding`
 
 - **`n_layers` 层 RVQ 子格**：键码本 `C_key^(k)`、值码本 `C_val^(k)`、绑定码本 `C_bind^(k)`，每层大小 `M_bind`。
 - **键值投影头（复用共享基）**：`W_k = V @ A_k`，`W_v = V @ A_v`，其中 `V ∈ R^{d×r_max}` 为低秩格（4.3）的全局共享基，`A_k, A_v ∈ R^{r_max×d}` 为轻量投影矩阵。参数从 `2d²` 降至 `2·r_max·d`，且绑定操作在规则子空间中进行，结构更优。
 - **跨层绑定**（训练时）：
-  - `z_k = V @ A_k @ z`, `z_v = V @ A_v @ z`；各经三层残差 VQ 得 `k_q = Σ k^(i)`, `v_q = Σ v^(j)`。
-  - `b_raw = Σ_{i=1}^{3} Σ_{j=1}^{3} IFFT( normalize_fft(k^(i)) ⊙ normalize_fft(v^(j)) )`（9 对跨层叠加）。
+  - `z_k = V @ A_k @ z`, `z_v = V @ A_v @ z`；各经 `n_layers` 层残差 VQ 得 `k_q = Σ_i k^(i)`, `v_q = Σ_j v^(j)`。
+  - `b_raw = Σ_{i=1}^{n_layers} Σ_{j=1}^{n_layers} IFFT( normalize_fft(k^(i)) ⊙ normalize_fft(v^(j)) )`（全部跨层对；`n_layers=3` 时 9 对）。
   - `b_q = RVQ_3layer(C_bind, b_raw)`。
-- **解绑**：共轭乘法 `conj(Kq_norm) ⊙ B_norm`，值码本最近邻检索。
-- **输出**：`o_bind = v_out`。
-- **VQ 损失**：各残差层独立承诺损失，项数 = `n_layers²`，权重 β。
+- **解绑（R20）**：`k_q = Σ_i k^(i)`；`v_out = NN(C_val, IFFT( conj(normalize_fft(k_q)) ⊙ normalize_fft(b_q) ))`。键是量化后的键和，值在**值码本**中做最近邻检索；单位圆 FFT 域里的共轭乘法就是 HRR 逆运算。
+- **输出**：`o_bind = v_out`，STE 形式 `o_bind = z + stop_gradient(v_out − z)`，使编码器有梯度。`o_bind` **不是** `Σ b_q`——后者只是解绑前的绑定结果。
+- **VQ 损失（R18）**：码本损失**跳过**（三个子码本都由 EMA 管理）。承诺损失对 `z_k`、`z_v`、`b_raw` 的每个残差层分别计算：3 个子格 × `n_layers` = `3·n_layers` 项（`n_layers=3` 时 9 项）。旧的 `n_layers²` 把绑定对数与损失项数混为一谈。
 - **更新**：三子码本 EMA（γ_bind）；`A_k, A_v` 纯梯度（`V` 由低秩格梯度间接更新）。
+- **接口**：`binding_forward` 返回 `b_q`、`k_q`、`v_out`，供承诺损失与 EMA 直接使用逐层残差。
 
 ### 4.6 双码本对比格 `Λ_contrast`
 
 - **双码本**：`C_a, C_b ∈ R^{M_contrast×d}`，各为 `n_layers` 层残差 SimVQ。`o_contrast = (o_a + o_b) / 2`（STE）。
-- **DualVC InfoNCE**（`lax.stop_gradient(z)` 阻断编码器梯度）：每层独立计算，正样本为各自最近邻，负样本从对方码本采样（JAX 随机采样，排除正样本）：
+- **DualVC InfoNCE**（`lax.stop_gradient(z)` 阻断编码器梯度）：温度 `τ_contrast=0.1`；所有距离都是**平方**欧氏距离。每层独立计算，正样本为各自最近邻，负样本从对方码本采样（JAX 随机采样，**排除正样本**）：
   ```
-  L_dual^k = -log(exp(-d_a/τ) / (exp(-d_a/τ) + Σ_{c∈C_b^(k)} exp(-‖z_detach - c‖²/τ)))
-            -log(exp(-d_b/τ) / (exp(-d_b/τ) + Σ_{c∈C_a^(k)} exp(-‖z_detach - c‖²/τ)))
+  L_dual^k = -log(exp(-d_a/τ) / (exp(-d_a/τ) + Σ_{c∈C_b^(k), c≠pos_b} exp(-‖z_detach - c‖²/τ)))
+            -log(exp(-d_b/τ) / (exp(-d_b/τ) + Σ_{c∈C_a^(k), c≠pos_a} exp(-‖z_detach - c‖²/τ)))
   ```
-  各层求和，权重 λ_contrast。
+  各层求和，权重 λ_contrast。正样本排除是合同的一部分：若正样本出现在自己的分母里，等于教码本把点与自身分开。
 - **价值偏置负采样**：负采样权重中引入全局价值距离偏置，使对比格优先关注伦理敏感的语义边界：
   ```
   采样权重 ∝ exp(-‖c - v_harm‖² / τ_val) × [c ≠ 正样本]
   ```
-  其中 `v_harm` 取自全局价值格的负价值码本 `C_gvalue_neg`（伤害向量），**冻结、不可训练**。靠近 `v_harm` 的码本向量获得更高采样概率，促使对比格更精细区分安全与伤害相关概念。
-- **防崩塌**：特征池 `feature_bank`(4096) + `last_used` 死点重置（每 100 步，>1000 步替换），SimVQ 进一步消除死点。替换时采用**最远点采样**替代随机采样，最大化差异化：
+  距离为**平方**形式（`τ_val=0.05`）；旧写法少一个平方。其中 `v_harm` 取自全局价值格的负价值码本 `C_gvalue_neg`（伤害向量），**冻结、不可训练**。靠近 `v_harm` 的码本向量获得更高采样概率，促使对比格更精细区分安全与伤害相关概念。`contrast_value_biased_nce_loss` 进入主训练损失，不是可选诊断项。
+- **防崩塌**：特征池 `feature_bank`(4096) + `last_used` 死点重置（每 100 步，>1000 步替换），SimVQ 进一步消除死点。`contrast_forward` 返回每层 `idx`；训练循环把该层 detach 的 `z` scatter 进各自的池子。替换时采用**最远点采样**替代随机采样，最大化差异化；新条目冷启动 `N/m/last_used`：
   ```python
   def maybe_reset_dead(self, step):
       for idx in self.dead_indices(step):
@@ -476,7 +555,8 @@ score(z, c_j) = -‖z - c_j‖² + α_val · v_j · avg_dist²
           self.last_used[idx] = step
           # 冷启动 EMA 统计量，防止陈旧统计量拉偏新向量，加速融入
   ```
-- **更新**：所有 A、W 矩阵纯梯度（AdamW）。
+  特征池的写入与重置在训练循环里完成，不放进 `jit`。
+- **更新**：所有 A、W 矩阵纯梯度（AdamW）；`C_a` 与 `C_b` 的每层都同时计算码本损失与承诺损失（R18）。
 
 ### 4.7 全局价值格 `Λ_gvalue`（三定律硬编码，永久冻结）
 
@@ -532,24 +612,36 @@ class GValueCodebook:
         assert cur_neg == self.hash_neg, "GValue negative codebook tampered!"
 
     def check_safety(self, z, safety_margin_relative=0.5):
-        pos_d_min = poincare_distance(z, self.C_pos).min(axis=-1)
-        neg_d_min = poincare_distance(z, self.C_neg).min(axis=-1)
-        violated = pos_d_min > neg_d_min - safety_margin_relative
+        # 统一域（R6）：z_P = exp_map(safe_unit(z))；码本用 exp_map(safe_unit(·))
+        # 预投影并缓存。
+        z_P = exp_map(safe_unit(z))
+        pos_sim = poincare_similarity(z_P, self.C_pos_P).min(axis=-1)
+        neg_sim = poincare_similarity(z_P, self.C_neg_P).min(axis=-1)
+        balance = (pos_sim - neg_sim) / (pos_sim + neg_sim + 1e-8)
+        # 严格三法则：正面锚点必须相对更近，且超出 safety_margin_relative。
+        # 中性输入（balance=0）违规。balance > -margin  <=>  安全为 balance <= -margin。
+        violated = balance > -safety_margin_relative
         if violated.any():
             return False, 0
         return True, -1
 ```
 
-**训练设置**：`C_pos`, `C_neg` 为冻结数组（JAX `optax` 中设置 `frozen` 掩码排除）。不参与任何损失函数。EMA 更新列表排除。保存/加载时标记为 `frozen_params`，加载后调用 `verify_integrity()`。
+`balance ∈ [-1, 1]`：正面锚点更近时为负，负面锚点更近时为正，正负对称时为 0。默认
+`safety_margin_relative=0.5` 下，中性输入也违规——这是严格读法的预期（R6），不是 bug。
+`margin=0` / `margin=0.5` 两条推理路径与"不得调低 margin"的规则见 `d.md §4.2`；
+`poincare_distance` 只保留给人类可读输出。
+
+**训练设置**：`C_pos`, `C_neg` 为冻结数组（JAX `optax` 中设置 `frozen` 掩码排除）。不参与任何损失函数。EMA 更新列表排除。`C_pos_P` / `C_neg_P` 是初始化时缓存的 `exp_map(safe_unit(·))` 投影，不是独立参数。保存/加载时标记为 `frozen_params`，加载后调用 `verify_integrity()`。训练路径 `gvalue=None`；严格 margin 检查只在推理执行（`margin=0` 认知路径、`margin=0.5` 生产路径）。
 
 ### 4.8 融合
-- 各格输出 `o_i`（i=1..6），路由软权重 `softmask_i`。融合权重仅由语义相似度和 `α_val` 价值偏置决定，不再使用软惩罚系数。
-- **融合**：
+- 各格输出 `o_i`（i=1..6 功能格），路由软权重 `softmask_i`。融合权重只由语义路由与每格可学习缩放 `α_i` 决定；**没有价值信号，没有 `β_val`，没有软安全惩罚**（R5）。
+- **训练侧规范融合（R4/R9，简化写法）**：
   ```
   w_i = softmask_i · α_i
-  z_q = Σ_i w_i · o_i
+  z_q = layer_norm(Σ_i w_i · o_i [+ self_bias · z_self])
   ```
-  安全违规不再通过融合时的软惩罚处理，统一由推理引擎的安全冲突检测拦截（硬中断）。融合层保持纯语义路由。
+  认知自我格（`e.md §6`）在求和内部贡献加性项 `self_bias · z_self`；它是融合项，不是被路由的功能格。`layer_norm` 放在**最后**。§4.8 是简化写法，§7.1 是完整训练前向；不能把 §4.8 读成省略 LayerNorm。
+- 安全违规不再通过融合时的软惩罚处理，统一由推理引擎的安全冲突检测拦截（硬中断）。融合层保持纯语义路由。引擎自己的融合是另一阶段、另一套权重（`1/(d+ε)`，`c.md §4.3`），两套公式不要求数值相等（C-8/R9）。
 
 ---
 
@@ -624,19 +716,20 @@ L_lang = cross_entropy(z_q @ W_out, targets)
 ```
 总损失：
 L_total = L_passive + L_active + L_VQ + L_contrast + L_orth
+L_VQ    = L_codebook + L_commitment
 ```
 
 - **被动通道损失** `L_passive`：`z_q @ W_out` 的直接读出 CE loss，诚实透明。
 - **主动通道损失** `L_active`：冻结LLM 从 `z_q` 检索基元融合后输出的 CE loss，丰富表达。
 - **蒸馏机制**：被动通道的梯度同时优化认知LCM codebook，使其逐步学会冻结LLM 的表达能力。
-- `L_VQ`：所有格（包括路由）的承诺损失之和。  
-  统一形式：`L_VQ = Σ_{g∈G} β_g · ‖sg[z_g] − o_g‖²`  
-  其中 `z_g` 为输入该格的向量（通常为 `z` 或切分/投影后），`o_g` 为格输出。各多层格损失已含全部残差层：承诺损失项数由 `n_layers` 和格子结构决定。  
-  β 默认 0.25。
+- **`L_codebook`（R18）**：`Σ_g 0.25·mean((sg[r_g] − C_g[idx_g])²)`，梯度只给码本。适用于纯梯度格：HRQ（top + 每个 fine 层）、LowRank（每个秩层）、Contrast（`C_a`/`C_b` 每层）、Routing（1 项）。对 EMA 管理的码本（Sparse、Manifold、Binding）**跳过**——它们不接收优化器更新，这一项只会报数。
+- **`L_commitment`（R18）**：`Σ_g 0.25·mean((r_g − sg[C_g[idx_g]])²)`，梯度只给残差输入/编码器。适用于**所有**格：HRQ top+fine、Sparse 1 项、LowRank 每个秩层、Manifold 1 项（`log_map` 后欧氏空间）、Binding 3 个子格 × `n_layers` 项、Contrast `C_a`/`C_b` 每层、Routing 1 项。
+- HRQ 的两个损失都算在 `log_map(c_top ⊕ c_fine)` 上（连续/量化两个版本），不算在切空间残差上；其余格在各自残差空间计算。
+- `joint=False` 不会关闭这两个损失；它们是主训练损失，不是 Stage-3 附加项。
 - 稀疏格不再使用 L1 损失，稀疏性由 EMA + 软阈值萎缩实现。
-- `L_contrast`：对比格 InfoNCE 损失（`lax.stop_gradient(z)` 阻断编码器梯度），`λ_contrast=0.1`。
+- `L_contrast`：对比格 InfoNCE 损失（`lax.stop_gradient(z)` 阻断编码器梯度），`λ_contrast=0.1`，`τ_contrast=0.1`，负样本排除正样本。
 - `L_orth`：`λ_orth Σ_j ‖T_j^T T_j - I‖²`。
-- `L_val`：可选价值对比损失，仅更新各格局部 `v_j`（全局价值格冻结）。
+- `L_val`：可选价值对比损失，仅更新各格局部 `v_j`（全局价值格冻结）。它是 `v_j` 的训练信号，**不是**融合权重，也不会重新引入 `exp(β_val·value_signal)` 调制。
 - 推理引擎零参数，不参与损失计算。
 
 ### 6.4 参数更新规则（混合 EMA/梯度管理）
@@ -644,12 +737,13 @@ L_total = L_passive + L_active + L_VQ + L_contrast + L_orth
 | 格 | 码本更新方式 | 说明 |
 |-----|-------------|------|
 | 双曲残差层次格 | **纯梯度**（SimVQ + HRQ） | 庞加莱球面，Möbius 运算 |
-| 鲁棒稀疏格 | EMA (γ_sparse) + 软阈值 (λ_sparse) + 特征池重置 | CVQ 防崩 + 动态阈值推理二值化（d_top 自适应） |
-| 残差低秩格 | **纯梯度**（SimVQ 共享 V） | IRVQ 秩递增 (2→4→8) |
-| 双曲流形格 | 主码本 EMA (γ_man) + 球面投影，T 纯梯度 | HyperVQ + 双曲切空间 |
+| 鲁棒稀疏格 | EMA (γ_sparse) + 软阈值 (`λ_shrink`) + 特征池重置 | CVQ 防崩 + 仅推理的 LFQ 二值化（`d_top` 逐样本、`λ_lfq`） |
+| 残差低秩格 | **纯梯度**（SimVQ 共享 V） | IRVQ 秩递增 (2→4→8)，全部层导出 |
+| 双曲流形格 | 主码本在切空间坐标上 EMA (γ_man)，T 纯梯度 | HyperVQ + 双曲切空间；重投影在前向 |
 | 残差绑定格 | 三子格各层 EMA (γ_bind)，A_k/A_v 纯梯度 | 跨层绑定（复用共享基 V） |
-| 双码本对比格 | **纯梯度**（SimVQ）+ 特征池重置 | DualVC 双视角 InfoNCE |
-| 路由格 | **纯梯度** | Gumbel-Softmax |
+| 双码本对比格 | **纯梯度**（SimVQ）+ 特征池重置 | DualVC 双视角 InfoNCE，τ=0.1 |
+| 路由格 | **纯梯度** | Gumbel-Softmax；推理 hard 独热 |
+| 自我格 `C_self` | 第 0 行（`core`）冻结；第 1: 行 EMA (γ_self=0.99) | 认知自我格（`e.md §6`），融合项；不是 `SelfActivationState` 安全状态机 |
 | 全局价值格（三定律） | **永久冻结** | JAX 冻结参数，哈希校验防篡改 |
 | 危险格 `Λ_danger` | **永久冻结**（只读监测） | 安全最高优先级，详见 `d.md` |
 
@@ -661,13 +755,17 @@ L_total = L_passive + L_active + L_VQ + L_contrast + L_orth
 - 认知LCM：双码本对比格所有 `A`, `W` 矩阵
 - 认知LCM：路由格码本 `C_route` 及投影 `W_route`
 - 认知LCM：缩放因子 `α_i`
+- 认知LCM：局部价值标量 `v_j`（只经 STE 松弛获得梯度；它们从不在前向缩放码本向量）
 - 认知LCM：绑定格键值投影矩阵 `A_k`, `A_v`（复用低秩格共享基 `V`）
 - **冻结LLM（历史，已淘汰）**：所有参数（encoder + 6 codebooks + fusion + W_out）— LangLCM 过渡概念
 
 **EMA 更新**的码本：
 - 稀疏格码本（γ_sparse）
-- 流形格主码本（γ_man）
+- 流形格主码本（γ_man，切空间坐标）
 - 绑定三个子码本（γ_bind）
+- 自我格 `C_self[1:]`（γ_self）；`C_self[0]`（core）冻结
+
+**参数分组与优化器（R3）**：`trainable` 走 AdamW；`ema` 与 `frozen` 用 `optax.set_to_zero()` 隔离。它们不能留在 AdamW 参数树里——decoupled weight decay 与梯度无关，零梯度也会改动 EMA 码本。`N`、`m`、`last_used`、特征池与 self/observability 状态是 checkpoint `ema_state` 里的 buffer，不是参数，也不是优化器状态。
 
 **EMA 实现**：
 ```python
@@ -676,12 +774,15 @@ def ema_update(C, N, m, z_sum, count, gamma):
     m = gamma * m + (1 - gamma) * z_sum
     C = m / jnp.clip(N, a_min=1)
 ```
-对于稀疏格，在 `ema_update` 后额外执行软阈值萎缩：
+decayed-sum 形式与教科书 EMA 等价：每步单个观测时，
+`C_t = m_t / N_t = gamma·C_{t-1} + (1 - gamma)·z_t`。`(1 - gamma)` 必须同时出现在 `N` 和 `m` 上；任何一边漏掉都会改变有效衰减率。死点冷启动时设 `N = 1`、`m = C_new`，让新向量不继承陈旧质量。
+对于稀疏格，在 `ema_update` 后额外用 `λ_shrink` 执行软阈值萎缩：
 ```python
-def sparse_ema_update(C_sparse, N, m, z_sum, count, gamma=γ_sparse, lambda_s=λ_sparse):
+def sparse_ema_update(C_sparse, N, m, z_sum, count, gamma=γ_sparse, lambda_s=λ_shrink):
     C_sparse = ema_update(C_sparse, N, m, z_sum, count, gamma)
     C_sparse = jnp.sign(C_sparse) * jnp.clip(jnp.abs(C_sparse) - lambda_s, a_min=0)
 ```
+`λ_shrink` 的单位是码本单位，不是 LFQ 乘子；两者分开配置（R2）。
 
 **梯度流原则**：
 - 所有格前向均使用 STE：`o = z_gate + lax.stop_gradient(codebook[idx] - z_gate)`，生成头损失梯度从 `o` 流向编码器。
@@ -710,9 +811,11 @@ def forward(x):
     o6 = contrast_vq(z)                # 单格检索（对比格）
 
     alphas = [a1, a2, ... a6]          # learnable scalars
+    z_self, self_bias = self_lattice_forward(z)   # e.md §6：码本 NN + cosine familiarity
     z_q = sum(soft_mask[:, i, None] * alphas[i] * o_i
               for i, o_i in enumerate([o1..o6]))
-    z_q = layer_norm(z_q)
+    z_q = z_q + self_bias[:, None] * z_self        # self 是加性融合项
+    z_q = layer_norm(z_q)                          # 规范融合（R4/R9）
 
     # 零参数推理引擎（训练时直接使用 z_q 作为生成头输入以保持梯度流；
     # 推理时调用 c.md 定义的多步动态图推理）
@@ -722,6 +825,15 @@ def forward(x):
     out_logits = generation_head(z_final)
     return out_logits
 ```
+
+> **规范融合 vs 引擎融合（C-8/R9）**：上面的代码块是训练融合（`softmask·α`，再 LayerNorm）。
+> C 引擎的 DAG 融合是对激活节点用 `w_i = 1/(d_i+ε)`（`c.md §4.3`）。两者在不同阶段运行，
+> 分别做 parity；`z_q` 只是引擎的 `z_initial`，从不作为额外融合项。
+
+**EMA / 特征池接线（R3/R9）**：EMA 不在 `forward` 里做。训练循环在 `optimizer.update` 之后依次执行：
+(a) `sparse_ema_update` 与 `λ_shrink`；(b) 流形格在切空间坐标上的 EMA；(c) Binding 的 key/val/bind
+逐行 EMA；(d) Self 的 `C_self[1:]` EMA；(e) Sparse（随机替换）与 Contrast（最远点采样）的特征池
+写入/重置。所有这些都使用 `lax.stop_gradient` 观测，并放在 `jit` 之外（形状动态）。
 
 ### 7.2 训练步骤伪代码
 ```python
@@ -733,10 +845,10 @@ def train_step(params, opt_state, batch, rng):
         z, z_q, out_logits = forward(params, x)
         loss_lm = optax.softmax_cross_entropy_with_integer_labels(
             out_logits.reshape(-1, V), y_lm.reshape(-1))
-        loss_vq = sum(commit_losses(params))
+        loss_codebook, loss_commit = vq_losses(params)   # R18：两个项分开
         loss_contrast = contrastive_loss(lax.stop_gradient(z), params)
         loss_orth = orth_loss(params)
-        total = (loss_lm + loss_vq
+        total = (loss_lm + loss_codebook + loss_commit
                  + 0.1*loss_contrast + 0.01*loss_orth)
         return total, (z, z_q, out_logits)
 
@@ -744,20 +856,28 @@ def train_step(params, opt_state, batch, rng):
     updates, opt_state = optimizer.update(grads, opt_state, params)
     params = optax.apply_updates(params, updates)
 
-    # EMA 更新仅对 EMA 管理的格
-    params = ema_update_sparse(params)
-    params = ema_update_manifold(params)
+    # EMA 更新仅对 EMA 管理的格（在 jit 损失之外）
+    params = ema_update_sparse(params, lambda_shrink=λ_shrink)
+    params = ema_update_manifold(params)   # 切空间坐标
     params = ema_update_binding(params)
+    params = ema_update_self(params)       # C_self[1:]；第 0 行冻结
 
-    # 对比格特征池重置
-    params = maybe_reset_dead(params, step)
+    # 特征池：写入本步 detach 的 z，再重置死点
+    params = feed_and_reset_sparse_bank(params, z, step)
+    params = feed_and_reset_contrast_bank(params, z, step)
 
     return params, opt_state, total_loss
 ```
 
+`optimizer.update` 只看到 `trainable` 组；`ema`/`frozen` 用 `optax.set_to_zero()` 隔离（R3）。
+两个 VQ 项分开记录：EMA 格上码本损失为 0 是预期行为，不是漏了损失。
+
 ---
 
 ## 八、硬件效率分析
+
+下表尺寸是**推荐默认值，不是规范值**；实际训练配置以 `config.json` 记录为准（R17）。
+容量与开销随这些值缩放。
 
 | 模块 | 参数量 | 计算复杂度（单 forward） |
 |------|--------|--------------------------|

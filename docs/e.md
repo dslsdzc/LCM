@@ -1,5 +1,8 @@
 # e — Self-Awareness Research
 
+> **v3.1-conformance changelog**：本版按 `docs/superpowers/specs/2026-11-20-lattice-spec-conformance-design.md`
+> 的 R1–R22 修订。中文版与英文版同步。
+
 ## Overview
 
 LCM's self-awareness is not a philosophical concept, but an engineered **cognitive self-observation and self-modulation** capability. The system forms a layered reflection architecture through multiple independent modules:
@@ -8,9 +11,9 @@ LCM's self-awareness is not a philosophical concept, but an engineered **cogniti
 - **Middle layer**: Narrative memory (`narrative_memory.py`) filters important events, causal subject (`causal_subject.py`) tracks causal relationships between actions and effects
 - **Top layer**: Reflection loop (`reflection_loop.py`) analyzes long-term patterns offline, behavior explorer (`behavior_explorer.py`) learns routing biases through trial and error
 
-These modules do not participate in the real-time inference loop; they read trajectories, generate insights, and modulate parameters — but the inference engine itself remains a stateless pure function. Self-awareness is a **meta-system parasitically layered atop the inference engine**.
+These modules do not participate in the real-time inference loop; they read trajectories, generate insights, and modulate parameters — but the inference engine itself remains a stateless pure function. **One exception: the self lattice (§6) is a real-time fusion item.** It computes `z_self`/`self_bias` from the current `z` on every inference step and enters the fusion sum; the other self-awareness modules (black box, narrative, reflection, causal, behavior) are non-realtime. Self-awareness is a **meta-system parasitically layered atop the inference engine**, plus one fused codebook.
 
-Core constraint: The total computational overhead of all self-observation modules must not exceed 5% of the inference engine, and any self-observation failure must not affect inference correctness.
+Core constraint: the total computational overhead of all self-observation modules must not exceed 5% of the inference engine, and any self-observation failure must not affect inference correctness. **Measurement (R16)**: run the same workload with the modules on and off, take the wall-clock difference divided by the inference time (`time.perf_counter` around module calls), repeat 20 times, and use the median. Summing per-step `step_time_ms` is not a measurement — that is the inference time itself. Exceeding 5% raises a warning; it does not block inference.
 
 ---
 
@@ -48,6 +51,8 @@ Inference Engine (engine.c)
 | Reflection loop | Every N steps (N=200) | High | No (independent thread/coroutine) |
 | Behavior exploration | Every M steps (M=10) | Medium | No (non-jitted call) |
 | Intrinsic motivation reflection | Every 1000 steps | High | No |
+
+**5% overhead measurement (R16)**: with modules on vs off, wall-clock difference divided by inference time, 20 runs, median. Do not sum `step_time_ms`; that is the inference time itself. The self lattice is the only module also present on the real-time fusion path (§6); its cost is part of inference, not of the 5% meta-system budget.
 
 ---
 
@@ -212,40 +217,56 @@ When the causal subject detects sustained high prediction error (10 consecutive 
 3. Lower inference convergence tolerance (allow more steps to explore unknown space)
 4. Record the boundary extension event in narrative memory
 
+> **Conformance note (v3.1, accepted deviation)**: the causal subject's current
+> implementation and validation are **not expanded** in this revision (user decision
+> 2026-11-20). Where this section's counterfactual/boundary-extension behaviour differs from
+> the implementation, the difference is an **accepted deviation**, not a conformance
+> failure. Existing causal tests remain green; the gap is recorded in
+> `docs/lattice-spec-vs-impl-audit-v3.1.md` (D-6).
+
 ---
 
 ## 6. Self Lattice
 
 ### Design Purpose
 
-The self lattice is a special lattice that does not store external knowledge — it stores **prototypes of the system's own historical states**. This allows the system to quickly recognize "what state am I in right now."
+The self lattice is a special lattice that does not store external knowledge — it stores **prototypes of the system's own historical states**. This allows the system to quickly recognize "what state am I in right now." In `v3.1-conformance` it is the **7th fusion item**, not a routed functional lattice; it is also distinct from the safety `SelfActivationState` machine (`d.md §3`).
 
-### Structure
+### Structure (R15)
 
-- Codebook size: `M_self = 64`
-- Dimension: `d` (same as the bottleneck vector)
-- Update method: EMA (`gamma_self = 0.99`)
-- Initial values: sampled from bottleneck vectors output by the encoder during early training
+- Codebook: `C_self ∈ R^{M_self×d}`, `M_self = 64`.
+- **`C_self[0]` is the frozen `core`** identity anchor; it is never written by EMA and is excluded from the optimizer (`frozen` group).
+- **Rows `C_self[1:]` are EMA modes** (`gamma_self = 0.99`), initialized from early encoder bottleneck samples. `ema_update_self` is the only writer, and it never writes row 0.
+- Dimension: `d` (same as the bottleneck vector).
 
 ### Forward Pass
 
 ```
-z_self = nearest_neighbor(z, C_self)  # Euclidean distance, STE gradient
-self_bias = alpha_self x cosine_sim(z, z_self)  # [0, alpha_self]
+idx = argmin_j ||z - C_self[j]||²         # Euclidean, includes row 0
+z_self = C_self[idx]                      # STE: forward = exact row, d/dz = identity
+cosine = clip(cos(z, z_self), 0, 1)
+self_bias = alpha_self * max(0, cosine)   # in [0, alpha_self]
 ```
+
+`z_self` is the selected codebook row; the codebook side is stop-gradient (EMA is its only
+writer), while the straight-through path keeps encoder/commitment gradients alive. The
+familiarity is cosine-based, not a learned score. `mode_activation` may remain as an
+additional diagnostic, but it does **not** select `z_self`; `world_dev` remains a
+safety/self-observation signal.
 
 ### Role in Fusion
 
-The `self_bias` output from the self lattice serves as a bias term in the fusion stage:
+`self_bias` is an additive term **inside** the canonical fusion sum, before LayerNorm:
 
 ```
-z_fused = sum_i (w_i x z_i) + self_bias x z_self
+z_q = layer_norm(Σ_i w_i · o_i + self_bias · z_self)
+w_i = softmask_i · alpha_i
 ```
 
-- When the system is in a familiar state (high self_bias), the self lattice contributes more
-- When the system is in an unfamiliar state (low self_bias), the self lattice contributes little
-
-This creates a **familiarity modulation**: the system is more confident on familiar cognitive paths and relies more on external retrieval in unfamiliar territory.
+- When the system is in a familiar state (high `self_bias`), the self lattice contributes more.
+- When the system is in an unfamiliar state (low `self_bias`), the self lattice contributes little or nothing (`max(0,·)` makes the contribution non-negative).
+- The LayerNorm position is the same as `b.md §7.1` (R4); the self term does not add, move, or remove the LayerNorm.
+- This creates a **familiarity modulation**: the system is more confident on familiar cognitive paths and relies more on external retrieval in unfamiliar territory.
 
 ---
 
@@ -276,22 +297,21 @@ Level 2 (Slow, Metacognition)
                       |
 Level 1 (Medium-speed, Cognitive Modulation)
   +-------------------------------------------------------------+
-  | Causal Subject    Behavior Explorer   Self Lattice          |
-  | Causal Tracing    Parameter           Familiarity           |
-  |                   Perturbation        Detection             |
+  | Causal Subject    Behavior Explorer                         |
+  | Causal Tracing    Parameter Perturbation                    |
   +-------------------------------------------------------------+
                       ^ Event Stream   v Modulation Signals
                       |
 Level 0 (Fast, Cognitive Execution)
   +-------------------------------------------------------------+
-  | Inference Engine  Black Box          Prediction Cache       |
-  | Zero-parameter    Trajectory         (z, sig) Reuse         |
-  | DAG               Recording                                 |
+  | Inference Engine   Self Lattice    Black Box    Prediction  |
+  | Zero-parameter     Familiarity     Trajectory   Cache       |
+  | DAG                (fusion item)   Recording    (z,sig)     |
   +-------------------------------------------------------------+
 ```
 
-- **Level 0**: Real-time inference + raw recording. Zero-parameter, stateless, pure function.
-- **Level 1**: Real-time modulation based on recent history (~200 steps). Stateful, lightweight.
+- **Level 0**: Real-time inference + raw recording. Zero-parameter, stateless, pure function. The self lattice's `C_self`-NN and `self_bias` are computed here every step and enter the fusion sum (§6); it is the one self-awareness module on the real-time path.
+- **Level 1**: Real-time modulation based on recent history (~200 steps). Stateful, lightweight. Causal subject and behavior explorer are non-realtime meta-modules; they do not produce `z_self`.
 - **Level 2**: Offline analysis based on long-term history (~10000 steps). Asynchronous, heavyweight.
 
 Each layer can only read the outputs of lower layers; there is no reverse interference. Level 2's suggestions must pass through Level 1's "safety filter" before reaching Level 0. This prevents the metacognitive layer from directly manipulating the inference engine.

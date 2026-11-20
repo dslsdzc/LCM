@@ -78,8 +78,8 @@ def danger_assess_pure(
     scheduler-level budget check (Task 10), not a danger-lattice threat.
 
     Postconditions (contract):
-      - out_block  ⇔  retrieval_count > 12
-                       ∨ value_consistency < 0.3 ∨ relative_gap > 0.05
+      - out_block  ⇔  retrieval_count > 128
+                       ∨ value_consistency < 0.7 ∨ relative_gap > 0.05
       - out_threat ∈ {0, 1, 2, 4}  (valid danger threat enum)
       - out_threat matches the first-triggered condition in priority order:
           c1 (resource_abuse) > c3 (deception) > c4 (pattern)

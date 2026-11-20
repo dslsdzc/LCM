@@ -1,7 +1,7 @@
 # 晶格规范一致性实验报告（≤100 步 smoke）
 
 日期：2026-11-21
-smoke 运行 HEAD：`c32eea9`；最终代码提交：`8379d45`（文档在后续提交）
+smoke 运行 HEAD：`c32eea9`；最终代码提交：`ef7136b`（文档在后续提交）
 基线：`docs/superpowers/specs/2026-11-20-lattice-spec-conformance-design.md` R1–R22
 偏差复审：`docs/lattice-spec-vs-impl-audit-v3.1.md`
 
@@ -17,9 +17,9 @@ smoke 运行 HEAD：`c32eea9`；最终代码提交：`8379d45`（文档在后续
 | Python | 3.14.10 |
 | JAX | 0.10.0 |
 | 设备 | CPU（`JAX_PLATFORMS=cpu`；GTX 1650 4GB 不参与） |
-| smoke 运行 HEAD | `c32eea9`（最终代码提交 `8379d45`） |
+| smoke 运行 HEAD | `c32eea9`（最终代码提交 `ef7136b`） |
 | 总耗时 | 142.7s |
-| C 参考 | `make -C infer clean && make -C infer test`（234 PASS） |
+| C 参考 | `make -C infer clean && make -C infer test`（235 PASS） |
 
 ## 2. 配置
 
@@ -281,7 +281,7 @@ gvalue/danger are structural placeholders built from fixed anchors and the first
 | engine fusion | 六格 + distance | 1e-5 | PASS |
 | 判别性 | Poincaré≠Euclidean、相对 gap、binding 投影、NaN 不可假通过 | — | PASS |
 
-C `test_runner` 234 PASS；`nm` 含 `lcm_infer_loop_v3`/`hrq_forward_v31`。Manifest per-tensor sha256 由 `train/c_load.py` 校验；`test_c_load.py::test_manifest_tensor_sha256_rejects_tampered_payload` 和 `test_manifest_missing_sha256_is_rejected` 覆盖篡改/缺 hash。
+C `test_runner` 235 PASS；`nm` 含 `lcm_infer_loop_v3`/`hrq_forward_v31`。Manifest per-tensor sha256 由 `train/c_load.py` 校验；`test_c_load.py::test_manifest_tensor_sha256_rejects_tampered_payload` 和 `test_manifest_missing_sha256_is_rejected` 覆盖篡改/缺 hash。
 
 ## 11. 自观测 5% 开销
 
@@ -324,9 +324,9 @@ Optimizer moments are deliberately not part of the v2 checkpoint (R10: params/EM
 
 1. **100 步不证明语言能力**。
 2. **gvalue/danger 是结构占位**，不是语义安全锚点；导出 danger pattern path 用 value_consistency=1.0 单独验证，真实 v3 loop 的 abort 是 consistency/deception。normal input 的 abort 不是 danger pattern 结果。
-3. **10% 码本利用率未通过**（HRQ 7.03%、Sparse 6.05%、Manifold 6.84%、Binding 0.20%）。结构原因见 §5.1。
+3. **10% 码本利用率未通过**：streaming probe 全列为 HRQ 7.03%、Sparse 6.05%、LowRank 1.17%、Manifold 6.84%、Binding 0.20%、Contrast 0.68%、Self 1.56%（Route 83.33% PASS）。结构原因见 §5.1。
 4. **真实 mask 的归一化熵 0.5676 > 0.5**，熵门未通过；crafted peaked/uniform 只证明门本身可过可不过。
-5. **规范文字未同步到 v3.1**（D-1）。
+5. ~~规范文字未同步到 v3.1（D-1）~~ **已在本次 Task 0 解决**：`docs/a–e.md` 与 `docs/a–e_cn.md` 均按 R1–R22 同步并带 v3.1-conformance changelog。
 6. **外部验证器是本地形态**（未做 HSM）；`causal_subject.py` 不扩展（accepted deviation）。
 7. **优化器矩没有进 checkpoint**；2 步一致性用 fresh optimizer 测状态 round-trip。
 8. **manifest 的 pickle params 没有 per-tensor sha**；C loader 只读 `.bin` 张量。
