@@ -3,6 +3,10 @@
 Run: be/bin/python -m train.test_fixes_aux
 
 每项一个测试函数，覆盖 audit 清单 #1-#13 的关键断言。
+
+注意：audit #2/#3 针对旧的 JAX MLP verifier stub。R14 已把
+`train/external_verifier.py` 重写为纯标准库 + 独立进程的 `VerifierProcess`，
+旧 stub 及其两个测试已删除；新行为见 `train/test_external_verifier.py`。
 """
 import numpy as np
 from types import SimpleNamespace
@@ -12,8 +16,6 @@ import jax.numpy as jnp
 
 from train.reflection_loop import (SlidingStats, AnomalyDetector, ReflectionLoop,
                                    CorrectionAction)
-from train.external_verifier import (init_verifier_params, init_verifier_state,
-                                     detect_anomaly, compute_verifier_loss)
 from train.causal_subject import (CausalGraph, CausalSubject,
                                   SOURCE_EXTERNAL, SOURCE_INTERNAL)
 from train.narrative_memory import ImportanceEvaluator, _check_state_jump
@@ -39,36 +41,6 @@ def test_01_sliding_stats_welford():
     frac = np.mean(np.abs(zs) < 3.0)
     assert frac > 0.95, f"only {frac:.3f} of z-scores < 3"
     print(f"  [1] std={std:.4f} (≈1.0), {frac:.1%} of z-scores < 3")
-
-
-# ─── #2 compute_verifier_loss 方向反 ────────────────────────────────────────
-
-def test_02_verifier_loss_direction():
-    rng = jax.random.PRNGKey(0)
-    d = 16
-    params = init_verifier_params(rng, d, hidden_dim=8)
-    state = init_verifier_state(d)
-    z_norm = jnp.zeros((1, d))                  # 正常点：mahal=0
-    z_out = jnp.full((1, d), 10.0)              # 越界点：mahal 大
-    l_norm = float(compute_verifier_loss(params, z_norm, state))
-    l_out = float(compute_verifier_loss(params, z_out, state))
-    assert l_norm < l_out, f"normal loss {l_norm:.6f} should be < outlier {l_out:.6f}"
-    assert l_out > 0.0
-    print(f"  [2] normal loss={l_norm:.6f} < outlier loss={l_out:.6f}")
-
-
-# ─── #3 combined_z 用 batch 自身 std（B=1 退化）────────────────────────────
-
-def test_03_combined_z_batch1():
-    rng = jax.random.PRNGKey(1)
-    d = 32
-    params = init_verifier_params(rng, d, hidden_dim=8)
-    state = init_verifier_state(d)              # z_var=1 → scale=1
-    z = jax.random.normal(rng, (1, d))          # B=1 正常样本
-    _, combined_z = detect_anomaly(state, z, params)
-    cz = float(combined_z[0])
-    assert 0.05 < abs(cz) < 100.0, f"B=1 combined_z={cz:.4g}, expected O(1) not 1e8"
-    print(f"  [3] B=1 combined_z={cz:.4f} (O(1), 非 1e8)")
 
 
 # ─── #4 detect_causal_edge 不写 flat ring buffer ────────────────────────────
