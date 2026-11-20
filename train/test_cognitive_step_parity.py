@@ -90,14 +90,16 @@ def test_model_forward_uses_the_step(built):
     _, z_q_ref, _, aux_ref, _ = forward(
         params, gvalue, x, CFG, training=True, rng=jax.random.PRNGKey(1),
         self_state=self_state)
-    # forward returns the fused lattice list including the self element.
+    # forward returns the fused lattice list including the self element, plus
+    # the per-sample familiarity that produced it (R15).
     self_out = aux_ref['lattice_outputs'][-1]
+    self_bias = aux_ref['self_bias']
     _, lat = six_lattice_step(z, params, CFG, training=True,
                               rng=jax.random.PRNGKey(1), gvalue=gvalue)
     want, _, _ = fuse_lattices_with_aux(
         lat['lattice_outputs'] + [self_out], lat['soft_mask'],
         params['fusion'], gvalue=gvalue, beta_val=CFG.beta_val,
-        tau_val=CFG.tau_val_signal, self_bias_weight=CFG.alpha_self)
+        tau_val=CFG.tau_val_signal, self_bias_weight=self_bias)
     assert np.allclose(np.asarray(z_q_ref), np.asarray(want), atol=1e-6), \
         "model.forward is no longer the canonical step plus its own periphery"
 

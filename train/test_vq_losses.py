@@ -269,7 +269,7 @@ def test_ema_codebook_loss_skipped_but_commitment_trains_r(built):
         present = True
         for key in path:
             if not isinstance(node, dict) or key not in node:
-                present = False  # e.g. self.C_self arrives with Task 13
+                present = False  # e.g. a partial hand-built params tree
                 break
             node = node[key]
         if not present:

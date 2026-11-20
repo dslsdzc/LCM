@@ -1,10 +1,13 @@
-"""EMA state for EMA-owned codebooks (R3).
+"""EMA state for EMA-owned codebooks (R3/R15).
 
-Three lattices are updated by EMA instead of The optimizer:
+Four lattices are updated by EMA instead of the optimizer:
 
     sparse    one codebook, C = params['sparse']['C']
     manifold  one tangent-space codebook, C = params['manifold']['C']
     binding   key/val/bind lists of SimVQ dicts, one codebook per layer
+    self      C_self (M_self, d); row 0 is the frozen identity anchor and
+              rows 1: are EMA modes (R15). ``ema_update_self`` is the only
+              writer of C_self and never writes row 0.
 
 State is a JAX pytree of arrays (``N``, ``m``, ``last_used``), carried through
 ``train_step`` and saved in the checkpoint. It is not a parameter and never
@@ -69,6 +72,13 @@ def init_ema_state(params, cfg):
             _empty_state(int(cfg.M_bind), d)
             for _ in range(int(cfg.n_bind_layers))
         ]
+    # R15: C_self[0] is the frozen core and C_self[1:] are EMA modes. The
+    # state has one row per C_self row; row 0's statistics stay zero because
+    # ``ema_update_self`` masks it. ``getattr`` keeps the helper usable from
+    # shape-only tests that predate the self branch.
+    M_self = int(getattr(cfg, 'n_self_codes', 0))
+    if M_self > 0:
+        state['self'] = _empty_state(M_self, d)
     return state
 
 
@@ -136,6 +146,29 @@ def ema_update_manifold(C, state, z, idx, gamma, step=None):
     return C_new, _rebuild_state(N, m, last_used)
 
 
+def ema_update_self(C, state, z, idx, gamma, step=None):
+    """EMA for the self codebook, with row 0 (the core) permanently frozen.
+
+    R15: ``C_self[0]`` is the identity anchor and ``C_self[1:]`` are the EMA
+    modes. ``param_groups`` owns the whole array as one EMA leaf because a
+    single JAX array cannot be split across groups, so this function is where
+    the row-level freeze is enforced. It is the only writer of ``C_self``.
+
+    ``idx`` is not recomputed here: it is the row the forward actually selected
+    (including row 0 when the core is the nearest prototype). If row 0 is
+    selected, its vector and EMA statistics are left untouched.
+    """
+    M = C.shape[0]
+    idx = jnp.asarray(idx, dtype=jnp.int32)
+    C_new, N, m = _ema(C, state, z, idx, gamma)
+    # Frozen core: never write the vector, never accumulate statistics for it.
+    C_new = C_new.at[0].set(C[0])
+    N = N.at[0].set(0.0)
+    m = m.at[0].set(0.0)
+    last_used = _update_last_used(state, idx, step, M)
+    return C_new, _rebuild_state(N, m, last_used)
+
+
 def ema_update_binding(params_binding, state, residuals, indices, gamma,
                        step=None):
     """EMA for the three binding codebook families, every layer.
@@ -197,5 +230,5 @@ def ema_update_binding(params_binding, state, residuals, indices, gamma,
 
 __all__ = [
     'init_ema_state', 'ema_update_sparse', 'ema_update_manifold',
-    'ema_update_binding',
+    'ema_update_self', 'ema_update_binding',
 ]

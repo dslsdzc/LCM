@@ -26,7 +26,7 @@ from train.cognitive_step import six_lattice_step
 from train.fusion import init_fusion_params, init_gen_head_params, gen_head_forward
 from train.self_lattice import (
     init_self_params, init_self_state, self_lattice_forward,
-    reset_session_state, SelfState,
+    update_self_state,
 )
 
 
@@ -67,7 +67,8 @@ def init_all_params(cfg: LCMConfig, rng):
     # Already in params['lowrank']
 
     # Self lattice params (initialized but managed separately)
-    params['self'] = init_self_params(keys[11], d, cfg.n_self_codes)
+    params['self'] = init_self_params(
+        keys[11], d, cfg.n_self_codes, alpha_self=cfg.alpha_self)
     self_state = init_self_state(cfg.n_self_codes, d)
 
     # Global value lattice — not in params (excluded from optimizer)
@@ -111,17 +112,24 @@ def forward(params, gvalue, x, cfg: LCMConfig, training=True, rng=None,
     # init can produce z-norms that overflow downstream softmax/log ops.
     z = safe_unit(z)
 
-    # Routing gate with optional bias injection
-    # Self lattice (internal state machine). Runs first so its output can be
-    # fused as the 7th element. Its output is INDEPENDENT of z — self exists
-    # regardless of external input; z only enters the world-self divergence
-    # (diagnostic).
+    # Self lattice (R15): nearest codebook row + cosine familiarity. The self
+    # output is the 7th fused element; self_bias is computed from z, so the
+    # self term is a genuine familiarity modulation rather than a constant.
     self_state_out = None
     world_dev = jnp.array(0.0)
     self_output = None
-    if self_state is not None and 'self' in params:
-        self_output, self_state_out, world_dev = self_lattice_forward(
-            params['self'], self_state, z=z, rng=rng, training=training)
+    self_bias = None
+    if 'self' in params:
+        self_output, self_bias, self_aux = self_lattice_forward(
+            params['self'], z, training=training, return_aux=True)
+        if self_state is not None:
+            self_state_out = update_self_state(
+                self_state, self_aux['idx'], self_output,
+                gamma_self=cfg.gamma_self)
+        # Diagnostic only: distance from the external context to the frozen
+        # identity anchor C_self[0].
+        core = params['self']['C_self'][0]
+        world_dev = jnp.mean(jnp.linalg.norm(z - core[None, :], axis=-1))
 
     # Routing + the six lattice forwards + fusion, from the single canonical
     # implementation in train/cognitive_step.py — the same one the cognitive
@@ -130,7 +138,7 @@ def forward(params, gvalue, x, cfg: LCMConfig, training=True, rng=None,
     z_q, lat = six_lattice_step(
         z, params, cfg, training=training, rng=rng, gvalue=gvalue,
         routing_bias=routing_bias, self_output=self_output,
-        self_bias_weight=cfg.alpha_self if self_output is not None else None)
+        self_bias=self_bias)
     lattice_outputs = lat['lattice_outputs']
 
     # Safety check on fused output (log only, no interrupt during training).
@@ -163,6 +171,7 @@ def forward(params, gvalue, x, cfg: LCMConfig, training=True, rng=None,
             gvalue.compute_value_signal_batch(lattice_outputs, cfg.tau_val_signal),
         'safety_margin': min_margin,
         'self_state': self_state_out,
+        'self_bias': self_bias,
         'world_dev': world_dev,
     }
 

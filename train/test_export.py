@@ -134,6 +134,28 @@ def test_manifest_covers_exported_tensors(exported):
         assert tensors[name]["offset"] == 0
 
 
+def test_exported_self_layout_matches_c_loader(exported):
+    """R15: C_self rows + tag + bias, and config counts EMA modes only."""
+    from train.checkpoint import SELF_LAYOUT_TAG
+
+    cfg, params, out, _, _ = exported
+    with open(os.path.join(out, "config.json")) as f:
+        exported_cfg = json.load(f)
+    n_modes = exported_cfg["n_self_codes"]
+    assert n_modes == params["self"]["C_self"].shape[0] - 1
+
+    flat = np.fromfile(os.path.join(out, "self_lattice.bin"),
+                       dtype=np.float32)
+    assert flat.size == cfg.d_model + n_modes * cfg.d_model + 2
+    rows = flat[:flat.size - 2].reshape(-1, cfg.d_model)
+    assert rows.shape[0] == 1 + n_modes
+    np.testing.assert_allclose(rows, np.asarray(params["self"]["C_self"]),
+                               atol=1e-6)
+    assert flat[-2] == SELF_LAYOUT_TAG
+    np.testing.assert_allclose(float(flat[-1]),
+                               float(params["self"]["bias_self"]), atol=1e-7)
+
+
 def test_exported_config_carries_the_real_training_config(exported):
     """Every exported setting must come from the real config or real tensors.
 

@@ -29,7 +29,7 @@ from train.lattices import (
 
 
 def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
-                     routing_bias=None, self_output=None, self_bias_weight=None):
+                     routing_bias=None, self_output=None, self_bias=None):
     """One cognitive step: route, run the six lattices, fuse.
 
     Args:
@@ -44,12 +44,14 @@ def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
             hard/soft choice. A loop step is a forward evaluation of the
             lattice stack, so this mirrors whatever the surrounding pass is.
         rng: PRNG key for the routing gate's Gumbel noise.
-        self_output: optional (B, d) self-lattice output, appended as a 7th
-            fused element. The self lattice itself is run by the caller; this
-            function does not compute it.
-        self_bias_weight: weight for self_output. Required whenever
-            self_output is given, because fusion identifies the self element by
-            having more outputs than routing weights.
+        self_output: optional (B, d) self-lattice output (``z_self``), appended
+            as a 7th fused element. The self lattice itself is run by the
+            caller; this function does not compute it.
+        self_bias: (B,) familiarity scalar from ``self_lattice_forward``, or a
+            scalar. Required whenever ``self_output`` is given, because fusion
+            identifies the self element by having more outputs than routing
+            weights. R15 replaced the old constant ``self_bias_weight`` with
+            this per-sample value.
 
     Returns:
         z_next: (B, d) fused state.
@@ -58,15 +60,18 @@ def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
             per-lattice selection indices the canonical forward exposes.
             R18 adds 'z_in', 'hrq_vq', 'lowrank_aux', 'contrast_indices' and
             'contrast_residuals': the per-layer loss targets from this same
-            forward pass.
+            forward pass. R15 adds 'self_output' and 'self_bias' when the self
+            element is present.
     """
     if rng is None:
         rng = jax.random.PRNGKey(0)
-    if self_output is not None and self_bias_weight is None:
+    if self_output is not None and self_bias is None:
         raise ValueError(
-            "self_output requires self_bias_weight: fuse_lattices separates "
+            "self_output requires self_bias: fuse_lattices separates "
             "the self element by it having no routing weight, so passing one "
             "without the other silently routes the self output instead")
+    if self_bias is not None and self_output is None:
+        raise ValueError("self_bias was given without self_output")
 
     # routing_bias must be applied HERE, not by the caller before calling in.
     # model.forward used to inject it into route_params and run its own
@@ -127,7 +132,7 @@ def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
     z_next, weights, entropy = fuse_lattices_with_aux(
         lattice_outputs, soft_mask, params['fusion'],
         gvalue=gvalue, beta_val=cfg.beta_val, tau_val=cfg.tau_val_signal,
-        self_bias_weight=self_bias_weight if self_output is not None else None)
+        self_bias_weight=self_bias if self_output is not None else None)
 
     aux = {
         # The state the lattices received. Kept here (not only in the loop's
@@ -164,4 +169,7 @@ def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
         'contrast_indices': contrast_indices,
         'contrast_residuals': contrast_residuals,
     }
+    if self_output is not None:
+        aux['self_output'] = self_output
+        aux['self_bias'] = self_bias
     return z_next, aux

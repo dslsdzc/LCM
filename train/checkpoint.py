@@ -26,7 +26,7 @@ Directory layout:
   ├── gvalue_codebook.bin   # header + C_pos + C_neg + SHA256
   ├── fusion.bin            # alpha + ln_scale + ln_bias
   ├── value_scalars.bin     # header + per-codebook local value scalars (R22)
-  ├── self_lattice.bin      # core + modes + tau_self + bias_self
+  ├── self_lattice.bin      # C_self rows (core + EMA modes) + bias_self (R15)
   ├── binding_proj.bin      # HRR projections A_k / A_v
   ├── opt_state.bin         # optimizer state (Python, not C-readable)
   ├── config.json           # all hyperparameters
@@ -58,6 +58,14 @@ from train.bin_format import (  # noqa: F401  (re-exported)
 # Codebook type constants
 CB_EUCLIDEAN = 1
 CB_HYPERBOLIC = 2
+
+# R15 self_lattice.bin layout tag. The payload is
+#   C_self[0] (core, d) | C_self[1:] (modes, (M-1)*d) | tag (1) | bias_self (1)
+# The tag occupies the slot the pre-R15 format called ``tau_self``. The C
+# loader reads it as an unused temperature (default 1.0), so it is safe to use
+# as a marker here; old ``core + modes + tau + bias`` files carry 1.0 and are
+# rejected instead of silently reinterpreted as C_self (Ruling 11).
+SELF_LAYOUT_TAG = -1.0
 
 
 def _pack_header(M, d, n_layers, cb_type, curvature=1.0):
@@ -488,13 +496,25 @@ def _save_value_scalars(params, path, cfg):
 
 
 def _save_self(params, path):
-    """self lattice params: core (d,) + modes (M_self, d) + 2 scalars."""
+    """self lattice params: C_self rows + R15 layout tag + bias_self.
+
+    Layout (kept compatible with ``infer/c_load.py``): row 0 is the frozen
+    core, rows 1: are the EMA modes, then two scalars. The first scalar is the
+    pre-R15 ``tau_self`` slot, now a layout tag; the second is ``bias_self``
+    (the familiarity strength, exported to C as ``alpha_self``).
+    """
     sp = params['self']
+    C_self = np.asarray(sp['C_self'], dtype=np.float32)
+    if C_self.ndim != 2 or C_self.shape[0] < 1:
+        raise ValueError(f"C_self must be (M_self, d), got {C_self.shape}")
+    bias = np.asarray(sp['bias_self'], dtype=np.float32).ravel()
+    if bias.size != 1:
+        raise ValueError(f"bias_self must be scalar, got shape {bias.shape}")
     flat = np.concatenate([
-        np.asarray(sp['core']).ravel(),
-        np.asarray(sp['modes']).ravel(),
-        np.asarray(sp['tau_self']).ravel(),
-        np.asarray(sp['bias_self']).ravel(),
+        C_self[0].ravel(),
+        C_self[1:].ravel(),
+        np.array([SELF_LAYOUT_TAG], dtype=np.float32),
+        bias,
     ]).astype(np.float32)
     flat.tofile(path)
     return flat
@@ -556,19 +576,34 @@ def _load_value_scalars(path, cfg):
 
 
 def _load_self(path, cfg):
-    d = cfg.d_model
-    M_self = cfg.n_self_codes
+    """Reconstruct R15 self params from ``self_lattice.bin``.
+
+    The file has ``n_rows * d + 2`` floats: ``n_rows`` C_self rows (core
+    first), a layout tag, and ``bias_self``. The tag replaces the pre-R15
+    ``tau_self``; an old ``core + modes + tau + bias`` file has tau≈1.0 and is
+    rejected, never migrated (Ruling 11). ``cfg`` is accepted for API symmetry;
+    the row count comes from the file so exported configs that count only the
+    EMA modes still load correctly.
+    """
     flat = np.fromfile(path, dtype=np.float32)
-    if flat.size != d + M_self * d + 2:
-        raise ValueError(f"self_lattice.bin has {flat.size} floats, "
-                         f"expected {d + M_self * d + 2}")
-    pos = 0
-    core = jnp.array(flat[pos:pos + d]); pos += d
-    modes = jnp.array(flat[pos:pos + M_self * d].reshape(M_self, d)); pos += M_self * d
-    tau_self = jnp.array(flat[pos]); pos += 1
-    bias_self = jnp.array(flat[pos])
-    return {'core': core, 'modes': modes,
-            'tau_self': tau_self, 'bias_self': bias_self}
+    d = int(cfg.d_model)
+    if d <= 0 or flat.size < 2 * d + 2 or (flat.size - 2) % d != 0:
+        raise ValueError(
+            f"self_lattice.bin has {flat.size} floats, not a valid R15 "
+            f"self codebook for d={cfg.d_model}")
+    n_rows = (flat.size - 2) // d
+    if n_rows < 2:
+        raise ValueError(
+            f"self_lattice.bin has {n_rows} C_self rows; R15 requires the "
+            f"frozen core plus at least one EMA mode")
+    tag = float(flat[-2])
+    if not np.isclose(tag, SELF_LAYOUT_TAG, atol=1e-6):
+        raise ValueError(
+            "self_lattice.bin predates R15 (no C_self layout tag); old "
+            "core+modes weights are discarded, not migrated")
+    C_self = jnp.array(flat[:n_rows * d].reshape(n_rows, d))
+    bias_self = jnp.array(flat[-1])
+    return {'C_self': C_self, 'bias_self': bias_self}
 
 
 def _load_binding_proj(path, cfg):
@@ -600,7 +635,8 @@ def _save_danger(params, path, M_danger, d):
     return sha
 
 
-def load_checkpoint(output_dir, cfg=None, rng=None, load_opt=True):
+def load_checkpoint(output_dir, cfg=None, rng=None, load_opt=True,
+                    allow_missing_self=False):
     """Load LCM checkpoint from flat binary directory.
 
     Loads encoder, decoder, all codebooks, gvalue, and optional optimizer state.
@@ -696,10 +732,27 @@ def load_checkpoint(output_dir, cfg=None, rng=None, load_opt=True):
     # Self lattice params
     self_path = os.path.join(output_dir, "self_lattice.bin")
     if os.path.exists(self_path):
-        params['self'] = _load_self(self_path, cfg)
+        try:
+            params['self'] = _load_self(self_path, cfg)
+        except ValueError as exc:
+            if not allow_missing_self:
+                raise
+            print(f"[WARN] {exc}; resetting to a fresh R15 self codebook "
+                  f"(allow_missing_self=True)")
+            params['self'] = init_self_params(
+                jax.random.PRNGKey(3), d, cfg.n_self_codes,
+                alpha_self=cfg.alpha_self)
+    elif allow_missing_self:
+        print("[WARN] self_lattice.bin missing — resetting to a fresh R15 "
+              "self codebook (allow_missing_self=True)")
+        params['self'] = init_self_params(
+            jax.random.PRNGKey(3), d, cfg.n_self_codes,
+            alpha_self=cfg.alpha_self)
     else:
-        print("  [WARN] self_lattice.bin missing — re-initialising self lattice")
-        params['self'] = init_self_params(jax.random.PRNGKey(3), d, cfg.n_self_codes)
+        raise ValueError(
+            f"{self_path} is missing; a checkpoint without C_self is not a "
+            f"valid R15 model. Pass allow_missing_self=True to reset it "
+            f"explicitly (old core+modes weights are discarded, not migrated)")
 
     # HRQ codebook (flat format — varying M per layer)
     hrq_path = os.path.join(output_dir, "hrq_codebook.bin")

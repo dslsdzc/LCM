@@ -39,12 +39,13 @@ from train.lattices import (
 )
 from train.fusion import init_fusion_params
 from train.self_lattice import (
-    init_self_params, init_self_state, self_lattice_forward,
-    self_lattice_reg_loss,
+    init_self_params, init_self_state, self_lattice_reg_loss,
+    update_self_state,
 )
 from train.cog_loop import cog_loop_scan
 from train.ema_state import (
-    ema_update_binding, ema_update_manifold, ema_update_sparse, init_ema_state,
+    ema_update_binding, ema_update_manifold, ema_update_self,
+    ema_update_sparse, init_ema_state,
 )
 from train.feature_bank import FeatureBank, init_contrast_last_used
 from train.param_groups import merge_params, partition_params
@@ -244,12 +245,54 @@ def verify_resume_identity(resume_dir, run_identity):
 
 # ─── Load Stage 2 memory checkpoint ─────────────────────────────────────────
 
-def load_stage2_params(resume, cfg, rng):
+def _ensure_r15_self(params, cfg, rng, allow_missing_self):
+    """Reject or explicitly reset a pre-R15 ``core + modes`` self lattice.
+
+    Ruling 11: old weights are discarded, not migrated. A fresh ``C_self`` is
+    acceptable for a new run, but only when the caller opts in with
+    ``allow_missing_self=True``; silently starting from a random codebook in a
+    resume is exactly the kind of mismatch this rejects.
+    """
+    d = int(cfg.d_model)
+    M_self = int(cfg.n_self_codes)
+    sp = params.get('self')
+    valid = isinstance(sp, dict) and 'C_self' in sp and 'bias_self' in sp
+    if valid:
+        C = jnp.asarray(sp['C_self'])
+        bias = jnp.asarray(sp['bias_self'])
+        valid = (C.ndim == 2 and tuple(C.shape) == (M_self, d)
+                 and bias.size == 1)
+    if valid:
+        # Drop pre-R15 leftovers if a hand-written checkpoint carries both.
+        params['self'] = {
+            'C_self': jnp.asarray(sp['C_self']),
+            'bias_self': jnp.asarray(sp['bias_self']).reshape(()),
+        }
+        return params
+
+    if not allow_missing_self:
+        raise ValueError(
+            "checkpoint self lattice has no R15 C_self (found "
+            f"{sorted(sp) if isinstance(sp, dict) else type(sp).__name__}); "
+            "old core+modes weights are discarded, not migrated. Start a new "
+            "run or pass allow_missing_self=True to reset C_self explicitly")
+    params['self'] = init_self_params(
+        jax.random.fold_in(rng, 13), d, M_self, alpha_self=cfg.alpha_self)
+    print("[COG] R15: checkpoint had no C_self; reset to a fresh random "
+          "self codebook (allow_missing_self=True)")
+    return params
+
+
+def load_stage2_params(resume, cfg, rng, allow_missing_self=False):
     """Load params from Stage 2 checkpoint (full pickle or legacy .bin format).
 
     Two formats:
       1. cog_params.pkl (new) — full params dict with self_state.
       2. .bin files (old) — loaded via checkpoint.load_checkpoint.
+
+    R15: a checkpoint whose ``params['self']`` predates ``C_self`` is rejected
+    unless ``allow_missing_self`` is explicit (Ruling 11: old weights are
+    discarded, not migrated).
 
     Returns:
         (params, self_state, step) — the saved absolute step is the time origin
@@ -263,6 +306,14 @@ def load_stage2_params(resume, cfg, rng):
             lambda x: jnp.array(x) if hasattr(x, 'numpy') else x,
             ckpt['params'])
         step = ckpt.get('step', 0)
+        # Check W_out first: it is an even older, more specific schema break,
+        # and a caller loading such a checkpoint should see that diagnosis
+        # rather than the generic R15 self-lattice rejection.
+        if 'W_out' in params:
+            raise ValueError(
+                "checkpoint carries W_out, which predates the tied readout; "
+                "old cognitive checkpoints are not migrated")
+        params = _ensure_r15_self(params, cfg, rng, allow_missing_self)
         self_state = ckpt.get('self_state')
         if self_state is None:
             self_state = init_self_state(cfg.n_self_codes, cfg.d_model)
@@ -271,11 +322,14 @@ def load_stage2_params(resume, cfg, rng):
 
     # Fallback: legacy .bin format — caller must supply --qwen-ckpt separately
     from train.checkpoint import load_checkpoint as bin_load
-    loaded, _, _, step = bin_load(resume, cfg=cfg, rng=rng, load_opt=False)
+    loaded, _, _, step = bin_load(
+        resume, cfg=cfg, rng=rng, load_opt=False,
+        allow_missing_self=allow_missing_self)
 
     wanted = ['encoder', 'hrq', 'sparse', 'lowrank', 'manifold',
               'binding', 'contrast', 'self', 'gen_head']
     params = {k: loaded[k] for k in wanted if k in loaded}
+    params = _ensure_r15_self(params, cfg, rng, allow_missing_self)
 
     self_state = init_self_state(cfg.n_self_codes, cfg.d_model)
 
@@ -285,7 +339,7 @@ def load_stage2_params(resume, cfg, rng):
     return params, self_state, int(step)
 
 
-def load_cog_buffers(resume, params, cfg):
+def load_cog_buffers(resume, params, cfg, allow_missing_self=False):
     """Load EMA state, feature bank and the saved step for a resume.
 
     These are buffers, not parameters: a resume that cannot restore them would
@@ -294,6 +348,10 @@ def load_cog_buffers(resume, params, cfg):
     (``load_cog_state(require_buffers=True)``). The saved step is returned
     because restored ``last_used`` values are absolute step indices from the
     old run; the loop must continue from that origin, not from 0.
+
+    R15: the EMA state must also carry the ``self`` branch (``C_self`` modes).
+    A pre-R15 checkpoint has no such branch and is rejected unless
+    ``allow_missing_self`` is explicit; then a fresh zeroed branch is created.
 
     Returns:
         ``(ema_state, feature_bank, contrast_bank, contrast_last_used, step)``.
@@ -307,6 +365,8 @@ def load_cog_buffers(resume, params, cfg):
         ckpt = load_cog_state(resume, require_buffers=True)
         ema_state = jax.tree_util.tree_map(
             lambda x: jnp.asarray(x), ckpt['ema_state'])
+        ema_state = _ensure_r15_self_ema(
+            ema_state, params, cfg, allow_missing_self)
         return (ema_state, ckpt['feature_bank'], ckpt['contrast_bank'],
                 ckpt['contrast_last_used'], int(ckpt.get('step', 0)))
 
@@ -314,6 +374,30 @@ def load_cog_buffers(resume, params, cfg):
             FeatureBank(cfg.bank_capacity, cfg.d_model),
             FeatureBank(cfg.bank_capacity, cfg.d_model),
             init_contrast_last_used(cfg.n_contrast_layers, cfg.M_contrast), 0)
+
+
+def _ensure_r15_self_ema(ema_state, params, cfg, allow_missing_self):
+    """Check the R15 ``ema_state['self']`` branch on a resume."""
+    M_self = int(cfg.n_self_codes)
+    d = int(cfg.d_model)
+    branch = ema_state.get('self')
+    valid = (isinstance(branch, dict)
+             and branch.get('N') is not None
+             and branch.get('m') is not None
+             and tuple(jnp.asarray(branch['N']).shape) == (M_self,)
+             and tuple(jnp.asarray(branch['m']).shape) == (M_self, d))
+    if valid:
+        return ema_state
+    if not allow_missing_self:
+        raise ValueError(
+            "checkpoint EMA state has no R15 self branch (C_self modes); "
+            "old checkpoints are discarded, not migrated. Start a new run or "
+            "pass allow_missing_self=True to reset it explicitly")
+    ema_state = dict(ema_state)
+    ema_state['self'] = init_ema_state(params, cfg)['self']
+    print("[COG] R15: checkpoint had no self EMA state; reset to zero "
+          "(allow_missing_self=True)")
+    return ema_state
 
 
 # ─── Init full params ───────────────────────────────────────────────────────
@@ -340,7 +424,8 @@ def _load_qwen_checkpoint(qwen_path, params, d=256):
     print(f"[COG]  z_proj: {'kept from checkpoint' if 'z_proj' in params else 'initialised'}")
 
 
-def init_cog_params(cfg, rng, qwen_ckpt=None, resume=None):
+def init_cog_params(cfg, rng, qwen_ckpt=None, resume=None,
+                    allow_missing_self=False):
     """Initialize all trainable params for dual-channel cognitive training.
 
     Params:
@@ -351,6 +436,8 @@ def init_cog_params(cfg, rng, qwen_ckpt=None, resume=None):
     Args:
         qwen_ckpt: Path to the Qwen `.npz` bridge, or None for passive-only.
         resume: Optional Stage 2 checkpoint dir.
+        allow_missing_self: R15 escape hatch for a pre-``C_self`` checkpoint;
+            resets the self codebook explicitly instead of rejecting.
 
     Returns:
         params: Dict of all parameters.
@@ -360,7 +447,8 @@ def init_cog_params(cfg, rng, qwen_ckpt=None, resume=None):
     d = cfg.d_model
 
     if resume:
-        params, self_state, _ = load_stage2_params(resume, cfg, rng)
+        params, self_state, _ = load_stage2_params(
+            resume, cfg, rng, allow_missing_self=allow_missing_self)
         # A checkpoint carrying W_out predates the tied readout. It is not
         # migrated: W_out was a second token table trained against a different
         # token space, so resuming it would silently mix the two.
@@ -382,7 +470,8 @@ def init_cog_params(cfg, rng, qwen_ckpt=None, resume=None):
         params['binding'] = init_binding_params(keys[5], d, cfg.M_bind, cfg.n_bind_layers, cfg.r_max)
         params['contrast'] = init_contrast_params(keys[6], d, cfg.M_contrast, cfg.n_contrast_layers)
 
-        params['self'] = init_self_params(keys[10], d, cfg.n_self_codes)
+        params['self'] = init_self_params(
+            keys[10], d, cfg.n_self_codes, alpha_self=cfg.alpha_self)
         self_state = init_self_state(cfg.n_self_codes, d)
 
         # Routing + fusion + per-lattice value scalars. The cognitive loop runs
@@ -503,12 +592,13 @@ def active_loss(logits, targets):
 # ─── Training step ──────────────────────────────────────────────────────────
 
 def _apply_ema_updates(ema, ema_state, stats, cfg, step):
-    """EMA pass over the EMA-owned codebooks (R3).
+    """EMA pass over the EMA-owned codebooks (R3/R15).
 
     ``stats`` is the last cognitive-loop step: its input state and selection
     indices are the observations the codebooks must move toward. The optimizer
     never sees these leaves (see ``partition_params``), so this function is the
-    only writer of ``ema``.
+    only writer of ``ema``. ``C_self`` goes through ``ema_update_self``, which
+    keeps row 0 (the frozen core) bit-identical.
     """
     new_ema = dict(ema)
     new_state = dict(ema_state)
@@ -535,6 +625,24 @@ def _apply_ema_updates(ema, ema_state, stats, cfg, step):
         new_ema['binding'] = binding
         new_state['binding'] = state
 
+    if 'self' in ema:
+        # R15: C_self[0] stays frozen inside ema_update_self. The forward's
+        # selected row is what the EMA must accumulate; when a caller did not
+        # provide it, recompute the (value-free) Euclidean argmin from the same
+        # z the forward saw.
+        idx = stats.get('self_idx')
+        if idx is None:
+            z_in = jnp.asarray(stats['z_in'])
+            C_self = ema['self']['C_self']
+            idx = jnp.argmin(
+                jnp.sum((z_in[:, None, :] - C_self[None, :, :]) ** 2,
+                        axis=-1), axis=-1)
+        C_self, state = ema_update_self(
+            ema['self']['C_self'], ema_state['self'], stats['z_in'], idx,
+            cfg.gamma_self, step=step)
+        new_ema['self'] = dict(ema['self'], C_self=C_self)
+        new_state['self'] = state
+
     return new_ema, new_state
 
 
@@ -558,7 +666,8 @@ def make_train_step(cfg, optimizer, joint=False):
     The Qwen bridge is frozen (stop_gradient) so the gradient
     forces the cognitive state z_q to adapt to it.
 
-    Self-lattice provides internal state machine (mode selection, self output).
+    Self-lattice (R15) runs per macro step: nearest C_self row plus a cosine
+    familiarity scalar, fused as the 7th element before LayerNorm.
 
     When joint=True, additional Stage 3 losses are computed:
       - Contrastive NCE
@@ -624,16 +733,20 @@ def make_train_step(cfg, optimizer, joint=False):
             # indices; the scan stacks them along the step axis.
             loop_stats = jax.tree_util.tree_map(lambda x: x[-1], loop_stats)
 
-            # ── Self lattice ────────────────────────────────────────────
-            z_final_mean = z_qs[:, -1, :].mean(axis=0)
-            rng_self = rng
-            self_state_out = None
+            # ── Self lattice (R15) ──────────────────────────────────────
+            # The loop runs the self lattice each macro step and fuses
+            # self_bias * z_self as the 7th element (cog_loop_scan). Here we
+            # only keep its regulariser and the thin diagnostic state; there
+            # is no second self forward pass.
+            self_state_out = self_state
             loss_self = jnp.array(0.0)
-            if self_state is not None and 'self' in p:
-                o_self, self_state_out, world_dev = self_lattice_forward(
-                    p['self'], self_state, z=z_final_mean[None, :],
-                    rng=rng_self, training=True)
-                loss_self = self_lattice_reg_loss(p['self'], self_state_out)
+            if 'self' in p:
+                loss_self = self_lattice_reg_loss(p['self'])
+                if self_state is not None and 'self_idx' in loop_stats:
+                    self_state_out = update_self_state(
+                        self_state, loop_stats['self_idx'],
+                        loop_stats.get('z_self', loop_stats['z_in']),
+                        gamma_self=cfg.gamma_self)
 
             # ── Passive channel: z_q @ E.T (tied to the encoder embedding) ──
             # One trainable token table: E is both the encoder's input
@@ -744,6 +857,9 @@ def make_train_step(cfg, optimizer, joint=False):
                     loss = loss + o_loss
 
             aux_out = {'self_state': self_state_out, 'loss_self': loss_self,
+                       'self_bias': (jnp.mean(loop_stats['self_bias'])
+                                     if 'self_bias' in loop_stats
+                                     else jnp.array(0.0)),
                        'z_margin': z_margin, 'stage3': stage3_extra,
                        'loop_stats': loop_stats}
             return loss, aux_out
@@ -926,7 +1042,7 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
               seq_len=256, log_every=100, save_every=1000,
               data_path=None, shape_path=None, spans_path=None,
               qwen_ckpt=None, resume=None, joint=False, auto_mode=False,
-              full_verify=True):
+              full_verify=True, allow_missing_self=False):
     """Run dual-channel cognitive training (Stage 2).
 
     Dual channels from cognitive state z_q:
@@ -942,6 +1058,9 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
         auto_mode: When True, enables Supervisor.
         full_verify: Re-read the corpus and check its content hash. On by
             default: a production run must verify the corpus, not just its size.
+        allow_missing_self: R15 escape hatch for resuming a pre-``C_self``
+            checkpoint. Off by default; when on, the self codebook and its EMA
+            branch are reset explicitly (old weights are not migrated).
     """
     from train.data import WikiDataIter
     from tqdm import tqdm
@@ -968,10 +1087,12 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     # 4. Only now is model allocation allowed.
     rng = jax.random.PRNGKey(42)
     rng, init_rng = jax.random.split(rng)
-    params, self_state = init_cog_params(cfg, init_rng, qwen_ckpt=qwen_ckpt,
-                                          resume=resume)
+    params, self_state = init_cog_params(
+        cfg, init_rng, qwen_ckpt=qwen_ckpt, resume=resume,
+        allow_missing_self=allow_missing_self)
     (ema_state, feature_bank, contrast_bank, contrast_last_used,
-     start_step) = load_cog_buffers(resume, params, cfg)
+     start_step) = load_cog_buffers(
+        resume, params, cfg, allow_missing_self=allow_missing_self)
     # Restored last_used values are absolute step indices from the old run, so
     # the loop continues from the saved step rather than restarting its clock.
     step = start_step
@@ -1032,7 +1153,8 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     # enforced before allocation by resolve_dataset_identity (tokenizer digest +
     # metadata + tensors) and verify_qwen_extent, which raise instead of warn:
     # a run whose token space cannot be verified has no interpretable metric.
-    print(f"[COG] Self-lattice: {cfg.n_self_codes} modes")
+    print(f"[COG] Self-lattice: {cfg.n_self_codes - 1} EMA modes + 1 frozen "
+          f"core (C_self rows={cfg.n_self_codes})")
     print(f"[COG] Steps: {steps}, B={batch_size}, N={seq_len}, lr={lr}")
     print("[COG] Layered codebook/commitment losses: always on (R18)")
     if joint:
@@ -1358,7 +1480,9 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
         'M_contrast': _to_np(params['contrast']['C_a'][0]['A']).shape[0],
         'n_bind_layers': len(params['binding']['key_cb']),
         'n_contrast_layers': len(params['contrast']['C_a']),
-        'n_self_codes': _to_np(params['self']['modes']).shape[0],
+        # R15: the C engine's M_self counts EMA mode rows and adds the frozen
+        # core row itself; C_self has 1 + M_self rows.
+        'n_self_codes': _to_np(params['self']['C_self']).shape[0] - 1,
 
         # Training choices, from train_cfg.
         'max_seq_len': train_cfg.max_seq_len,
@@ -1373,7 +1497,7 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
         't_dim': train_cfg.t_dim,
         'n_value_pairs': train_cfg.n_value_pairs,
         'M_danger': train_cfg.M_danger,
-        'alpha_self': train_cfg.alpha_self,
+        'alpha_self': float(_to_np(params['self']['bias_self'])),
         'tau_route': train_cfg.tau_route,
         'tau_route_fallback': train_cfg.tau_route_fallback,
         'lambda_lfq': train_cfg.lambda_lfq,
@@ -1617,13 +1741,19 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
     print(f"[CKPT] Step {step}: inference format → {output_dir}/ ({total_bytes/1e6:.0f} MB)")
 
 
-def load_cog_checkpoint(path, d_model=None, n_self_codes=64):
+def load_cog_checkpoint(path, d_model=None, n_self_codes=64,
+                        allow_missing_self=False):
     """Load full cognitive training checkpoint.
+
+    R15: a checkpoint without ``params['self']['C_self']`` is rejected unless
+    ``allow_missing_self`` is explicit, in which case a fresh codebook is
+    created (Ruling 11: old core+modes weights are discarded, not migrated).
 
     Args:
         path: Path to checkpoint .pkl file.
-        d_model: Model dimension (for re-init self_state if not saved).
-        n_self_codes: Number of self modes.
+        d_model: Model dimension (required when resetting a missing C_self).
+        n_self_codes: Number of self codebook rows, including the frozen core.
+        allow_missing_self: Explicit opt-in to reset a pre-R15 self codebook.
 
     Returns:
         params, step, self_state
@@ -1633,6 +1763,16 @@ def load_cog_checkpoint(path, d_model=None, n_self_codes=64):
     params = jax.tree_util.tree_map(
         lambda x: jnp.array(x) if hasattr(x, 'numpy') else x,
         ckpt['params'])
+    sp = params.get('self')
+    if not (isinstance(sp, dict) and 'C_self' in sp and 'bias_self' in sp):
+        if not allow_missing_self or d_model is None:
+            raise ValueError(
+                "checkpoint self lattice has no R15 C_self; old core+modes "
+                "weights are discarded, not migrated"
+                + ("" if allow_missing_self else
+                   "; pass allow_missing_self=True to reset explicitly"))
+        params['self'] = init_self_params(
+            jax.random.PRNGKey(13), int(d_model), int(n_self_codes))
     self_state = ckpt.get('self_state')
     if self_state is None and d_model is not None:
         self_state = init_self_state(n_self_codes, d_model)

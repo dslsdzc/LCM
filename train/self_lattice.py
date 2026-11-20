@@ -1,269 +1,210 @@
-"""Self Lattice — Internal State Machine with Identity Anchor (d.md §3).
+"""Self Lattice — codebook nearest-neighbour + cosine familiarity (R15).
 
-Three-tier architecture:
-  core:      Permanent identity vector (frozen). "我是我" — always present,
-             never changes, independent of all external input.
-  modes:     Learned internal modes/moods (M_self × d). Selected by internal
-             dynamics (mode activation momentum), NOT by external context z.
-  active:    EMA-tracked working state — recent self-output history.
+``e.md §6`` defines the self lattice as a codebook of the system's own
+historical states:
 
-Self output does NOT depend on input z. The self exists regardless of input.
-World-self divergence is computed as a diagnostic: ||z - core||² measures
-how far the current external context is from the identity anchor.
+    z_self    = C_self[argmin_j ||z - C_self[j]||²]      (Euclidean, STE)
+    self_bias = alpha_self · max(0, cosine_sim(z, z_self))
+
+``C_self`` has ``M_self`` rows. Row 0 is the frozen identity anchor ("我是我"),
+kept from the old ``core`` parameter; rows ``1:`` are the EMA modes
+(``gamma_self = 0.99``).  The whole array is EMA-owned in ``param_groups``
+because one JAX array cannot be split across parameter groups; the freeze is
+enforced by ``train.ema_state.ema_update_self``, which never writes row 0.
+
+The old ``core + modes + mode_activation`` machine is gone as a forward path.
+The selection is a plain nearest-neighbour over ``C_self``, not a mode sample.
+``mode_activation`` survives only as a cheap diagnostic (``init_self_state`` /
+``update_self_state``) and never influences ``z_self``.
 
 Usage:
-    from train.self_lattice import init_self_params, init_self_state
-    params = init_self_params(rng, d, n_self_codes)
-    state = init_self_state(n_self_codes, d)
-    o_self, state, world_dev = self_lattice_forward(params, state, z, rng)
-
-Note:
-    SelfState is a dict (not a dataclass) so it passes cleanly through JAX
-    jit boundaries. Use self_state_to_dc(s) to convert to the dataclass form
-    for Python-side attribute access.
+    from train.self_lattice import init_self_params, self_lattice_forward
+    params = init_self_params(rng, d, M_self=64)
+    z_self, self_bias = self_lattice_forward(params, z, training=False)
 """
 import jax
 import jax.numpy as jnp
 from jax import lax
-from dataclasses import dataclass
-from typing import Optional, Tuple
+
+# R15 random fallback: standard deviation of the small random codebook rows
+# used when no early encoder-bottleneck samples are available. The scale is
+# deliberately small (the same 0.02 the old core/modes used) because the
+# encoder output is normalised to the unit sphere and an untrained codebook
+# must not dominate fusion.
+SELF_INIT_STD = 0.02
 
 
-@dataclass
-class SelfStateDC:
-    """Self lattice runtime state (dataclass form, Python-side convenience).
-
-    For JIT-compatible operations use dict form (created by init_self_state).
-    Convert between forms with self_state_from_dc / self_state_to_dc.
-
-    Attributes:
-        step: Current step counter.
-        mode_activation: (M_self,) momentum of mode usage.
-        temp_avg: (d,) running average of past self outputs.
-        gamma_self: Decay rate for mode activation momentum.
-    """
-    step: int = 0
-    mode_activation: jnp.ndarray = None
-    temp_avg: jnp.ndarray = None
-    gamma_self: float = 0.99
-
-
-def self_state_from_dc(dc: 'SelfStateDC') -> dict:
-    """Convert SelfStateDC dataclass to a JIT-compatible dict."""
-    return {
-        'step': dc.step,
-        'mode_activation': dc.mode_activation,
-        'temp_avg': dc.temp_avg,
-        'gamma_self': dc.gamma_self,
-    }
-
-
-def self_state_to_dc(d: dict) -> 'SelfStateDC':
-    """Convert JIT-compatible dict back to SelfStateDC dataclass."""
-    return SelfStateDC(
-        step=d['step'],
-        mode_activation=d['mode_activation'],
-        temp_avg=d['temp_avg'],
-        gamma_self=d['gamma_self'],
-    )
-
-
-# Convenience alias: SelfState for backward compatibility
-SelfState = SelfStateDC
-
-
-def init_self_params(rng, d, M_self=64):
-    """Initialize self lattice parameters.
-
-    core:   (d,) — permanent identity vector, frozen after init.
-            "I am me" — the immutable anchor.
-    modes:  (M_self, d) — learned internal modes/moods, updated via gradient.
-    tau_self:  scalar — temperature controlling mode-switching volatility.
-    bias_self: scalar — how much self influences fusion.
+def init_self_params(rng, d, M_self=64, *, init_samples=None,
+                     alpha_self=0.05):
+    """Initialise the self codebook.
 
     Args:
         rng: JAX PRNG key.
-        d: Model dimension.
-        M_self: Number of self-state modes.
+        d: Bottleneck dimension.
+        M_self: Total number of ``C_self`` rows, including the frozen core.
+        init_samples: Optional ``(K, d)`` array of early encoder bottleneck
+            vectors. Up to ``M_self - 1`` rows seed the EMA modes; remaining
+            rows fall back to small random vectors. If None, every mode is
+            random (std ``SELF_INIT_STD``), which is the documented fresh-run
+            behaviour (``e.md §6`` prefers early-training samples when a caller
+            has them).
+        alpha_self: Initial familiarity strength. Stored as the trainable
+            scalar ``bias_self`` and used as the upper bound of ``self_bias``.
 
     Returns:
-        params: Dict with 'core', 'modes', 'tau_self', 'bias_self'.
+        ``{'C_self': (M_self, d), 'bias_self': ()}``.
     """
-    k1, k2 = jax.random.split(rng, 2)
+    if int(M_self) < 2:
+        raise ValueError(f"M_self must be >= 2 (core + at least one mode), "
+                         f"got {M_self}")
+    d = int(d)
+    M_self = int(M_self)
+
+    k_core, k_modes = jax.random.split(rng, 2)
+    core = jax.random.normal(k_core, (d,), dtype=jnp.float32) * SELF_INIT_STD
+    modes = (jax.random.normal(k_modes, (M_self - 1, d), dtype=jnp.float32)
+             * SELF_INIT_STD)
+
+    if init_samples is not None:
+        samples = jnp.asarray(init_samples, dtype=jnp.float32)
+        if samples.ndim != 2 or samples.shape[-1] != d:
+            raise ValueError(
+                f"init_samples must be (K, {d}), got {tuple(samples.shape)}")
+        k = min(int(samples.shape[0]), M_self - 1)
+        if k > 0:
+            modes = modes.at[:k].set(samples[:k])
+
+    C_self = jnp.concatenate([core[None, :], modes], axis=0)
     return {
-        # ── Core identity: permanently frozen ──
-        # This vector is the answer to "who am I?" — it never changes.
-        'core': jax.random.normal(k1, (d,)) * 0.02,
-        # ── Learned internal modes ──
-        # Different internal states/moods (not driven by external input)
-        'modes': jax.random.normal(k2, (M_self, d)) * 0.02,
-        # ── Learnable scalars ──
-        'tau_self': jnp.array(1.0),    # mode selection temperature
-        'bias_self': jnp.array(0.1),   # fusion bias strength
+        'C_self': C_self,
+        'bias_self': jnp.asarray(alpha_self, dtype=jnp.float32),
     }
 
 
 def init_self_state(M_self, d):
-    """Initialize self lattice runtime state (returns a JIT-compatible dict).
+    """Initialise the optional diagnostic state (JIT-compatible dict).
 
-    Mode activation starts uniform — no mode is preferred at init.
-
-    Args:
-        M_self: Number of self-state modes.
-        d: Model dimension.
-
-    Returns:
-        Dict with step, mode_activation, temp_avg, gamma_self.
+    This is *not* the forward selector any more. It records which codebook row
+    was nearest over time, for logging/self-observation. ``self_lattice_forward``
+    does not read it.
     """
     return {
         'step': 0,
-        'mode_activation': jnp.ones(M_self) / M_self,  # uniform start
-        'temp_avg': jnp.zeros(d),
+        'mode_activation': jnp.ones(int(M_self), dtype=jnp.float32)
+        / float(M_self),
+        'temp_avg': jnp.zeros(int(d), dtype=jnp.float32),
         'gamma_self': 0.99,
     }
 
 
 def reset_session_state(state, M_self, d):
-    """Reset session state (called at start of each inference session).
-
-    Core identity persists. Mode activation resets to uniform.
-    Accepts and returns dict form for JIT compatibility.
-    """
-    return {
-        'step': 0,
-        'mode_activation': jnp.ones(M_self) / M_self,
-        'temp_avg': jnp.zeros(d),
-        'gamma_self': 0.99,
-    }
+    """Reset the diagnostic state at a session boundary."""
+    return init_self_state(M_self, d)
 
 
-def self_lattice_forward(params, state, z: Optional[jnp.ndarray] = None,
-                         rng: Optional[jax.Array] = None,
-                         training: bool = True):
-    """Self lattice forward pass — output is INDEPENDENT of external input z.
-
-    The self output is determined by core identity + selected internal mode.
-    Mode selection is driven by internal (mode activation momentum), NOT by z.
-    World-self divergence is computed separately as a diagnostic.
+def self_lattice_forward(params, z, training=False, return_aux=False):
+    """Nearest codebook row + cosine familiarity.
 
     Args:
-        params: Self lattice parameters (core, modes, tau_self, bias_self).
-        state: Current self state dict (as returned by init_self_state).
-        z: Optional external input (B, d) — NOT used for retrieval, only
-           for computing world-self divergence diagnostic.
-        rng: PRNG key (for Gumbel-Softmax in training).
-        training: Whether in training mode.
+        params: ``{'C_self': (M_self, d), 'bias_self': ()}``.
+        z: ``(B, d)`` current bottleneck vectors (a single ``(d,)`` is promoted
+            to ``(1, d)``).
+        training: Accepted for call-site symmetry with the other lattices. The
+            forward is deterministic: retrieval is a hard argmin and STE is
+            used in both modes.
+        return_aux: When True, also return the cheap diagnostics
+            ``{'idx', 'dist2', 'cosine'}``. They are not inputs to any selector.
 
     Returns:
-        o_self: (1, d) self-modulated output (broadcast over batch).
-        new_state: Updated self state dict (JIT-compatible).
-        world_dev: Scalar — mean ||z - core||², measure of world-self distance.
+        ``z_self``: ``(B, d)`` selected codebook rows. The forward value is the
+        exact row; the gradient is the identity in ``z`` (straight-through), so
+        commitment/encoder gradients flow through it.
+        ``self_bias``: ``(B,)`` familiarity in ``[0, max(bias_self, 0)]``.
+        ``aux``: only when ``return_aux=True``.
     """
-    d = params['core'].shape[0]
-    M_self = params['modes'].shape[0]
+    C_self = jnp.asarray(params['C_self'])
+    z = jnp.atleast_2d(jnp.asarray(z))
+    if z.ndim != 2 or z.shape[-1] != C_self.shape[-1]:
+        raise ValueError(
+            f"z must be (B, {C_self.shape[-1]}), got {tuple(z.shape)}")
 
-    # Unpack state (dict form)
-    mode_activation = state['mode_activation']  # (M_self,)
-    temp_avg = state['temp_avg']                # (d,)
-    gamma_self = state.get('gamma_self', 0.99)
+    dist2 = jnp.sum((z[:, None, :] - C_self[None, :, :]) ** 2, axis=-1)
+    idx = jnp.argmin(dist2, axis=-1)          # (B,)
+    selected = C_self[idx]                    # (B, d)
 
-    # ── Core identity is always frozen ──
-    core = lax.stop_gradient(params['core'])  # (d,), permanently frozen
+    # STE: forward is the codebook row, d/dz is the identity. The codebook
+    # itself is EMA-owned, so no parameter gradient is needed here.
+    z_self = z + lax.stop_gradient(selected - z)
 
-    # ── Mode selection: internal dynamics, NOT z ──
-    # Mode activation momentum determines which mode is active.
-    # This is the key design choice: self state changes based on its own
-    # internal dynamics, not on what the external world looks like.
-    # mode_activation 是概率（初始为均匀），当 logits 用会锐化采样
-    # （softmax(τ·p)），坍缩加速。改用对数概率：采样 ∝ p^τ，argmax 不变。
-    logits = params['tau_self'] * jnp.log(mode_activation + 1e-8)  # (M_self,)
+    # Cosine similarity is computed against the selected row (which equals
+    # z_self forward). Clipping makes the [0, alpha_self] range structural,
+    # not dependent on floating-point noise.
+    z_norm = jnp.linalg.norm(z, axis=-1) + 1e-8
+    c_norm = jnp.linalg.norm(selected, axis=-1) + 1e-8
+    cosine = jnp.sum(z * selected, axis=-1) / (z_norm * c_norm)
+    cosine = jnp.clip(cosine, 0.0, 1.0)
+    alpha = jnp.maximum(jnp.asarray(params['bias_self'], dtype=jnp.float32),
+                        0.0)
+    self_bias = alpha * cosine
 
-    if training:
-        # Gumbel-Softmax for differentiable mode selection
-        if rng is None:
-            rng = jax.random.PRNGKey(0)
-        mode_idx = jax.random.categorical(rng, logits)
-        # STE: hard selection with soft gradient
-        mode_onehot = jax.nn.one_hot(mode_idx, M_self, dtype=jnp.float32)
-        mode_soft = jax.nn.softmax(logits)
-        mode_weights = lax.stop_gradient(mode_onehot - mode_soft) + mode_soft
-    else:
-        # Hard selection at inference
-        mode_idx = jnp.argmax(logits)
-        mode_weights = jax.nn.one_hot(mode_idx, M_self, dtype=jnp.float32)
+    if return_aux:
+        aux = {
+            'idx': idx,
+            'dist2': jnp.min(dist2, axis=-1),
+            'cosine': cosine,
+        }
+        return z_self, self_bias, aux
+    return z_self, self_bias
 
-    # ── Self output = core + selected mode ──
-    # core is the permanent "I am me" anchor.
-    # modes[selected] is the current internal state/mood.
-    # Together: "I am me, and right now I am in this state."
-    self_vec = core + jnp.sum(params['modes'] * mode_weights[:, None], axis=0)  # (d,)
-    o_self = self_vec[None, :]  # (1, d), broadcast over batch
 
-    # ── World-self divergence (diagnostic only) ──
-    # How far is the external context from my core identity?
-    # This is NOT used to modify self output — it's a measurement.
-    if z is not None:
-        world_dev = jnp.mean(jnp.linalg.norm(z - core[None, :], axis=-1))
-    else:
-        world_dev = jnp.array(0.0)
+def update_self_state(state, idx, z_self, gamma_self=None):
+    """Update the optional diagnostic state from a self forward.
 
-    # ── State update: mode activation momentum ──
-    # Modes decay uniformly, then the selected mode gets a boost.
-    # This creates smooth mode transitions (no flickering).
-    decayed = gamma_self * mode_activation
-    boost = (1.0 - gamma_self) * mode_weights
-    new_activation = decayed + boost
-    new_activation = new_activation / (new_activation.sum() + 1e-8)  # re-normalise
+    ``mode_activation`` is an exponential moving average of hard nearest-row
+    assignments. It is logged, never used to pick ``z_self``.
+    """
+    M_self = state['mode_activation'].shape[0]
+    idx = jnp.asarray(idx, dtype=jnp.int32)
+    gamma = state.get('gamma_self', 0.99) if gamma_self is None \
+        else gamma_self
 
-    # Running average of self outputs (temporal continuity)
-    new_temp_avg = 0.99 * temp_avg + 0.01 * self_vec
+    counts = jnp.mean(
+        jax.nn.one_hot(idx, M_self, dtype=jnp.float32), axis=0)
+    activation = gamma * state['mode_activation'] + (1.0 - gamma) * counts
+    activation = activation / (activation.sum() + 1e-8)
 
-    new_state = {
+    z_self = jnp.atleast_2d(jnp.asarray(z_self))
+    new_temp_avg = (gamma * state['temp_avg']
+                    + (1.0 - gamma) * jnp.mean(z_self, axis=0))
+    return {
         'step': state['step'] + 1,
-        'mode_activation': new_activation,
+        'mode_activation': activation,
         'temp_avg': new_temp_avg,
-        'gamma_self': gamma_self,
+        'gamma_self': gamma,
     }
-
-    return o_self, new_state, world_dev
 
 
 def narrative_keep_score(params_np, mode_activation_np, record):
     """Score 0-1 for how worth keeping a narrative record is.
 
-    Uses self-lattice state (core identity + current mode) to judge
-    ongoing relevance. A memory close to the current self is worth keeping;
-    a distant or low-importance one can be forgotten.
-
-    Args:
-        params_np: Self-lattice params as numpy arrays
-            (core, modes extracted via jax.device_get).
-        mode_activation_np: (M_self,) numpy array — current mode activation
-            (from state['mode_activation']).
-        record: NarrativeRecord or StepRecord to evaluate.
-
-    Returns:
-        Float in [0, 1].
+    Uses the record's ``z_q`` and the nearest self-codebook row: a memory close
+    to a prototype of the system's own states is worth keeping; a distant one
+    can be forgotten. ``mode_activation_np`` is retained for the legacy caller
+    signature and is deliberately ignored (R15 removed it as a selector).
     """
     import numpy as _np
 
-    core = _np.asarray(params_np['core'])  # (d,)
-    modes = _np.asarray(params_np['modes'])  # (M_self, d)
-    act = _np.asarray(mode_activation_np)  # (M_self,)
-
-    # Current self vector: core + weighted mode
-    mode_weights = _np.exp(act - act.max()) / (_np.exp(act - act.max()).sum() + 1e-8)
-    self_vec = core + _np.sum(modes * mode_weights[:, None], axis=0)  # (d,)
-
-    # Get record's z_q if available
+    C = _np.asarray(params_np['C_self'])  # (M_self, d)
     z_q = getattr(record, 'z_q', None)
     if z_q is not None and hasattr(z_q, 'numpy'):
         z_q = _np.asarray(z_q)
     if z_q is not None and _np.prod(_np.array(z_q.shape)) > 1:
-        # Self-relevance: cosine similarity between memory and current self
+        z_q = z_q.ravel()
+        idx = int(_np.argmin(_np.sum((C - z_q[None, :]) ** 2, axis=-1)))
+        self_vec = C[idx]
         z_norm = _np.linalg.norm(z_q) + 1e-8
         s_norm = _np.linalg.norm(self_vec) + 1e-8
-        sim = float(_np.dot(z_q.ravel(), self_vec.ravel()) / (z_norm * s_norm))
+        sim = float(_np.dot(z_q, self_vec) / (z_norm * s_norm))
         sim = max(0.0, sim)  # [0, 1], negative similarity = forget
         score = 0.3 * record.importance_score + 0.7 * sim
     else:
@@ -277,49 +218,35 @@ def narrative_keep_score(params_np, mode_activation_np, record):
     return float(_np.clip(score, 0.0, 1.0))
 
 
-def self_lattice_reg_loss(params, state) -> jnp.ndarray:
-    """Regularization loss for self lattice.
+def self_lattice_reg_loss(params, state=None):
+    """Weak diversity regulariser over the EMA modes.
 
-    Encourages:
-    1. Mode diversity: modes should not all collapse to the same vector.
-    2. Mode stability: mode activation should have some entropy (not lock on one forever).
-
-    Args:
-        params: Self lattice params dict (core, modes, tau_self, bias_self).
-        state: Self state dict (mode_activation, temp_avg, ...).
-
-    Returns:
-        Scalar loss.
+    ``C_self[1:]`` are EMA-owned, so this term does not train them; it is kept
+    as a reported diagnostic (and so the existing training consumers keep a
+    finite, well-defined value). The frozen core row is excluded: it is an
+    anchor, not one mode among peers. ``state`` is accepted for the legacy
+    caller signature and ignored.
     """
-    # Mode diversity: pairwise distance between modes
-    modes = params['modes']  # (M_self, d)
+    modes = jnp.asarray(params['C_self'])[1:]  # (M_self - 1, d)
     M = modes.shape[0]
+    if M < 2:
+        return jnp.array(0.0)
 
-    # Compute pairwise cosine similarity
     norms = jnp.linalg.norm(modes, axis=-1, keepdims=True) + 1e-8
     modes_norm = modes / norms
-    sim = modes_norm @ modes_norm.T  # (M, M)
-    # Mask out diagonal
+    sim = modes_norm @ modes_norm.T
     mask = 1.0 - jnp.eye(M)
     avg_sim = (sim * mask).sum() / (M * (M - 1))
-    diversity_penalty = 0.01 * jnp.clip(avg_sim - 0.3, 0.0)  # penalise >0.3 similarity
-
-    # Mode activation entropy bonus (keep some exploration)
-    p = state['mode_activation'] / (state['mode_activation'].sum() + 1e-8)
-    entropy = -jnp.sum(p * jnp.log(p + 1e-8))
-    entropy_bonus = -0.001 * entropy  # negative = maximise entropy, but weak
-
-    return diversity_penalty + entropy_bonus
+    return 0.01 * jnp.clip(avg_sim - 0.3, 0.0)
 
 
 __all__ = [
-    'SelfStateDC',
-    'SelfState',
-    'self_state_from_dc',
-    'self_state_to_dc',
+    'SELF_INIT_STD',
     'init_self_params',
     'init_self_state',
     'reset_session_state',
     'self_lattice_forward',
+    'update_self_state',
+    'narrative_keep_score',
     'self_lattice_reg_loss',
 ]

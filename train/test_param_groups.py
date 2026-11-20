@@ -76,7 +76,7 @@ def test_every_leaf_survives_and_no_leaf_is_duplicated():
             'val_cb': [{'A': jnp.ones((4, 3)), 'W': jnp.eye(3)}],
             'bind_cb': [{'A': jnp.ones((4, 3)), 'W': jnp.eye(3)}],
         },
-        'self': {'core': jnp.ones(3), 'modes': jnp.ones((4, 3))},
+        'self': {'C_self': jnp.ones((4, 3)), 'bias_self': jnp.array(0.05)},
         'danger': {'C': jnp.ones((4, 3))},
         'qwen': None,
         'z_proj': None,
@@ -126,7 +126,8 @@ def test_frozen_constants_stay_out_of_the_optimizer_tree():
     p = {
         'encoder': {'w': jnp.ones((2, 2))},
         'sparse': {'C': jnp.ones((4, 2)), 'zero_vec': jnp.zeros((1, 2))},
-        'self': {'core': jnp.ones(2), 'modes': jnp.ones((4, 2))},
+        # R15: C_self is one EMA-owned array; ema_update_self freezes row 0.
+        'self': {'C_self': jnp.ones((4, 2)), 'bias_self': jnp.array(0.05)},
         'danger': {'C': jnp.ones((4, 2))},
         'qwen': {'model.embed_tokens.weight': jnp.ones((3, 2))},
         'z_proj': None,
@@ -136,9 +137,10 @@ def test_frozen_constants_stay_out_of_the_optimizer_tree():
     assert 'zero_vec' not in em['sparse']
     assert 'zero_vec' in fr['sparse']
     assert 'danger' in fr and 'danger' not in tr
-    # self_lattice documents core as permanently frozen; only modes train.
-    assert 'core' in fr['self'] and 'core' not in tr.get('self', {})
-    assert 'modes' in tr['self'] and 'modes' not in fr['self']
+    # C_self belongs wholly to the EMA group (a JAX array cannot be split), so
+    # the core row is protected inside ema_update_self, not by a frozen path.
+    assert 'C_self' in em['self'] and 'C_self' not in tr.get('self', {})
+    assert 'bias_self' in tr['self'] and 'bias_self' not in em['self']
     # The frozen Qwen bridge is ~2 GB and must never enter AdamW.
     assert 'qwen' in fr and 'qwen' not in tr
     assert 'z_proj' not in tr and 'z_proj' in fr

@@ -19,8 +19,7 @@ from train.reflection_loop import (SlidingStats, AnomalyDetector, ReflectionLoop
 from train.causal_subject import (CausalGraph, CausalSubject,
                                   SOURCE_EXTERNAL, SOURCE_INTERNAL)
 from train.narrative_memory import ImportanceEvaluator, _check_state_jump
-from train.self_lattice import (init_self_params, init_self_state,
-                                self_lattice_forward)
+from train.self_lattice import init_self_params, self_lattice_forward
 from train.gvalue import make_global_value_vectors, GValueCodebook
 
 
@@ -169,33 +168,27 @@ def test_09_ema_no_collapse():
           f"manifold={Dm.min():.4f} (>0.1)")
 
 
-# ─── #10 mode_activation（概率）当 logits ───────────────────────────────────
+# ─── #10 R15: self codebook NN + cosine familiarity ─────────────────────────
 
-def test_10_self_mode_sampling_proportional():
-    rng = jax.random.PRNGKey(42)
-    d, M = 8, 4
-    params = init_self_params(rng, d, M_self=M)
-    # 峰值激活：mode 0 占 0.7。logits=τ·log(p) → 采样 ∝ p^τ = p。
-    # 旧实现 logits=τ·p → softmax 锐化 → mode 0 占比仅 ~0.25。
-    state = {'step': 0,
-             'mode_activation': jnp.array([0.7, 0.1, 0.1, 0.1]),
-             'temp_avg': jnp.zeros(d),
-             'gamma_self': 0.99}
-    core = np.asarray(params['core'])
-    modes = np.asarray(params['modes'])
-    counts = np.zeros(M)
-    for i in range(2000):
-        o_self, _, _ = self_lattice_forward(
-            params, state, rng=jax.random.PRNGKey(i), training=True)
-        o = np.asarray(o_self).ravel()
-        # STE 下 o_self = core + modes[mode_idx]，用最近 mode 反推采样索引
-        idx = int(np.argmin(np.sum(
-            (o[None, :] - core[None, :] - modes) ** 2, axis=-1)))
-        counts[idx] += 1
-    props = counts / counts.sum()
-    assert 0.55 <= props[0] <= 0.85, f"mode0 占比 {props[0]:.3f}, 期望 ≈0.7"
-    assert np.all((props[1:] >= 0.05) & (props[1:] <= 0.25)), f"props {props}"
-    print(f"  [10] 2000 次采样 mode 占比: {np.round(props, 3)} (≈[.7,.1,.1,.1])")
+def test_10_self_familiarity_modulation():
+    """R15 replaced mode sampling with nearest-prototype familiarity."""
+    p = init_self_params(jax.random.PRNGKey(42), 8, M_self=4)
+    # The initial codebook is random and tiny; use an explicit one so the
+    # familiar/unfamiliar distinction is about the formula, not the seed.
+    e0 = np.zeros((1, 8), dtype=np.float32); e0[0, 0] = 1.0
+    e1 = np.zeros((1, 8), dtype=np.float32); e1[0, 1] = 1.0
+    p['C_self'] = jnp.concatenate([jnp.asarray(e0), jnp.asarray(e1),
+                                   jnp.zeros((2, 8))], axis=0)
+    z_fam = jnp.asarray(e0)
+    z_other = jnp.zeros((1, 8)).at[0, 7].set(1.0)  # orthogonal to every row
+
+    _, familiar = self_lattice_forward(p, z_fam, training=False)
+    _, unfamiliar = self_lattice_forward(p, z_other, training=False)
+    assert float(familiar[0]) > float(unfamiliar[0])
+    assert 0.0 <= float(unfamiliar[0]) <= float(p['bias_self']) + 1e-6
+    assert 0.0 <= float(familiar[0]) <= float(p['bias_self']) + 1e-6
+    print(f"  [10] self_bias: familiar={float(familiar[0]):.4f}, "
+          f"unfamiliar={float(unfamiliar[0]):.4f} (R15 cosine)")
 
 
 # ─── #11 gvalue 边界不一致（margins == 0）──────────────────────────────────

@@ -30,12 +30,18 @@ def test_resume_keeps_trained_z_proj():
     token spaces. W_out was never what this test was about.
     """
     cfg = LCMConfig()
-    d, V = 64, 32
+    d, V = cfg.d_model, 32
     with tempfile.TemporaryDirectory() as tmp:
         params_min = {
             'z_proj': np.ones((896, d), dtype=np.float32),
             'encoder': {'embed': np.ones((V, d), dtype=np.float32)},
         }
+        # R15: a resumable params dict must carry the self codebook; this
+        # fixture is intentionally minimal, so seed a valid one.
+        from train.self_lattice import init_self_params
+        params_min['self'] = jax.tree_util.tree_map(
+            np.asarray,
+            init_self_params(jax.random.PRNGKey(0), d, cfg.n_self_codes))
         with open(os.path.join(tmp, "cog_params.pkl"), "wb") as f:
             import pickle
             pickle.dump({'params': params_min, 'step': 5,

@@ -181,13 +181,15 @@ def cog_loop_scan(z, params, cfg, max_steps=None, rng=None,
             ``contrast_indices``, ``contrast_residuals``,
             ``binding_residuals``, ``binding_indices``, ``binding_b_q``,
             ``binding_k_q`` and ``binding_val_out_idx`` (each stacked along
-            axis 0). These are exactly the
+            axis 0). R15 adds ``self_idx`` and ``self_bias`` when the self
+            lattice is present. These are exactly the
             inputs the R18 losses and the EMA pass consume, so neither needs a
             second forward pass.
     """
     from jax import lax
 
     from train.cognitive_step import six_lattice_step
+    from train.self_lattice import self_lattice_forward
 
     if max_steps is None:
         max_steps = cfg.max_inference_steps
@@ -196,8 +198,26 @@ def cog_loop_scan(z, params, cfg, max_steps=None, rng=None,
     keys = jax.random.split(rng, max_steps)
 
     def _step(z_cur, key):
+        # R15: self is a real seventh fused element and is recomputed from the
+        # current state each macro step (the same contract as infer/loops_v3.c).
+        # Its nearest-row index is carried in aux so the EMA pass writes the
+        # row this forward actually selected.
+        self_output = None
+        self_bias = None
+        self_extras = {}
+        if 'self' in params:
+            self_output, self_bias, self_aux = self_lattice_forward(
+                params['self'], z_cur, training=True, return_aux=True)
+            self_extras = {
+                'self_idx': self_aux['idx'],
+                'self_bias': self_bias,
+                'z_self': self_output,
+            }
         z_next, aux = six_lattice_step(
-            z_cur, params, cfg, training=True, rng=key)
+            z_cur, params, cfg, training=True, rng=key,
+            self_output=self_output, self_bias=self_bias)
+        if self_extras:
+            aux = {**aux, **self_extras}
         diff = jnp.sqrt(jnp.sum((z_next - z_cur) ** 2, axis=-1))
         return z_next, diff, aux
 
@@ -226,6 +246,10 @@ def cog_loop_scan(z, params, cfg, max_steps=None, rng=None,
                 'binding_k_q': aux['binding_k_q'],
                 'binding_val_out_idx': aux['binding_val_out_idx'],
             }
+            if 'self_idx' in aux:
+                stats['self_idx'] = aux['self_idx']
+                stats['self_bias'] = aux['self_bias']
+                stats['z_self'] = aux['z_self']
             return z_next, (z_next, diff, aux['entropy'], stats)
 
         _, (z_qs, diffs, entropies, stats) = lax.scan(macro_step, z, keys)

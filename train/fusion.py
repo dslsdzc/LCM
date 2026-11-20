@@ -53,7 +53,13 @@ def fuse_lattices_with_aux(lattice_outputs, soft_mask, params, gvalue=None,
             routing. It must not change the weights (R5).
         tau_val: DEPRECATED / ignored temperature for the removed value
             signal.
-        self_bias_weight: Optional scalar weight for self lattice output.
+        self_bias_weight: The self lattice's familiarity scalar. Despite the
+            historical keyword name (kept for API compatibility, Ruling 2),
+            this is no longer a constant weight: it is the per-sample
+            ``self_bias`` returned by ``self_lattice_forward``. A scalar is
+            broadcast over the batch; a ``(B,)`` or ``(B, 1)`` array applies
+            one familiarity value per sample. May be None when no self output
+            is present.
 
     Returns:
         z_q: (B, d) fused representation.
@@ -82,9 +88,20 @@ def fuse_lattices_with_aux(lattice_outputs, soft_mask, params, gvalue=None,
 
     z_q = jnp.einsum('bdn,bn->bd', stacked, weights_norm)  # (B, d)
 
-    # Fuse self lattice output as additive bias
+    # Fuse self lattice output as additive bias. R15: self_bias is a
+    # per-sample familiarity scalar, so it needs an explicit broadcast axis.
     if self_output is not None:
-        z_q = z_q + self_bias_weight * self_output
+        bias = jnp.asarray(self_bias_weight)
+        if bias.ndim == 0:
+            z_q = z_q + bias * self_output
+        else:
+            if bias.ndim == 2 and bias.shape[-1] == 1:
+                bias = bias[:, 0]
+            if bias.ndim != 1 or bias.shape[0] != z_q.shape[0]:
+                raise ValueError(
+                    f"self_bias must be scalar or ({z_q.shape[0]},), got "
+                    f"{tuple(bias.shape)}")
+            z_q = z_q + bias[:, None] * self_output
 
     z_q = layer_norm(z_q, params['ln_scale'], params['ln_bias'])
     entropy = -jnp.sum(weights_norm * jnp.log(weights_norm + 1e-8), axis=-1)
