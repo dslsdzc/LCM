@@ -183,7 +183,7 @@ python train/smoke_conformance.py --steps 100 --batch 1 --seq 64 \
     VQ codebook/commitment split、routing hard、HRQ-inactive LFQ、
     observability 100 条、feature bank、gvalue strict margin=0.5
     （pos 1.0 safe / neutral 1.0 abort / neg 1.0 abort）、frozen hashes、
-    self_bias、5% 开销（0.0399%）、save/load/旧 checkpoint 拒绝。
+    self_bias、5% 开销（0.0416%）、save/load/旧 checkpoint 拒绝。
   - `--allow-fail` 只影响退出码；`checks` 表仍是 verdict。
 - Artifact：`checkpoints/conformance_smoke/smoke_report.json` +
   `smoke_report.md` + `step_000100/`（149 MB，不提交）。

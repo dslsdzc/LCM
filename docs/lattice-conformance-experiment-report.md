@@ -17,8 +17,8 @@ smoke 运行 HEAD：`661a26b`（I7 修复尚未提交的工作树）；Task 15 e
 | Python | 3.14.10 |
 | JAX | 0.10.0 |
 | 设备 | CPU（`JAX_PLATFORMS=cpu`；GTX 1650 4GB 不参与） |
-| smoke 运行 HEAD | `c32eea9`（Task 15 evidence 提交 `ef7136b`，pre-docs；最后行为变更 `8379d45`） |
-| 总耗时 | 142.7s |
+| smoke 运行 HEAD | `661a26b` + I7 未提交工作树（Task 15 evidence 提交 `ef7136b`，pre-docs；最后行为变更 `661a26b`） |
+| 总耗时 | 174.86s |
 | C 参考 | `make -C infer clean && make -C infer test`（243 PASS） |
 
 ## 2. 配置
@@ -170,20 +170,20 @@ EMA 总结果：PASS
 
 - EMA codebook loss zero：PASS
 - commitment loss positive：PASS
-- `hrq_codebook`：0.2553
-- `hrq_commitment`：0.2553
+- `hrq_codebook`：0.0033098
+- `hrq_commitment`：0.0033098
 - `sparse_codebook`：0.0000
-- `sparse_commitment`：0.0000
-- `lowrank_codebook`：0.7621
-- `lowrank_commitment`：0.7621
+- `sparse_commitment`：0.0001511
+- `lowrank_codebook`：0.7620
+- `lowrank_commitment`：0.7620
 - `manifold_codebook`：0.0000
-- `manifold_commitment`：0.1483
+- `manifold_commitment`：0.0076786
 - `binding_codebook`：0.0000
-- `binding_commitment`：0.0130
-- `contrast_codebook`：1.3749
-- `contrast_commitment`：1.3749
-- `route_codebook`：0.2491
-- `route_commitment`：0.2491
+- `binding_commitment`：0.022789
+- `contrast_codebook`：1.4140
+- `contrast_commitment`：1.4140
+- `route_codebook`：0.25021
+- `route_commitment`：0.25021
 - pass：PASS
 
 ### 6.3 Routing hard (R19)
@@ -201,10 +201,10 @@ EMA 总结果：PASS
 
 ## 7. C_route vs weight-decay baseline
 
-- `C_route` Δmax：1.252e-02
+- `C_route` Δmax：1.5537e-02
 - weight-decay-only `C_route` Δmax：1.066e-05
-- 实际 / baseline：1174.5×
-- full route tree Δmax（含 `W_route`，secondary）：1.502e-02
+- 实际 / baseline：1457.8×
+- full route tree Δmax（含 `W_route`，secondary）：1.5537e-02
 - 结论：PASS（C_route only; W_route is reported separately）
 
 ## 8. Sparse / LFQ、HRQ 路由、熵门、feature bank、self
@@ -213,7 +213,7 @@ EMA 总结果：PASS
 
 - 推理非零比例：100.00% (8/8)
 - near 非零：PASS；far 强制 zero_vec：PASS
-- far d_top=2.3013, d_min=2.8511, lambda_lfq=1.5
+- far d_top=2.5766, d_min=2.8352, lambda_lfq=1.5
 - 无 c_top 时 LFQ 禁用：PASS
 - d_top shape=[2]，跨样本不同=PASS
 
@@ -240,7 +240,7 @@ EMA 总结果：PASS
 
 - self_bias [0.0036, 0.0500]，alpha=0.05，in_range=PASS
 - 熟悉 vs 不熟悉：0.0500 vs 0.0036，varies=PASS
-- 训练步内范围：[0.0083, 0.0500]
+- 训练步内范围：[0.004925, 0.0500]
 
 ## 9. 安全：pattern probe 与 v3 hard-stop 分开
 
@@ -285,10 +285,10 @@ C `test_runner` 243 PASS；`nm` 含 `lcm_infer_loop_v3`/`hrq_forward_v31`。Mani
 
 ## 11. 自观测 5% 开销
 
-- 真实 `_self_observe_step` 20 次中位数：0.440 ms
-- 生产 `train_step` 20 次中位数（无 on_step，block_until_ready）：1101.5 ms
-- callback interval 参考值：1109.6 ms
-- overhead：**0.042%**，<5%：PASS
+- 真实 `_self_observe_step` 20 次中位数：0.4465 ms
+- 生产 `train_step` 20 次中位数（无 on_step，block_until_ready）：1073.67 ms
+- callback interval 参考值：1110.79 ms
+- overhead：**0.0416%**，<5%：PASS
 
 20-run median wall-clock of the real _self_observe_step path divided by a 20-run median of the production train_step measured without the smoke on_step callback and with jax.block_until_ready per run. The callback interval is only a reference. The first JIT step is a warmup, not a measurement.
 
@@ -348,10 +348,10 @@ JAX_PLATFORMS=cpu /home/DslsDZC/LCM/be/bin/python train/smoke_conformance.py \
   --data /home/DslsDZC/data/tmp/opencode/conformance_corpus/conformance.dat \
   --shape /home/DslsDZC/data/tmp/opencode/conformance_corpus/conformance_shape.json \
   --spans /home/DslsDZC/data/tmp/opencode/conformance_corpus/conformance_docs.npy \
-  --output checkpoints/conformance_smoke --passive-only --allow-fail
+  --output checkpoints/conformance_smoke --passive-only
 ```
 
-`--allow-fail` 让命令在已知 FAIL（利用率/真实熵门）时仍写出完整 artifact；`checks` 表是 verdict，不是退出码。
+本次复跑未加 `--allow-fail`，因此两个已知 FAIL（利用率/真实熵门）使退出码为 1；`checks` 表是 verdict。只有在需要强制写出完整 artifact 时才使用 `--allow-fail`。
 
 ## 16. Checks 汇总
 
