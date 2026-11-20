@@ -606,18 +606,20 @@ def manifold_orth_loss(T, indices, k, lambda_orth=0.01, rng=None):
 
     ``k`` is the number of *sampled* codebooks (static): the sample shape must
     be a compile-time constant, since ``jax.random.choice`` cannot take a
-    shape derived from a traced value. The previous form sized the draw by
-    ``k - len(unique(indices))``, and ``indices`` is a traced array under
-    ``jax.grad``/``jit`` — ``jnp.unique(...).shape[0]`` is not concrete, so the
-    call raised a shape error whenever this was used inside a jitted step.
-    Active codebooks are added on top of the draw and de-duplicated.
+    shape derived from a traced value. ``indices`` is a traced array under
+    ``jax.grad``/``jit``, so it must not be passed through ``jnp.unique``:
+    without a static ``size=`` that call raises a ConcretizationTypeError
+    during tracing. Active codebooks are appended to the draw as-is; a
+    duplicate index simply contributes the same term twice, which is a
+    weighting choice, not a correctness issue, and keeps every tensor shape
+    static.
     """
     if rng is None:
         rng = jax.random.PRNGKey(0)
     k = max(1, min(int(k), T.shape[0]))  # choice(replace=False) needs k <= M
     sampled = jax.random.choice(rng, T.shape[0], (k,), replace=False)
-    active = jnp.unique(jnp.asarray(indices, dtype=sampled.dtype))
-    target = jnp.unique(jnp.concatenate([active, sampled]))
+    active = jnp.asarray(indices, dtype=sampled.dtype).reshape(-1)
+    target = jnp.concatenate([active, sampled])
 
     # Vectorized: T[target] -> (n, d, t)
     T_target = T[target]  # (n_target, d, t)
@@ -954,12 +956,22 @@ def contrast_value_biased_nce_loss(params, z, v_harm, tau=0.1, tau_val=0.05):
 # ── Local Value Scalars ──────────────────────────────────────────────────────
 
 def init_danger_params(rng, M_danger, d):
-    """Initialize danger codebook — frozen set of vectors marking unsafe regions.
+    """Initialize the two danger codebooks — frozen, never trained.
 
-    Used like gvalue: saved with SHA-256, never updated by optimizer.
+    R13 requires ``C_threats`` and ``C_normal`` to come from different data and
+    to be structurally distinct; ``lcm.py`` refuses to load a checkpoint whose
+    halves are equal. These are **structural placeholders** for the ≤100-step
+    conformance run: the threat half is a fixed random basis, and the normal
+    half is a second, independent draw. ``cog_train`` replaces the normal half
+    with the first training batch's ``z`` so the normal path is data-aligned;
+    neither half has any semantic safety meaning yet. Used like gvalue: saved
+    with SHA-256, never updated by the optimizer.
     """
-    C = jax.random.normal(rng, (M_danger, d)) * 0.02
-    return {'C': C}
+    threat_key, normal_key = jax.random.split(rng)
+    return {
+        'C': jax.random.normal(threat_key, (M_danger, d)) * 0.02,
+        'C_normal': jax.random.normal(normal_key, (M_danger, d)) * 0.02,
+    }
 
 
 def init_value_scalars(cfg: LCMConfig):

@@ -619,17 +619,26 @@ def _load_binding_proj(path, cfg):
 
 
 def _save_danger(params, path, M_danger, d):
-    """danger: threats + normals, SHA-256 hash (frozen, values not trained).
+    """danger: two distinct frozen halves (C_threats then C_normal) + SHA-256.
 
-    The C engine (lcm.py) reads TWO halves: C_threats (M_danger × d) then
-    C_normal (M_danger × d). params['danger'] only carries the threat
-    codebook (C) — the normal half is a C placeholder: identical threats
-    give danger_score = sim_threat - sim_normal = 0, so the pattern-match
-    gate never fires until real normals are trained.
+    R13: equal halves are a placeholder that disables the lattice; ``lcm.py``
+    rejects them on load. Refuse to write one rather than producing a file the
+    engine cannot honestly use. The values are frozen structural placeholders,
+    not trained semantic safety data.
     """
-    C = np.asarray(params['danger']['C'], dtype=np.float32)
+    danger = params['danger']
+    C_t = np.asarray(danger['C'], dtype=np.float32)
+    if 'C_normal' not in danger:
+        raise ValueError(
+            "params['danger'] has no C_normal; R13 requires distinct "
+            "threat/normal halves")
+    C_n = np.asarray(danger['C_normal'], dtype=np.float32)
+    if np.array_equal(C_t, C_n):
+        raise ValueError(
+            "danger threat and normal halves are identical; refusing to "
+            "write a placeholder that lcm.py will reject")
     hdr = _pack_header(M_danger, d, 1, CB_EUCLIDEAN, 1.0)
-    data_bytes = C.tobytes() + C.tobytes()
+    data_bytes = C_t.tobytes() + C_n.tobytes()
     sha = _sha256(data_bytes)
     _write_bin(path, hdr, data_bytes, sha256_digest=sha)
     print(f"    SHA-256: {sha.hex()[:16]}...")

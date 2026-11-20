@@ -72,7 +72,9 @@ class LCMConfig:
     n_value_pairs: int = 4      # Four laws → 4 pos + 4 neg
     M_danger: int = 256         # Danger codebook size
     safety_margin_relative: float = 0.5
-    consistency_threshold: float = 0.3
+    # R17: spec value. The JAX field is unused; the deployed C engine still
+    # compares against LCM_CONSISTENCY_THRESHOLD=0.3 (deferred, see audit).
+    consistency_threshold: float = 0.7
 
     # Routing
     tau_route: float = 0.5      # Gumbel-Softmax temperature
@@ -145,15 +147,21 @@ class LCMConfig:
     lambda_verifier: float = 0.001  # Verifier regularization weight
 
     # Inference engine (C)
-    max_inference_steps: int = 32
+    # R17: scheduling budget 16 (graceful return). The C hard limit is 64 and
+    # is the only step-count abort. 32 macro steps also made the unrolled
+    # recurrence's gradient explode (non-finite trainable gradients at step 32,
+    # finite at 16); 16 is both the spec value and the stable one.
+    max_inference_steps: int = 16
     convergence_tol: float = 1e-3
     # 2.0 ≈ ln(7)+ε: uniform fusion entropy (≈1.95) never trips it, so the
     # entropy gate is effectively disabled — convergence is driven by
     # convergence_tol only. Aligned with infer/lcm.h LCM_ENTROPY_THRESHOLD.
     # (0.5 used to make the convergence bonus in cog_train dead code: fusion
-    # entropy ≈ ln(6) ≈ 1.79 could never drop below it.)
+    # entropy ≈ ln(6) ≈ 1.79 could never drop below it.) See the 3.1 audit:
+    # R9 asks for normalised H/ln(n_active) at 0.5; the JAX training path still
+    # uses this raw-nats threshold, so that item is deferred, not claimed fixed.
     entropy_threshold: float = 2.0
-    max_retrievals_per_step: int = 12
+    max_retrievals_per_step: int = 128
 
     # Reflection loop (轨迹审计器)
     reflection_enabled: bool = True

@@ -12,17 +12,18 @@ from train.param_groups import (
 
 
 def test_ema_paths_are_the_frozen_contract():
-    """R3/Ruling 4: exactly these EMA paths, danger is the only frozen param.
+    """R3/Ruling 4/R13: these EMA paths, and both danger halves frozen.
 
     gvalue is a runtime state object (``state['gvalue']``), never a member of
-    ``params``, so it must not appear here.
+    ``params``, so it must not appear here. R13 added ``C_normal`` next to
+    ``C_threats``; both are frozen safety data, not parameters.
     """
     assert EMA_PATHS == {
         ('sparse', 'C'), ('manifold', 'C'),
         ('binding', 'key_cb'), ('binding', 'val_cb'), ('binding', 'bind_cb'),
         ('self', 'C_self'),
     }
-    assert FROZEN_PATHS == {('danger', 'C')}
+    assert FROZEN_PATHS == {('danger', 'C'), ('danger', 'C_normal')}
 
 
 def test_partition_roundtrip():

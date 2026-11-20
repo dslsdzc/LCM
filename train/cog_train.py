@@ -36,7 +36,7 @@ from train.hyp import safe_unit
 from train.lattices import (
     init_hrq_params, init_sparse_params, init_lowrank_params,
     init_manifold_params, init_binding_params, init_contrast_params,
-    init_route_params, init_value_scalars,
+    init_route_params, init_value_scalars, init_danger_params,
 )
 from train.fusion import init_fusion_params
 from train.self_lattice import (
@@ -498,6 +498,20 @@ def init_cog_params(cfg, rng, qwen_ckpt=None, resume=None,
         params['route'] = init_route_params(keys[8], cfg.n_lattices, d)
         params['fusion'] = init_fusion_params(keys[9], cfg.n_lattices, d)
         params['value_scalars'] = init_value_scalars(cfg)
+        # R13: frozen structural safety codebooks. Both halves are distinct by
+        # construction; the training loop replaces the normal half with the
+        # first batch's z so the normal path is data-aligned. They never enter
+        # the optimizer (FROZEN_PATHS).
+        params['danger'] = init_danger_params(keys[11], cfg.M_danger, d)
+
+    # R13: a v2 checkpoint written before the two-half danger layout, or the
+    # minimal fixtures used by resume tests, may lack C_normal. Initialise a
+    # fresh structural pair rather than silently exporting equal halves.
+    if 'danger' not in params or 'C_normal' not in params.get('danger', {}):
+        fresh = init_danger_params(jax.random.fold_in(rng, 17), cfg.M_danger, d)
+        params['danger'] = fresh
+        print("[COG] danger: initialised structural C_threats/C_normal "
+              "(checkpoint lacked the two-half R13 layout)")
 
     # Load the frozen Qwen bridge for the active channel. Language LCM is
     # retired: it is not an alternative backend, and a path that is not a .npz
@@ -1207,7 +1221,8 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
               qwen_ckpt=None, resume=None, joint=False, auto_mode=False,
               full_verify=True, allow_missing_self=False,
               self_awareness=True, verifier=None,
-              causal_subject=None):
+              causal_subject=None, tokenizer_path=None, on_step=None,
+              overfit_one_batch=False):
     """Run dual-channel cognitive training (Stage 2).
 
     Dual channels from cognitive state z_q:
@@ -1243,6 +1258,22 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
             Per Ruling 43 it is wired only when supplied; the default omission
             is the accepted causal deviation (``causal_subject.py`` itself is
             not modified).
+        tokenizer_path: optional override for dataset identity resolution. The
+            default is the registry path for the metadata's ``tokenizer_id``;
+            tests and the conformance smoke use this to point at a temporary
+            tokenizer without modifying the global registry.
+        on_step: optional callback invoked after a clean step has been applied,
+            bank-updated and saved. Signature:
+            ``on_step(abs_step, loss, aux_out, params, ema_state,
+            feature_bank, contrast_bank, contrast_last_used, step_time_ms)``.
+            It exists for the Task-15 smoke diagnostics; it is outside jit,
+            receives the post-step state, and must not mutate it. Exceptions
+            propagate (a diagnostic failure is not a training failure).
+        overfit_one_batch: smoke-only switch. When True, every step reuses the
+            first ``(inputs, targets)`` window instead of sampling a new one.
+            Design §6.3's "single-batch overfit" check (last-10 mean < 0.8 ×
+            first-10 mean) is only meaningful when the target does not change
+            every step. Default False is the normal streaming path.
     """
     from train.data import WikiDataIter
     from tqdm import tqdm
@@ -1252,6 +1283,7 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     # 1. Verify corpus/tokenizer BEFORE allocating model parameters.
     spec, meta = resolve_dataset_identity(
         data_path, shape_path, spans_path, full_verify=full_verify,
+        tokenizer_path=tokenizer_path,
     )
 
     # 2. The dataset owns the tensor vocabulary extent. Deliberately does not
@@ -1310,6 +1342,10 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     # 6. Sampling must consume the same dataset identity.
     data_iter = WikiDataIter(data_path, shape_path, spans_path,
                              B=batch_size, N=seq_len)
+    fixed_batch = next(data_iter) if overfit_one_batch else None
+    if overfit_one_batch:
+        print("[COG] smoke: reusing one fixed batch for every step "
+              "(single-batch overfit check)")
     train_step = make_train_step(cfg, optimizer, joint=joint)
 
     # ── Self-observation stack (R16 / e.md §1) ──────────────────────────
@@ -1415,7 +1451,7 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
         # checkpoint names). Never use one for the other.
         abs_step = item['abs_step']
         step = abs_step
-        batch = next(data_iter)
+        batch = fixed_batch if fixed_batch is not None else next(data_iter)
         current_lr = schedule(abs_step)
         rng, step_rng = jax.random.split(rng)
 
@@ -1484,6 +1520,22 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
             pbar.update(1)
             continue
 
+        # R13: the normal danger half is a structural placeholder drawn from the
+        # first clean batch's cognitive state, not a semantic normal set. The
+        # threat half stays the fixed random basis; the two halves are
+        # therefore different data and different rows, which is what the C
+        # loader requires. This is a frozen write: it never enters the
+        # optimizer, and it happens once.
+        if abs_step == 0 and 'danger' in params:
+            z0 = np.asarray(jax.device_get(aux_out['z_cur'])).astype(np.float32)
+            z0 = z0.reshape(-1, cfg.d_model)
+            M_d = int(params['danger']['C'].shape[0])
+            reps = np.tile(z0, (int(np.ceil(M_d / z0.shape[0])), 1))[:M_d]
+            params['danger'] = dict(
+                params['danger'], C_normal=jnp.asarray(reps))
+            print(f"[COG] danger: C_normal seeded from first-batch z "
+                  f"({M_d} rows, structural placeholder)")
+
         # Feature bank: contrast's usage clock is updated EVERY step (R17);
         # dead detection/replacement and bank collection only at the interval.
         loop_stats = aux_out.get('loop_stats')
@@ -1511,6 +1563,13 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
                                 contrast_bank=contrast_bank,
                                 contrast_last_used=contrast_last_used,
                                 run_identity=run_identity, train_cfg=cfg)
+
+        # Task-15 diagnostics: post-bank, post-save state. Placed after the
+        # checkpoint write so the callback sees exactly what was persisted.
+        if on_step is not None:
+            on_step(abs_step, loss_f, aux_out, params, ema_state,
+                    feature_bank, contrast_bank, contrast_last_used,
+                    step_time_ms)
 
         running_loss += loss_f
         logged_steps += 1
@@ -1907,15 +1966,15 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
     try:
         C_pos, C_neg = make_global_value_vectors(d)
         C_p = _to_np(C_pos)
-        # PLACEHOLDER — NOT A WORKING SAFETY LAYER.
-        # Identical halves → pos_d_min == neg_d_min → the C engine's margin
-        # check (pos > neg - margin ⇒ unsafe) never fires, and lcm.py detects
-        # the equality and disables gvalue entirely. Real anchors are not
-        # trained yet; distinct halves would abort the cognitive loop on
-        # (almost) every input instead, which is worse. See README §Safety.
-        print("[CKPT] WARNING: exporting PLACEHOLDER gvalue (pos == neg) — "
-              "the global value safety check is DISABLED in the C engine")
-        C_n = C_p.copy()
+        C_n = _to_np(C_neg)
+        if np.array_equal(C_p, C_n):
+            raise ValueError(
+                "gvalue anchors are identical; refusing to export a "
+                "placeholder that lcm.py would reject")
+        # STRUCTURAL, NOT SEMANTIC. These are the hand-designed R6 anchors, not
+        # trained value examples. The strict margin=0.5 path will abort most
+        # real inputs by design; the smoke uses use_safety=False for the
+        # cognitive path and reports the strict result separately.
         _hdr = bytearray(_pack_header(C_p.shape[0], d, 1, 2, 1.0))
         _data = C_p.tobytes() + C_n.tobytes()
         struct.pack_into("<I", _hdr, HEADER_SIZE_V2 - 4,
@@ -1931,18 +1990,29 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
         C_p, C_n = gvalue_written
         manifest_tensors['gvalue_codebook'] = _np.concatenate(
             [C_p.ravel(), C_n.ravel()]).astype(_np.float32)
-    # danger codebook — PLACEHOLDER, same story as gvalue above: identical
-    # halves with a fixed seed → danger_score ≡ 0 → the danger lattice never
-    # fires. The danger lattice is not part of cognitive training yet.
-    # Matches checkpoint._save_danger.
+    # R13: danger two-half export. Both halves are frozen structural
+    # placeholders, but they MUST be different data — lcm.py refuses an equal
+    # pair, and an equal pair makes the danger lattice a no-op. The threat half
+    # is the fixed random basis from init_cog_params; the normal half is the
+    # first training batch's z (data-aligned). This is not semantic safety.
     danger_written = None
     try:
-        print("[CKPT] WARNING: exporting PLACEHOLDER danger codebook "
-              "(threat == normal) — the danger lattice is INACTIVE")
-        M_d = export_cfg["M_danger"]
-        _np.random.seed(0)
-        danger_t = _np.random.randn(M_d, d).astype(_np.float32) * 0.02
-        danger_n = danger_t.copy()
+        danger = params.get('danger')
+        if danger is None or 'C_normal' not in danger:
+            raise ValueError(
+                "params['danger'] has no C_normal; R13 requires a distinct "
+                "threat/normal pair, not an equal placeholder")
+        danger_t = _to_np(danger['C']).astype(np.float32)
+        danger_n = _to_np(danger['C_normal']).astype(np.float32)
+        if danger_t.shape != danger_n.shape:
+            raise ValueError(
+                f"danger halves have shapes {danger_t.shape} and "
+                f"{danger_n.shape}")
+        if np.array_equal(danger_t, danger_n):
+            raise ValueError(
+                "danger threat and normal halves are identical; lcm.py would "
+                "reject this checkpoint")
+        M_d = danger_t.shape[0]
         _data_d = danger_t.tobytes() + danger_n.tobytes()
         _sha_d = hashlib.sha256(_data_d).digest()
         _crc_d = zlib.crc32(_data_d) & 0xFFFFFFFF

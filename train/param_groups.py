@@ -33,9 +33,12 @@ EMA_PATHS = frozenset({
 })
 
 # R3 / Ruling 4: frozen parameter leaves. gvalue is a runtime state object and
-# is deliberately absent.
+# is deliberately absent. R13: the danger lattice owns two frozen codebooks,
+# both of which must stay out of AdamW (otherwise weight decay changes safety
+# data every step).
 FROZEN_PATHS = frozenset({
     ('danger', 'C'),
+    ('danger', 'C_normal'),
 })
 
 # Read-only constants that are stored in the params tree for shape/API
