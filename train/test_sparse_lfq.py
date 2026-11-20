@@ -5,14 +5,15 @@ Run from repo root:
 """
 import jax
 import jax.numpy as jnp
+import pytest
 
 from train.cognitive_step import six_lattice_step
 from train.config import LCMConfig
 from train.encoder import encoder_forward
 from train.hyp import exp_map, poincare_similarity, safe_unit
 from train.lattices import (
-    hrq_forward, hrq_top_prototype, init_sparse_params, sparse_forward,
-    sparse_zero_similarity,
+    clamp_norm, hrq_forward, hrq_top_prototype, init_simvq, init_sparse_params,
+    sparse_forward, sparse_zero_similarity,
 )
 from train.model import init_all_params
 
@@ -63,7 +64,7 @@ def test_lfq_is_per_sample():
     p = {'C': jnp.ones((1, 4)) * 0.99, 'zero_vec': jnp.zeros((1, 4))}
     # d_min(0) ~ 2e-4: sample 0's threshold is 1e-9, sample 1's is huge.
     d_top = jnp.array([1e-9, 1e9])
-    o, _ = sparse_forward(p, z, training=False, lambda_lfq=0.1,
+    o, _ = sparse_forward(p, z, training=False, lambda_lfq=1.5,
                           d_top=d_top, c_top=z)
     assert jnp.allclose(o[0], 0.0)
     assert not jnp.allclose(o[1], 0.0)
@@ -85,12 +86,107 @@ def test_lambda_lfq_scales_the_threshold():
     d_top = jnp.ones((2,))
     # d_min ~ 2.5e-4 for this crafted pair. A multiplier above that keeps the
     # code; one below it zeroes the output.
-    kept, _ = sparse_forward(p, z, training=False, lambda_lfq=1.0,
+    kept, _ = sparse_forward(p, z, training=False, lambda_lfq=1.5,
                              d_top=d_top, c_top=z)
     zeroed, _ = sparse_forward(p, z, training=False, lambda_lfq=1e-6,
                                d_top=d_top, c_top=z)
     assert not jnp.allclose(kept, 0.0)
     assert jnp.allclose(zeroed, 0.0)
+
+
+def test_lfq_uses_real_hrq_top_similarity():
+    """The threshold must work at HRQ's real similarity scale.
+
+    Fabricated ``d_top=1.0`` hides the scale mismatch: with the old 0.1
+    multiplier and an init-scale ``d_top`` of ~2.7, every sample was zeroed at
+    random initialisation. Here ``d_top`` is produced by ``hrq_forward``.
+    """
+    d = 4
+    u = jnp.ones((1, d)) / jnp.sqrt(jnp.float32(d))
+    # Prototype on the query's ray at tangent radius 0.5 -> d_top ~ 0.54.
+    hrq = {
+        'top': {'A': jnp.concatenate([0.5 * u, -0.5 * u], axis=0),
+                'W': jnp.eye(d)},
+        'fine': [init_simvq(jax.random.PRNGKey(7), 1, d)],
+    }
+    z = jnp.ones((1, d))
+    _, _, d_top, _ = hrq_forward(hrq, z, tau_fallback=0.1,
+                                 value_topk=CFG.hrq_value_topk)
+    assert d_top.shape == (1,)
+    assert 0.1 < float(d_top[0]) < 1.0
+
+    zero_vec = jnp.zeros((1, d))
+    near = {'C': 0.99 * u, 'zero_vec': zero_vec}   # same ray, almost at z_P
+    far = {'C': 0.20 * u, 'zero_vec': zero_vec}    # same ray, near the origin
+
+    def ratio(p):
+        z_P = exp_map(safe_unit(z))
+        C_P = exp_map(clamp_norm(p['C'], 0.99))
+        d_min = poincare_similarity(
+            z_P[:, None, :], C_P[None, :, :]).squeeze(-1).min(axis=-1)
+        return d_min, d_min / d_top
+
+    d_near, r_near = ratio(near)
+    d_far, r_far = ratio(far)
+    assert float(r_near[0]) < CFG.lambda_lfq
+    assert float(r_far[0]) > CFG.lambda_lfq
+    # The far code is still closer than zero_vec, so a zero output is LFQ's
+    # decision — ordinary retrieval would have returned the code.
+    zero_sim = sparse_zero_similarity(z)
+    assert float(d_far[0]) < float(zero_sim[0])
+
+    o_near, idx_near = sparse_forward(
+        near, z, training=False, lambda_lfq=CFG.lambda_lfq,
+        d_top=d_top, c_top=z)
+    o_far, idx_far = sparse_forward(
+        far, z, training=False, lambda_lfq=CFG.lambda_lfq,
+        d_top=d_top, c_top=z)
+    assert not jnp.allclose(o_near, 0.0)
+    assert int(idx_near[0]) != 0
+    assert jnp.allclose(o_far, 0.0)
+    assert int(idx_far[0]) == 0
+
+    # Control: with LFQ effectively disabled, the same far code is returned.
+    o_ctrl, idx_ctrl = sparse_forward(
+        far, z, training=False, lambda_lfq=1e9, d_top=d_top, c_top=z)
+    assert not jnp.allclose(o_ctrl, 0.0)
+    assert int(idx_ctrl[0]) == 1
+
+    # Reviewer's init scale: an orthogonal-ish HRQ codebook gives d_top > 2.
+    # The near code must still survive the default 1.5 multiplier there.
+    wide = {'top': {'A': jnp.eye(d) * 0.9, 'W': jnp.eye(d)},
+            'fine': [init_simvq(jax.random.PRNGKey(8), 1, d)]}
+    _, _, d_top_wide, _ = hrq_forward(wide, z, value_topk=CFG.hrq_value_topk)
+    assert float(d_top_wide[0]) > 2.0
+    o_wide, idx_wide = sparse_forward(
+        near, z, training=False, lambda_lfq=CFG.lambda_lfq,
+        d_top=d_top_wide, c_top=z)
+    assert not jnp.allclose(o_wide, 0.0)
+    assert int(idx_wide[0]) != 0
+
+
+def test_all_zero_sparse_codebook_is_finite():
+    """All-zero EMA rows must not divide by zero or produce NaN."""
+    z = jnp.ones((2, 4))
+    p = {'C': jnp.zeros((3, 4)), 'zero_vec': jnp.zeros((1, 4))}
+    d_top = jnp.array([0.5, 0.5])
+    for training in (True, False):
+        o, idx = sparse_forward(p, z, training=training,
+                                d_top=d_top, c_top=z)
+        assert jnp.all(jnp.isfinite(o))
+        assert jnp.allclose(o, 0.0)
+        assert jnp.array_equal(idx, jnp.zeros_like(idx))
+
+
+def test_d_top_must_be_per_sample():
+    """A scalar d_top must fail loudly instead of broadcasting to the batch."""
+    p = _sparse_params()
+    z = jnp.ones((2, 4))
+    with pytest.raises(ValueError, match="per-sample"):
+        sparse_forward(p, z, training=False, d_top=1e-6, c_top=z)
+    with pytest.raises(ValueError, match="per-sample"):
+        sparse_forward(p, z, training=False,
+                       d_top=jnp.array([1e-6]), c_top=z)
 
 
 def test_zero_vec_similarity_is_the_poincare_domain():
@@ -129,7 +225,7 @@ def test_step_passes_per_sample_d_top_to_sparse():
     _, _, direct_top_sim, _ = hrq_forward(
         params['hrq'], z, CFG.tau_route_fallback,
         value_scalars=params['value_scalars'].get('hrq'),
-        alpha_val=CFG.alpha_val)
+        alpha_val=CFG.alpha_val, value_topk=CFG.hrq_value_topk)
     assert jnp.allclose(d_top, direct_top_sim, atol=1e-6)
 
     c_top = hrq_top_prototype(params['hrq'], aux['hrq_idx'])
@@ -140,3 +236,6 @@ def test_step_passes_per_sample_d_top_to_sparse():
         alpha_val=CFG.alpha_val)
     assert jnp.allclose(aux['lattice_outputs'][1], want, atol=1e-6), \
         "step's sparse output is not the forward with HRQ's d_top/c_top"
+    # Ruling 15 / design §6.3 B: random-init inference must not be all zero_vec.
+    assert not jnp.allclose(aux['lattice_outputs'][1], 0.0), \
+        "sparse inference is still all-zero at random initialisation"

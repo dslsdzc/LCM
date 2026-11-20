@@ -248,8 +248,20 @@ def hrq_forward(params, z, tau_fallback=0.1, value_scalars=None, alpha_val=0.0,
         ``log_map``; ``quant`` is the selected prototype after ``log_map``.
         ``top_sim`` is per-sample ``(B,)`` — it is Sparse's ``d_top``.
     """
+    if int(value_topk) <= 0:
+        raise ValueError(f"value_topk must be >= 1, got {value_topk}")
+    if tau_proxy <= 0:
+        raise ValueError(f"tau_proxy must be > 0, got {tau_proxy}")
+    M_top = int(params['top']['A'].shape[0])
+    if value_scalars is not None:
+        v_shape = jnp.shape(value_scalars)
+        if len(v_shape) != 1 or int(v_shape[0]) != M_top:
+            raise ValueError(
+                f"value_scalars must have one scalar per top prototype "
+                f"({M_top},), got shape {v_shape}")
+
     z_P, C_top_P, sims = _hrq_sims(params, z)
-    B, M_top = sims.shape
+    B = sims.shape[0]
 
     # ── Stage 1: geometric top-k (no value term) ───────────────────────────
     k = min(int(value_topk), int(M_top))
@@ -270,13 +282,18 @@ def hrq_forward(params, z, tau_fallback=0.1, value_scalars=None, alpha_val=0.0,
     c_top = C_top_P[top_idx]                                  # (B, d)
 
     # ── STE: hard forward, top-k softmax backward (R1.3) ───────────────────
-    # The design's shorthand writes ``c_top + sg(o_soft - c_top)``, but that
-    # operand order blocks the soft path and leaves d output/d v ≡ 0. The STE
-    # that actually yields "hard value, soft gradient" is the reverse:
-    # forward = c_top (bit-for-bit up to one ulp), backward = o_soft.
+    # Two corrections to the design's shorthand:
+    #   * the literal ``c_top + sg(o_soft - c_top)`` puts stop_gradient on the
+    #     soft operand, so d output/d v is exactly zero;
+    #   * ``o_soft + sg(c_top - o_soft)`` has the right gradient but its
+    #     forward value is only c_top up to one ulp.
+    # This form is exact in both directions: the forward correction is
+    # ``o_soft - sg(o_soft) == 0`` (no rounding), the backward path is the soft
+    # mixture alone, and the hard prototype is detached.
     w_proxy = jax.nn.softmax(-score_topk / tau_proxy, axis=-1)  # (B, k)
     o_soft_topk = jnp.einsum('bk,bkd->bd', w_proxy, C_topk_P)   # (B, d)
-    c_top_route = o_soft_topk + lax.stop_gradient(c_top - o_soft_topk)
+    c_top_route = (lax.stop_gradient(c_top)
+                   + (o_soft_topk - lax.stop_gradient(o_soft_topk)))
 
     # ── Relative fallback criterion (R1.4) ────────────────────────────────
     if M_top > 1:
@@ -357,17 +374,19 @@ def clamp_norm(C, max_norm):
 
 
 def sparse_zero_similarity(z):
-    """R2: ``poincare_similarity(z_P, 0)`` in the unified R6 domain.
+    """C-parity helper: ``poincare_similarity(z_P, 0)`` in the unified R6 domain.
 
-    Equals ``2‖z_P‖²/(1-‖z_P‖²)``. It is a domain definition for the C side
-    (``zero_vec`` participates in inference retrieval); the LFQ decision itself
-    compares only the non-zero codebook, as b.md §4.2 specifies.
+    Equals ``2‖z_P‖²/(1-‖z_P‖²)``. It exists so the C side (Task 8) has one
+    authoritative formula for the ``zero_vec`` candidate's domain. The JAX LFQ
+    threshold does **not** call it: b.md §4.2 defines ``d_sparse_min`` over the
+    non-zero codebook only, and the zero vector is the *output* of the LFQ
+    decision, not a candidate in its comparison.
     """
     z_P = exp_map(safe_unit(z))
     return poincare_similarity(z_P, jnp.zeros_like(z_P)).squeeze(-1)
 
 
-def sparse_forward(params, z, training=True, lambda_lfq=0.1, d_top=None,
+def sparse_forward(params, z, training=True, lambda_lfq=1.5, d_top=None,
                    c_top=None, value_scalars=None, alpha_val=0.0):
     """Sparse lattice with train/inference branching and LFQ.
 
@@ -382,7 +401,23 @@ def sparse_forward(params, z, training=True, lambda_lfq=0.1, d_top=None,
     ``d_min`` is measured in the same similarity domain
     (``exp_map(clamp_norm(C, 0.99))``), while retrieval keeps b.md §4.2's
     Euclidean ``argmin`` (value-biased when ``alpha_val > 0``, R22).
+
+    ``d_top`` must be ``(B,)``. The old batch scalar was the defect R2 removed;
+    scalar/1-element inputs are rejected here so they cannot silently broadcast
+    back into batch-shared behaviour.
     """
+    B = z.shape[0]
+    if d_top is not None:
+        shape = jnp.shape(d_top)
+        if len(shape) != 1 or int(shape[0]) != int(B):
+            raise ValueError(
+                f"d_top must be per-sample with shape ({B},), got {shape}")
+    if c_top is not None:
+        shape = jnp.shape(c_top)
+        if len(shape) != 2 or int(shape[0]) != int(B):
+            raise ValueError(
+                f"c_top must be a per-sample prototype ({B}, d), got {shape}")
+
     if training:
         C_search = params['C']  # (M_sparse, d) no zero
     else:

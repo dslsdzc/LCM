@@ -9,8 +9,9 @@ Run from repo root:
 """
 import jax
 import jax.numpy as jnp
+import pytest
 
-from train.hyp import exp_map, log_map, poincare_similarity, safe_unit
+from train.hyp import exp_map, log_map, mobius_add, poincare_similarity, safe_unit
 from train.lattices import _topk_indices, hrq_forward, init_hrq_params, init_simvq
 
 
@@ -120,6 +121,59 @@ def test_value_scalars_receive_gradient():
     assert jnp.any(g != 0.0), "value_scalars got no gradient from HRQ routing"
 
 
+def test_top_codebook_receives_gradient():
+    """R1.3: the top-k proxy must give ``C_top`` a real gradient, not only v."""
+    p = _crafted_hrq(M_top=8)
+    z = jax.random.normal(jax.random.PRNGKey(6), (2, 8)) * 0.3
+
+    def loss(A):
+        params = {'top': {'A': A, 'W': p['top']['W']}, 'fine': p['fine']}
+        o = hrq_forward(params, z, value_scalars=jnp.zeros(8),
+                        alpha_val=1.0)[0]
+        return jnp.sum(o ** 2)
+
+    g = jax.grad(loss)(p['top']['A'])
+    assert jnp.all(jnp.isfinite(g))
+    assert jnp.any(g != 0.0), "C_top got no gradient through the top-k proxy"
+
+
+def test_public_entry_guards():
+    p = _crafted_hrq(M_top=4)
+    z = jax.random.normal(jax.random.PRNGKey(7), (2, 8)) * 0.3
+    with pytest.raises(ValueError, match="value_topk"):
+        hrq_forward(p, z, value_topk=0)
+    with pytest.raises(ValueError, match="tau_proxy"):
+        hrq_forward(p, z, tau_proxy=0.0)
+    with pytest.raises(ValueError, match="value_scalars"):
+        hrq_forward(p, z, value_scalars=jnp.zeros(3), alpha_val=0.1)
+
+
+def test_hard_forward_is_bit_exact():
+    """The STE's forward correction is exactly zero: output == raw hard route.
+
+    ``o_soft + sg(c_top - o_soft)`` is only exact up to one ulp. The
+    implemented form ``sg(c_top) + (o_soft - sg(o_soft))`` adds a literal zero
+    in the forward pass, so the result must match the hard-route reference
+    bit-for-bit while the backward path is the soft mixture.
+    """
+    params = _two_proto_hrq([0.60, 0.0], [0.20, 0.0])
+    z = jnp.array([[0.5, 0.0]])
+    o, _, _, _ = hrq_forward(params, z, tau_fallback=0.1)
+
+    z_P, C_P, sims = _sims(params, z)
+    c_top = C_P[sims.argmin(axis=-1)]
+    r = mobius_add(z_P, -c_top)
+    for fb in params['fine']:
+        C_fb_P = exp_map(fb['A'] @ fb['W'])
+        fi = poincare_similarity(
+            r[:, None, :], C_fb_P[None, :, :]).squeeze(-1).argmin(axis=-1)
+        r = mobius_add(r, -C_fb_P[fi])
+    ref = log_map(mobius_add(c_top, r))
+    assert jnp.array_equal(o, ref), (
+        "hard forward is not the raw prototype route; max abs diff "
+        f"{jnp.max(jnp.abs(o - ref))}")
+
+
 def _two_proto_hrq(p0, p1, d=2):
     return {
         'top': {'A': jnp.stack([jnp.asarray(p0), jnp.asarray(p1)]),
@@ -167,6 +221,40 @@ def test_relative_gap_selects_fallback():
     # is a tie at tau=0.1 but not at tau=1e-6.
     got, hard, _, _ = _branch_top_term(near, z, tau_fallback=1e-6)
     assert jnp.allclose(got, hard, atol=1e-5)
+
+
+def test_fallback_blends_topk_only_when_more_prototypes_exist():
+    """M_top > value_topk: the fallback must not pull in far prototypes.
+
+    The old fallback softmaxed over every prototype. With M_top=512 and a
+    value_topk of 4, that lets far codes contribute weight they never earned
+    in the geometric first stage.
+    """
+    params = {
+        'top': {'A': jnp.array([[0.60, 0.0], [0.59, 0.0],
+                                [0.00, 0.40], [0.20, 0.30]]),
+                'W': jnp.eye(2)},
+        'fine': [init_simvq(jax.random.PRNGKey(7), 1, 2)],
+    }
+    z = jnp.array([[0.5, 0.0]])
+    _, idx, _, pairs = hrq_forward(params, z, tau_fallback=0.1, value_topk=2)
+    _, C_P, sims = _sims(params, z)
+
+    assert float(_relative_gap(sims)[0]) < 0.1
+    topk = jnp.argsort(sims, axis=-1)[:, :2]
+    assert {int(j) for j in topk[0]} == {0, 1}
+    assert int(idx[0]) in (0, 1)
+
+    topk_sims = jnp.take_along_axis(sims, topk, axis=-1)
+    c_top_w = jnp.einsum(
+        'bk,bkd->bd', jax.nn.softmax(-topk_sims, axis=-1), C_P[topk])
+    assert jnp.allclose(pairs['quant'][0], log_map(c_top_w), atol=1e-5), \
+        "fallback did not restrict its softmax to the top-k"
+
+    # A blend over all four prototypes is meaningfully different here, so the
+    # equality above is a real constraint rather than a near-tie.
+    c_all = jnp.einsum('bm,md->bd', jax.nn.softmax(-sims, axis=-1), C_P)
+    assert not jnp.allclose(log_map(c_top_w), log_map(c_all), atol=1e-2)
 
 
 def test_top_sim_is_per_sample():

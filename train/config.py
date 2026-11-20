@@ -88,7 +88,7 @@ class LCMConfig:
     # R2 splits the old `lambda_sparse` by unit: the soft threshold is in
     # codebook units, the LFQ multiplier is dimensionless.
     lambda_shrink: float = 1e-4  # EMA soft-threshold shrinkage (codebook units)
-    lambda_lfq: float = 0.1      # LFQ threshold multiplier (dimensionless)
+    lambda_lfq: float = 1.5      # LFQ threshold multiplier (dimensionless)
     lambda_orth: float = 0.01   # Tangent orthogonality weight
     n_orth_samples: int = 32    # Codebooks sampled for orth loss per step
     lambda_contrast: float = 0.1

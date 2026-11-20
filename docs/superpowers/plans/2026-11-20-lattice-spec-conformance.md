@@ -624,8 +624,9 @@ git commit -m "feat(loss): layered codebook/commitment losses and routing traini
   - `hrq_forward(params, z, tau_fallback=0.1, value_scalars=None,
     alpha_val=0.0, value_topk=4, tau_proxy=1.0)`。
   - `_topk_indices(params, z, k) -> jnp.ndarray`（测试辅助；内部同 top-k 计算）。
-  - `sparse_forward(params, z, training=True, lambda_lfq=0.1, d_top=None,
-    c_top=None, value_scalars=None, alpha_val=0.0)`。
+  - `sparse_forward(params, z, training=True, lambda_lfq=1.5, d_top=None,
+    c_top=None, value_scalars=None, alpha_val=0.0)`（Ruling 15：1.5，0.1 会在
+    随机初始化下恒零）。
   - `six_lattice_step` 先算 HRQ，把 `d_top`/`c_top` 传给 Sparse。
 
 - [ ] **Step 1: 写 HRQ 测试**

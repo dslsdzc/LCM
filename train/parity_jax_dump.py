@@ -96,6 +96,7 @@ def main():
         print(f"cfg.n_lattices= {CFG.n_lattices}")
         print(f"cfg.tau_route = {CFG.tau_route}")
         print(f"cfg.tau_route_fallback = {CFG.tau_route_fallback}")
+        print(f"cfg.hrq_value_topk     = {CFG.hrq_value_topk}")
         print(f"cfg.alpha_val = {CFG.alpha_val}")
         print(f"cfg.beta_val  = {CFG.beta_val}")
         print(f"cfg.tau_val_signal = {CFG.tau_val_signal}")
