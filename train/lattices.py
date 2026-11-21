@@ -868,9 +868,16 @@ def contrast_info_nce_loss(params, z, tau=0.1):
     """DualVC InfoNCE with the positive excluded from the negatives (R21).
 
     Each family's nearest code is the positive; the other family's rows are
-    the negatives. ``tau`` defaults to 0.1. The loss is evaluated in the
-    numerically stable form ``pos/tau + logsumexp(-neg/tau)`` over
-    ``neg != positive_index``.
+    the negatives. ``tau`` defaults to 0.1. The loss is a proper negative
+    log-likelihood
+
+        -log( exp(-p/τ) / (exp(-p/τ) + Σ_{j≠pos} exp(-d_j/τ)) )
+        = softplus(logsumexp_{j≠pos}(-(d_j - p)/τ))
+
+    and is therefore bounded below by zero. The earlier
+    ``p/τ + logsumexp(-d_j/τ)`` form omitted the positive logit from the
+    denominator; it was unbounded below and let the optimizer push negatives
+    away forever (CPU dialogue run: total loss ≈ -1360 at step 1000).
     """
     z_detach = lax.stop_gradient(z)
     loss = 0.0
@@ -890,8 +897,9 @@ def contrast_info_nce_loss(params, z, tau=0.1):
 
         def _ce_excluding(pos, neg, idx):
             excluded = jax.nn.one_hot(idx, neg.shape[-1], dtype=bool)
-            log_neg = jnp.where(excluded, -jnp.inf, -neg / tau)
-            return pos / tau + jax.nn.logsumexp(log_neg, axis=-1)
+            logits = -(neg - pos[:, None]) / tau
+            logits = jnp.where(excluded, -jnp.inf, logits)
+            return jax.nn.softplus(jax.nn.logsumexp(logits, axis=-1))
 
         loss = loss + jnp.mean(_ce_excluding(d_a_pos, d_b, idx_b))
         loss = loss + jnp.mean(_ce_excluding(d_b_pos, d_a, idx_a))

@@ -483,7 +483,8 @@ def _gen_forward(params, x, cfg, rng):
     return lang_lcm_forward(params, x, cfg, rng=rng, training=False, dropout_rate=0.0)
 
 
-def lang_lcm_generate(params, prompt, max_len, bos_id, eos_id, rng, cfg):
+def lang_lcm_generate(params, prompt, max_len, bos_id, eos_id, rng, cfg,
+                      temperature=1.0, top_k=0):
     """Autoregressive generation with Language LCM.
 
     Uses fixed-size input to avoid JIT recompilation per step.
@@ -503,8 +504,17 @@ def lang_lcm_generate(params, prompt, max_len, bos_id, eos_id, rng, cfg):
         logits, _, _ = _gen_forward(params, x, cfg, rng)
         next_logits = logits[0, pos - 1, :]
 
-        rng, sample_rng = jax.random.split(rng)
-        next_id = int(jax.random.categorical(sample_rng, next_logits))
+        if temperature <= 0.0:
+            next_id = int(jnp.argmax(next_logits))
+        else:
+            next_logits = next_logits / max(float(temperature), 1e-8)
+            if top_k and top_k > 0:
+                k = min(int(top_k), int(next_logits.shape[-1]))
+                cutoff = jnp.sort(next_logits)[-k]
+                next_logits = jnp.where(next_logits < cutoff, -jnp.inf,
+                                        next_logits)
+            rng, sample_rng = jax.random.split(rng)
+            next_id = int(jax.random.categorical(sample_rng, next_logits))
         tokens_list.append(next_id)
 
         if next_id == eos_id or next_id == 0:

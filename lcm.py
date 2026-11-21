@@ -2979,6 +2979,7 @@ def main():
             from_ckpt=args.resume,
             data_path=args.data,
             shape_path=shape,
+            spans_path=args.spans,
         )
     elif args.lang_infer:
         _require_jax()
@@ -2990,10 +2991,14 @@ def main():
         tokenizer = _load_tokenizer()
         prompt_text = args.prompt or "今天天气"
         prompt_ids = tokenizer.encode(prompt_text).ids
+        bos_id = tokenizer.token_to_id("[BOS]")
+        eos_id = tokenizer.token_to_id("[EOS]")
         rng = jax.random.PRNGKey(42)
         tokens = lang_lcm_generate(
             params, prompt_ids, max_len=args.max_new or 128,
-            bos_id=1, eos_id=2, rng=rng, cfg=cfg)
+            bos_id=2 if bos_id is None else bos_id,
+            eos_id=3 if eos_id is None else eos_id,
+            rng=rng, cfg=cfg, temperature=args.temperature, top_k=40)
         output = tokenizer.decode(tokens)
         print(f"\n[LANG] Prompt: {prompt_text}")
         print(f"[LANG] Output: {output}")

@@ -50,13 +50,14 @@ def _info_nce_reference(params, z, tau, exclude_positive):
         d_b_pos = jnp.take_along_axis(d_b, idx_b[:, None], axis=-1)[:, 0]
 
         def term(pos, neg, idx):
+            # Proper InfoNCE: the positive logit is part of the denominator.
+            # softplus(logsumexp_{j!=pos}(-(d_j - p)/tau)) is >= 0.
+            logits = -(neg - pos[:, None]) / tau
             if exclude_positive:
-                neg = jnp.where(
+                logits = jnp.where(
                     jax.nn.one_hot(idx, neg.shape[-1], dtype=bool),
-                    -jnp.inf, -neg / tau)
-            else:
-                neg = -neg / tau
-            return jax.nn.logsumexp(neg, axis=-1) + pos / tau
+                    -jnp.inf, logits)
+            return jax.nn.softplus(jax.nn.logsumexp(logits, axis=-1))
 
         total = total + jnp.mean(term(d_a_pos, d_b, idx_b))
         total = total + jnp.mean(term(d_b_pos, d_a, idx_a))
@@ -106,6 +107,28 @@ def test_far_positive_is_finite_and_lower_than_positive_at_query():
 
     assert jnp.isfinite(loss_near) and jnp.isfinite(loss_far)
     assert float(loss_far) < float(loss_near)
+
+
+def test_info_nce_is_nonnegative_when_negatives_are_far():
+    """InfoNCE is a negative log-likelihood, so it cannot go below zero.
+
+    The old ``pos/tau + logsumexp(-neg/tau)`` form omitted the positive logit
+    from the denominator. With far negatives it returned a large negative
+    value, and the optimizer could reduce it without bound by pushing the
+    negative bank away. That is the loss divergence seen in the CPU dialogue
+    run (total loss ≈ -1360).
+    """
+    d = 2
+    z = jnp.zeros((1, d))
+    C_a = jnp.array([[1.0, 0.0], [2.0, 0.0]])
+    C_b = jnp.array([[50.0, 0.0], [100.0, 0.0]])
+    p = {
+        'C_a': [{'A': C_a, 'W': jnp.eye(d)}],
+        'C_b': [{'A': C_b, 'W': jnp.eye(d)}],
+    }
+    loss = contrast_info_nce_loss(p, z, tau=1.0)
+    assert jnp.isfinite(loss)
+    assert float(loss) >= 0.0, f"InfoNCE must be >= 0, got {float(loss)}"
 
 
 def test_value_biased_loss_uses_squared_harm_distance():

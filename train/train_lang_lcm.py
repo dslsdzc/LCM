@@ -256,7 +256,8 @@ def load_checkpoint(path):
 
 def train_lang_lcm(cfg, output_dir, steps=100000, lr=3e-4, batch_size=16,
                    seq_len=512, log_every=100, save_every=5000,
-                   from_ckpt=None, data_path=None, shape_path=None):
+                   from_ckpt=None, data_path=None, shape_path=None,
+                   spans_path=None):
     """Run Language LCM training with MTP + mHC + Muon.
 
     Args:
@@ -271,6 +272,7 @@ def train_lang_lcm(cfg, output_dir, steps=100000, lr=3e-4, batch_size=16,
         from_ckpt: Resume from checkpoint path.
         data_path: Path to .dat mmap file.
         shape_path: Path to shape JSON.
+        spans_path: Path to document spans .npy (default: <data>_docs.npy).
     """
     os.makedirs(output_dir, exist_ok=True)
     rng = jax.random.PRNGKey(42)
@@ -354,7 +356,9 @@ def train_lang_lcm(cfg, output_dir, steps=100000, lr=3e-4, batch_size=16,
     # Data iterator
     mp = data_path or MMAP_PATH
     sp = shape_path or (mp.replace('.dat', '_shape.json'))
-    data_iter = WikiDataIter(mmap_path=mp, shape_path=sp, B=batch_size, N=seq_len)
+    spans = spans_path or mp.replace('.dat', '_docs.npy')
+    data_iter = WikiDataIter(data_path=mp, shape_path=sp, spans_path=spans,
+                             B=batch_size, N=seq_len)
 
     mtp_w = getattr(cfg, 'mtp_loss_weight', 0.3)
 
