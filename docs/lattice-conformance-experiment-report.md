@@ -1,7 +1,7 @@
 # 晶格规范一致性实验报告（≤100 步 smoke）
 
 日期：2026-11-21
-smoke 运行 HEAD：`661a26b`（I7 修复尚未提交的工作树）；Task 15 evidence 提交：`ef7136b`（pre-docs HEAD，仅证据记录）；最后行为变更提交：`661a26b`
+smoke 运行 HEAD：`f6b2e4c`（value consistency 实际索引、安全门 z_cur/z_next、D-9 诊断与文档修订之后）
 基线：`docs/superpowers/specs/2026-11-20-lattice-spec-conformance-design.md` R1–R22
 偏差复审：`docs/lattice-spec-vs-impl-audit-v3.1.md`
 
@@ -17,8 +17,8 @@ smoke 运行 HEAD：`661a26b`（I7 修复尚未提交的工作树）；Task 15 e
 | Python | 3.14.10 |
 | JAX | 0.10.0 |
 | 设备 | CPU（`JAX_PLATFORMS=cpu`；GTX 1650 4GB 不参与） |
-| smoke 运行 HEAD | `661a26b` + I7 未提交工作树（Task 15 evidence 提交 `ef7136b`，pre-docs；最后行为变更 `661a26b`） |
-| 总耗时 | 174.86s |
+| smoke 运行 HEAD | `f6b2e4c`（value consistency 实际索引、安全门 z_cur/z_next、D-9 诊断与文档修订） |
+| 总耗时 | 152.3s |
 | C 参考 | `make -C infer clean && make -C infer test`（249 PASS） |
 
 ## 2. 配置
@@ -81,25 +81,25 @@ smoke 运行 HEAD：`661a26b`（I7 修复尚未提交的工作树）；Task 15 e
 
 ## 4. 100 步 loss
 
-- 首 10 步均值：**18.3438**
-- 末 10 步均值：**12.9269**
-- 比值：**0.7047**（< 0.8：PASS）
+- 首 10 步均值：**18.3368**
+- 末 10 步均值：**11.9986**
+- 比值：**0.6543**（< 0.8：PASS）
 - 全部有限：PASS
 
 | 步区间 | 均值 | 最小 | 最大 |
 |---|---|---|---|
-| 0–9 | 18.3438 | 17.3922 | 19.0286 |
-| 10–19 | 16.8645 | 15.1980 | 18.6407 |
-| 20–29 | 16.6089 | 14.8846 | 22.0831 |
-| 30–39 | 15.7963 | 14.0700 | 22.1303 |
-| 40–49 | 15.1026 | 14.1758 | 17.0367 |
-| 50–59 | 14.3549 | 13.8970 | 14.7857 |
-| 60–69 | 17.2930 | 14.2266 | 22.6053 |
-| 70–79 | 14.0705 | 13.4196 | 14.6677 |
-| 80–89 | 13.2742 | 12.9852 | 13.7118 |
-| 90–99 | 12.9269 | 12.5071 | 13.5218 |
+| 0–9 | 18.3368 | 17.4823 | 19.3431 |
+| 10–19 | 17.6552 | 16.4572 | 20.3163 |
+| 20–29 | 16.3323 | 15.0985 | 21.7605 |
+| 30–39 | 15.6059 | 14.1383 | 21.5206 |
+| 40–49 | 15.3877 | 13.7310 | 17.7664 |
+| 50–59 | 13.3281 | 12.7299 | 14.2777 |
+| 60–69 | 12.9188 | 12.5025 | 13.5287 |
+| 70–79 | 15.5383 | 12.5509 | 20.1645 |
+| 80–89 | 12.5461 | 12.0204 | 14.3196 |
+| 90–99 | 11.9986 | 11.6236 | 13.2558 |
 
-完整逐 step 曲线在 `checkpoints/conformance_smoke_final/smoke_report.json` 的 `loss.per_step`。
+完整逐 step 曲线在 `checkpoints/conformance_smoke_final2/smoke_report.json` 的 `loss.per_step`。
 
 ## 5. 逐格更新、真实梯度、方差与利用率
 
@@ -107,17 +107,17 @@ smoke 运行 HEAD：`661a26b`（I7 修复尚未提交的工作树）；Task 15 e
 
 | 晶格 | grad norm | grad>1e-6 | Δmax abs (secondary) | var ratio | utilization |
 |---|---|---|---|---|---|
-| encoder | 1090.9929 | PASS | 0.0155 | — | — |
-| hrq | 680.3317 | PASS | 0.0156 | 4.7843 | 5.08% |
-| sparse | — | — | 2.8703 | 38.2559 | 3.91% |
-| lowrank | 0.5485 | PASS | 0.0087 | 1.0361 | 5.47% |
-| manifold | 0.0023 | PASS | 2.8854 | 38.8239 | 3.91% |
-| binding | 0.3061 | PASS | 1.9091 | 70.6662 | 1.26% |
-| contrast | 1.4561 | PASS | 0.0202 | 211.0913 | 2.80% |
-| route | 39.1918 | PASS | 0.0152 | 1.0576 | 100.00% |
-| fusion | 22.7596 | PASS | 0.0163 | — | — |
-| self | — | — | 2.8232 | 32.1763 | 31.25% |
-| value_scalars | 55.4405 | PASS | 0.0165 | — | — |
+| encoder | 1090.5130 | PASS | 0.0152 | — | — |
+| hrq | 677.0636 | PASS | 0.0162 | 4.5002 | 5.08% |
+| sparse | — | — | 3.0744 | 49.3075 | 4.69% |
+| lowrank | 1.8931 | PASS | 0.0084 | 0.7463 | 6.77% |
+| manifold | 0.0023 | PASS | 3.0520 | 49.8755 | 4.69% |
+| binding | 0.7223 | PASS | 1.4081 | 76.2772 | 1.17% |
+| contrast | 1.9307 | PASS | 0.0200 | 298.9470 | 2.96% |
+| route | 39.1918 | PASS | 0.0149 | 1.0535 | 100.00% |
+| fusion | 22.7596 | PASS | 0.0166 | — | — |
+| self | — | — | 3.1184 | 41.3112 | 37.50% |
+| value_scalars | 55.0926 | PASS | 0.0159 | — | — |
 
 sparse/self 无 trainable 子树，用 N/m 判据；manifold/binding 同时有 `T`/`A_k`/`A_v` 的梯度和码本 EMA。
 
@@ -125,14 +125,14 @@ sparse/self 无 trainable 子树，用 N/m 判据；manifold/binding 同时有 `
 
 | 晶格 | training probe (fixed batch) | streaming probe (100 batches) | 阈值 | verdict |
 |---|---|---|---|---|
-| hrq | 5.08% | 6.45% | 10% | **FAIL** |
-| sparse | 3.91% | 4.49% | 10% | **FAIL** |
-| lowrank | 5.47% | 0.78% | 10% | **FAIL** |
-| manifold | 3.91% | 8.01% | 10% | **FAIL** |
-| binding | 1.26% | 0.20% | 10% | **FAIL** |
-| contrast | 2.80% | 0.91% | 10% | **FAIL** |
+| hrq | 5.08% | 5.86% | 10% | **FAIL** |
+| sparse | 4.69% | 7.03% | 10% | **FAIL** |
+| lowrank | 6.77% | 1.30% | 10% | **FAIL** |
+| manifold | 4.69% | 6.25% | 10% | **FAIL** |
+| binding | 1.17% | 0.20% | 10% | **FAIL** |
+| contrast | 2.96% | 1.33% | 10% | **FAIL** |
 | route | 100.00% | 83.33% | 10% | PASS |
-| self | 31.25% | 1.56% | 10% | **FAIL** |
+| self | 37.50% | 1.56% | 10% | **FAIL** |
 
 Streaming verdict：**FAIL**；batches=100，B=1。
 Training probe（固定单 batch，secondary）：**FAIL**。
@@ -142,14 +142,14 @@ Ruling 51 的 streaming probe 仍低于 10%：这不是“码本没更新”，�
 
 | 晶格 | ratio |
 |---|---|
-| hrq | 4.7843 |
-| sparse | 38.2559 |
-| lowrank | 1.0361 |
-| manifold | 38.8239 |
-| binding | 70.6662 |
-| contrast | 211.0913 |
-| route | 1.0576 |
-| self | 32.1763 |
+| hrq | 4.5002 |
+| sparse | 49.3075 |
+| lowrank | 0.7463 |
+| manifold | 49.8755 |
+| binding | 76.2772 |
+| contrast | 298.9470 |
+| route | 1.0535 |
+| self | 41.3112 |
 
 Result: PASS
 
@@ -159,10 +159,10 @@ Result: PASS
 
 | 分支 | ΔN abs | N sum | 使用行 | Δm norm | changed |
 |---|---|---|---|---|---|
-| sparse | 63.3968 | 63.3968 | 20/512 | 606.8900 | PASS |
-| manifold | 63.3968 | 63.3968 | 20/512 | 606.8900 | PASS |
-| self | 63.3968 | 63.3968 | 20/64 | 606.8900 | PASS |
-| binding | 570.5711 | 570.5711 | 58/4608 | 409.3718 | PASS |
+| sparse | 63.3968 | 63.3968 | 24/512 | 573.9488 | PASS |
+| manifold | 63.3968 | 63.3968 | 24/512 | 573.9488 | PASS |
+| self | 63.3968 | 63.3968 | 24/64 | 573.9488 | PASS |
+| binding | 570.5711 | 570.5711 | 54/4608 | 377.4845 | PASS |
 
 EMA 总结果：PASS
 
@@ -227,7 +227,7 @@ EMA 总结果：PASS
 
 - crafted peaked：0.0396 → PASS
 - crafted uniform：1.0000 → 不通过=PASS
-- **真实训练 mask**：H_norm=0.5848 → **FAIL**（阈值 0.5）
+- **真实训练 mask**：H_norm=0.5652 → **FAIL**（阈值 0.5）
 - 总 pass：**FAIL**；JAX 训练门按归一化 0.5 解释。
 
 ### 8.4 Feature bank（synthetic policy probe）
@@ -324,8 +324,8 @@ Optimizer moments are deliberately not part of the v2 checkpoint (R10: params/EM
 
 1. **100 步不证明语言能力**。
 2. **gvalue/danger 是结构占位**，不是语义安全锚点；导出 danger pattern path 用 value_consistency=1.0 单独验证，真实 v3 loop 的威胁输入由 `CONFLICT_DANGER/THREAT_PATTERN_MATCH` 中断（同时检查 `z_cur`/`z_next`）。normal input 在 `use_safety=True` 时按严格三法则 abort，这是已确认的预期行为，不是语义安全通过。
-3. **10% 码本利用率未通过**：streaming probe 全列为 HRQ 6.45%、Sparse 4.49%、LowRank 0.78%、Manifold 8.01%、Binding 0.20%、Contrast 0.91%、Self 1.56%（Route 83.33% PASS）。结构原因与诊断见 §5.1 和 `docs/d9-codebook-utilization-research-plan.md`。
-4. **真实 mask 的归一化熵 0.5848 > 0.5**，熵门未通过；crafted peaked/uniform 只证明门本身可过可不过。
+3. **10% 码本利用率未通过**：streaming probe 全列为 HRQ 5.86%、Sparse 7.03%、LowRank 1.30%、Manifold 6.25%、Binding 0.20%、Contrast 1.33%、Self 1.56%（Route 83.33% PASS）。结构原因与诊断见 §5.1 和 `docs/d9-codebook-utilization-research-plan.md`。
+4. **真实 mask 的归一化熵 0.5652 > 0.5**，熵门未通过；crafted peaked/uniform 只证明门本身可过可不过。
 5. ~~规范文字未同步到 v3.1（D-1）~~ **已在 Task 0 + review 修正中解决**：`docs/a–e.md` 与 `docs/a–e_cn.md` 均按 R1–R22 同步并带 v3.1-conformance changelog。
 6. **外部验证器是本地形态**（未做 HSM）；`causal_subject.py` 不扩展（accepted deviation）。
 7. **优化器矩没有进 checkpoint**；2 步一致性用 fresh optimizer 测状态 round-trip。
@@ -348,7 +348,7 @@ JAX_PLATFORMS=cpu /home/DslsDZC/LCM/be/bin/python train/smoke_conformance.py \
   --data /home/DslsDZC/data/tmp/opencode/conformance_corpus/conformance.dat \
   --shape /home/DslsDZC/data/tmp/opencode/conformance_corpus/conformance_shape.json \
   --spans /home/DslsDZC/data/tmp/opencode/conformance_corpus/conformance_docs.npy \
-  --output checkpoints/conformance_smoke --passive-only
+  --output checkpoints/conformance_smoke_final2 --passive-only
 ```
 
 本次复跑未加 `--allow-fail`，因此两个已知 FAIL（利用率/真实熵门）使退出码为 1；`checks` 表是 verdict。只有在需要强制写出完整 artifact 时才使用 `--allow-fail`。
@@ -380,4 +380,4 @@ JAX_PLATFORMS=cpu /home/DslsDZC/LCM/be/bin/python train/smoke_conformance.py \
 | overhead_under_5pct | PASS |
 | persistence | PASS |
 
-artifact：`checkpoints/conformance_smoke/smoke_report.json`、`smoke_report.md`、`step_000100/`（149 MB，不提交）。
+artifact：`checkpoints/conformance_smoke_final2/smoke_report.json`、`smoke_report.md`、`step_000100/`（149 MB，不提交）。

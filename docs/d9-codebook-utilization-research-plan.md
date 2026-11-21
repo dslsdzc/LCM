@@ -10,8 +10,8 @@
 
 | 检查 | 当前值 | 阈值 | 结论 |
 |---|---|---|---|
-| `codebook_utilization_10pct`（streaming，100 个不同 batch） | HRQ 7.23%、Sparse 4.10%、LowRank 0.78%、Manifold 7.23%、Binding 0.20%、Contrast 1.07%、Self 1.56%、Route 83.33% | 每个码本 ≥10% | FAIL |
-| `entropy_gate`（真实 routing mask） | `H_norm=0.5848` | ≤0.5 | FAIL |
+| `codebook_utilization_10pct`（streaming，100 个不同 batch） | HRQ 5.86%、Sparse 7.03%、LowRank 1.30%、Manifold 6.25%、Binding 0.20%、Contrast 1.33%、Self 1.56%、Route 83.33% | 每个码本 ≥10% | FAIL |
+| `entropy_gate`（真实 routing mask） | `H_norm=0.5652` | ≤0.5 | FAIL |
 
 两项都按原阈值保留。研究目标是解释并修复根因，而不是调低 10% / 0.5。
 
@@ -24,23 +24,23 @@
 - top-1 行占比
 - `constant_across_batches`：是否每个 batch 都选中完全相同的行集合
 
-示例（100 个 batch，`conformance_smoke_final/step_000100`）：
+示例（100 个 batch，`conformance_smoke_final2/step_000100`）。探针从磁盘重新加载 checkpoint，而 smoke 使用训练结束时的内存参数，因此计数可能相差几行；结论不变：
 
 | 码本 | 唯一行 / M | top-1 占比 | 是否输入无关 |
 |---|---|---|---|
 | Binding key/val/bind（3 层） | 1 / 512 每层 | 100% | **是** |
 | Self | 1 / 64 | 100% | **是** |
-| LowRank layer 0/1/2 | 2 / 256 每层 | 65–98% | 否 |
-| Contrast a/b | 2–11 / 512 | 25–95% | 否 |
-| HRQ top | 37 / 512 | 16% | 否 |
-| Sparse | 21 / 512（去掉 zero_vec 后） | 64% | 否 |
-| Manifold | 37 / 512 | 21% | 否 |
-| Route | 5 / 6 | 51% | 否 |
+| LowRank layer 0/1/2 | 2–3 / 256 每层 | 71–97% | 否 |
+| Contrast a/b | 2–18 / 512 | 42–79% | 否 |
+| HRQ top | 29 / 512 | 24% | 否 |
+| Sparse | 29 / 512（去掉 zero_vec 后） | 21% | 否 |
+| Manifold | 34 / 512 | 18% | 否 |
+| Route | 5 / 6 | 63% | 否 |
 
 几何信号：
 
-- HRQ top 行范数 `min 0.0222 / mean 0.0420 / max 0.3150`，码本尺度跨一个数量级。
-- Route 行两两 cosine `min -0.116 / mean 0.012 / max 0.113`，接近正交但只有 6 行；83.33% 只是 5/6，不构成多样性证据。
+- HRQ top 行范数 `min 0.0221 / mean 0.0413 / max 0.3255`，码本尺度跨一个数量级。
+- Route 行两两 cosine `min -0.123 / mean 0.017 / max 0.113`，接近正交但只有 6 行；83.33% 只是 5/6，不构成多样性证据。
 - LowRank layer-0 的 `U` 只有 rank 2，effective rank 1.96，行间几何高度集中。
 
 **关键结论：Binding 和 Self 不是“路由探索不足”，而是前向选择对输入不敏感。** 每层、每个 batch 都选同一行，说明增加训练步数或 batch size 不会自动解决它。LowRank 也接近常数。HRQ/Sparse/Manifold 是分布覆盖不足，和 Binding/Self 不是同一类问题。
@@ -100,7 +100,7 @@ Contrast 的 feature bank / usage clock 可能让选择集中；Self 已归入 H
 
 ```bash
 JAX_PLATFORMS=cpu python -m train.research_d9_probe \
-  --checkpoint checkpoints/conformance_smoke/step_000100 \
+  --checkpoint checkpoints/conformance_smoke_final2/step_000100 \
   --data /path/conformance.dat \
   --shape /path/conformance_shape.json \
   --spans /path/conformance_docs.npy \
