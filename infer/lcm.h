@@ -477,7 +477,8 @@ int build_dag_v3(const float* z, lcm_memory_v3* mem, dag_t* dag);
  * Returns true on success, false on invalid arguments.
  */
 bool execute_dag_v3(dag_t* dag, const lcm_memory_v3* mem, float alpha_val,
-                    vec_t* outputs, float* confidences, int* active);
+                    vec_t* outputs, float* confidences, int* active,
+                    vec_t* selected_rows, float* selected_values);
 
 /* Canonical fusion (R9/R15), shared with lcm_fuse_only:
  *   z = layer_norm(Σ_{active} w_i/Σw · o_i + self_bias · o_self)
@@ -523,8 +524,9 @@ int lcm_infer_loop_v3(const lcm_memory_v3* mem, const gvalue_t* gv,
  * Returns 1.0 when no value vector/direction is available. Exposed for the
  * focused conformance test. */
 float lcm_value_consistency_v3(const lcm_memory_v3* mem,
-                               const float* outputs, const int* active,
-                               const float* z_cur, const float* z_next);
+                               vec_t* selected_rows,
+                               const float* selected_values,
+                               const int* active, const float* z_next);
 
 /* Count the retrieval operations performed by one v3 step: one per codebook
  * layer actually searched (HRQ top + fine layers, low-rank layers, three
@@ -734,7 +736,8 @@ void contrast_forward_v31(const float* z, const contrast_mem_t* m,
  * power of two (the HRR FFT). Invalid descriptors zero out/optional outputs.
  */
 void binding_forward_c(const float* z, const binding_mem_t* m, const float* V,
-                       float alpha_val, float* out, float* b_q, float* k_q);
+                       float alpha_val, float* out, float* b_q, float* k_q,
+                       int* val_idx);
 
 /* Lattice retrieval operations */
 void retrieve_single(const float* z, const lattice_memory_t* mem,

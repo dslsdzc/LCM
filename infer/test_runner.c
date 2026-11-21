@@ -1726,7 +1726,7 @@ static void test_binding_unbind_and_cval(void) {
     m.A_k = A_k; m.A_v = A_v;
     m.value_key = NULL; m.value_val = NULL; m.value_bind = NULL;
 
-    binding_forward_c(z, &m, V, 0.0f, out, bq, kq);
+    binding_forward_c(z, &m, V, 0.0f, out, bq, kq, NULL);
 
     /* k_q = k0+k1+k2; b_q = b_raw (bind layer 0), then zero bind rows. */
     memset(bcheck, 0, sizeof(bcheck));
@@ -1828,7 +1828,7 @@ static void test_binding_projection_direction(void) {
     m.A_k = A_k; m.A_v = A_v;
     m.value_key = NULL; m.value_val = NULL; m.value_bind = NULL;
 
-    binding_forward_c(z, &m, V, 0.0f, out, NULL, kq);
+    binding_forward_c(z, &m, V, 0.0f, out, NULL, kq, NULL);
 
     CHECK(t9_max_abs_diff(kq, correct, LCM_D) < 1e-6f,
           "binding: z_k = V @ A_k @ z (W_k z), not W_k^T z");
@@ -1874,11 +1874,11 @@ static void test_binding_value_families(void) {
     key_cb[0] = 0.5f;               /* row 0 */
     key_cb[LCM_D] = 0.7f;           /* row 1 */
     m.value_key = NULL; m.value_val = NULL; m.value_bind = NULL;
-    binding_forward_c(z, &m, V, 0.0f, out, NULL, kq);
+    binding_forward_c(z, &m, V, 0.0f, out, NULL, kq, NULL);
     CHECK(fabsf(kq[0] - 0.5f) < 1e-6f,
           "binding value_key: alpha=0 keeps the Euclidean key row");
     m.value_key = vk;
-    binding_forward_c(z, &m, V, 4.0f, out, NULL, kq);
+    binding_forward_c(z, &m, V, 4.0f, out, NULL, kq, NULL);
     CHECK(fabsf(kq[0] - 0.7f) < 1e-6f,
           "binding value_key: R22 bias selects the farther key row");
 
@@ -1907,21 +1907,21 @@ static void test_binding_value_families(void) {
     memcpy(bind_cb + LCM_D, B1, sizeof(B1));
 
     m.value_key = NULL; m.value_val = NULL; m.value_bind = NULL;
-    binding_forward_c(z, &m, V, 0.0f, out, bq, kq);
+    binding_forward_c(z, &m, V, 0.0f, out, bq, kq, NULL);
     CHECK(t9_max_abs_diff(bq, B0, LCM_D) < 1e-5f,
           "binding value_val: alpha=0 quantises the Euclidean value row");
     m.value_val = vv;
-    binding_forward_c(z, &m, V, 4.0f, out, bq, kq);
+    binding_forward_c(z, &m, V, 4.0f, out, bq, kq, NULL);
     CHECK(t9_max_abs_diff(bq, B1, LCM_D) < 1e-5f,
           "binding value_val: R22 bias changes the val code and b_raw");
 
     /* ── value_bind: b_q selects the biased binding row ── */
     m.value_val = NULL; m.value_bind = NULL;
-    binding_forward_c(z, &m, V, 0.0f, out, bq, kq);
+    binding_forward_c(z, &m, V, 0.0f, out, bq, kq, NULL);
     CHECK(t9_max_abs_diff(bq, B0, LCM_D) < 1e-5f,
           "binding value_bind: alpha=0 picks the Euclidean bind row");
     m.value_bind = vb;
-    binding_forward_c(z, &m, V, 8.0f, out, bq, kq);
+    binding_forward_c(z, &m, V, 8.0f, out, bq, kq, NULL);
     CHECK(t9_max_abs_diff(bq, B1, LCM_D) < 1e-5f,
           "binding value_bind: R22 bias picks the other bind row");
 }
@@ -2048,38 +2048,38 @@ static void test_layer_forwards_invalid(void) {
     memset(out, 1, sizeof(out));
     memset(bq, 1, sizeof(bq));
     memset(kq, 1, sizeof(kq));
-    binding_forward_c(z, &bin, V, 0.0f, out, bq, kq);
+    binding_forward_c(z, &bin, V, 0.0f, out, bq, kq, NULL);
     CHECK(t9_all_zero(out, LCM_D) && t9_all_zero(bq, LCM_D)
               && t9_all_zero(kq, LCM_D),
           "binding invalid: n_layers=0 zeroes out/b_q/k_q");
 
     bin.n_layers = LCM_MAX_BIND_LAYERS + 1;
     memset(out, 1, sizeof(out));
-    binding_forward_c(z, &bin, V, 0.0f, out, bq, kq);
+    binding_forward_c(z, &bin, V, 0.0f, out, bq, kq, NULL);
     CHECK(t9_all_zero(out, LCM_D), "binding invalid: layer cap zeroes out");
 
     bin.n_layers = L; bin.M = 0;
     memset(out, 1, sizeof(out));
-    binding_forward_c(z, &bin, V, 0.0f, out, bq, kq);
+    binding_forward_c(z, &bin, V, 0.0f, out, bq, kq, NULL);
     CHECK(t9_all_zero(out, LCM_D), "binding invalid: M=0 zeroes out");
 
     bin.M = M; bin.r_max = 0;
     memset(out, 1, sizeof(out));
-    binding_forward_c(z, &bin, V, 0.0f, out, bq, kq);
+    binding_forward_c(z, &bin, V, 0.0f, out, bq, kq, NULL);
     CHECK(t9_all_zero(out, LCM_D), "binding invalid: r_max=0 zeroes out");
 
     bin.r_max = R; bin.key_cb = NULL;
     memset(out, 1, sizeof(out));
-    binding_forward_c(z, &bin, V, 0.0f, out, bq, kq);
+    binding_forward_c(z, &bin, V, 0.0f, out, bq, kq, NULL);
     CHECK(t9_all_zero(out, LCM_D), "binding invalid: NULL key_cb zeroes out");
 
     bin.key_cb = key_cb;
     memset(out, 1, sizeof(out));
-    binding_forward_c(z, &bin, NULL, 0.0f, out, bq, kq);
+    binding_forward_c(z, &bin, NULL, 0.0f, out, bq, kq, NULL);
     CHECK(t9_all_zero(out, LCM_D), "binding invalid: NULL V zeroes out");
 
     memset(out, 1, sizeof(out));
-    binding_forward_c(z, &bin, V, 0.0f, out, NULL, NULL);
+    binding_forward_c(z, &bin, V, 0.0f, out, NULL, NULL, NULL);
     CHECK(t9_all_zero(out, LCM_D),
           "binding: b_q=NULL and k_q=NULL are accepted");
 }
@@ -2251,7 +2251,7 @@ static void test_dag_sparse_depends_on_hrq(void) {
     int active[LCM_MAX_LATTICES];
     memset(outputs, 0, sizeof(outputs));
     memset(conf, 0, sizeof(conf));
-    execute_dag_v3(&dag, &t10_mem, 0.0f, outputs, conf, active);
+    execute_dag_v3(&dag, &t10_mem, 0.0f, outputs, conf, active, NULL, NULL);
 
     vec_t ref_out;
     float ref_sim = -1.0f;
@@ -2271,7 +2271,7 @@ static void test_dag_sparse_depends_on_hrq(void) {
     CHECK(si >= 0, "Sparse still activates without HRQ");
     memset(outputs, 0, sizeof(outputs));
     memset(conf, 0, sizeof(conf));
-    execute_dag_v3(&dag, &t10_mem, 0.0f, outputs, conf, active);
+    execute_dag_v3(&dag, &t10_mem, 0.0f, outputs, conf, active, NULL, NULL);
     CHECK(dag.nodes[si].inputs[1] == NULL && dag.nodes[si].dep_dist == 0.0f,
           "inactive HRQ ⇒ Sparse d_top = 0 / no HRQ edge (LFQ off)");
 }
@@ -2432,38 +2432,105 @@ static void test_loop_v3_self_only(void) {
           "(Ruling 24)");
 }
 
+static void test_value_consistency_uses_actual_poincare_idx(void) {
+    t10_prepare();
+    memset(t7_hrq_top, 0, sizeof(t7_hrq_top));
+    /* Euclidean winner is row 0 (same radial direction, r=0.4); the Poincaré
+     * winner is row 1 (near the boundary at a small angle). This is the
+     * case the old re-search implementation got wrong. */
+    t7_hrq_top[0] = 0.4f;
+    t7_hrq_top[LCM_D] = 0.95f * cosf(0.5f);
+    t7_hrq_top[LCM_D + 1] = 0.95f * sinf(0.5f);
+    for (int i = 0; i < LCM_MAX_LATTICES; i++)
+        t10_mem.trigger_theta[i] = 0.0f;
+    t10_mem.trigger_theta[LATTICE_HRQ] = 1e6f;
+
+    float z[LCM_D] = {0};
+    z[0] = 0.9f;
+
+    int e_idx = 0;
+    float e_best = INFINITY;
+    for (int r = 0; r < T7_M; r++) {
+        const float* row = t7_hrq_top + (size_t)r * LCM_D;
+        float d2 = 0.0f;
+        for (int j = 0; j < LCM_D; j++) {
+            float t = z[j] - row[j];
+            d2 += t * t;
+        }
+        if (d2 < e_best) { e_best = d2; e_idx = r; }
+    }
+    vec_t zP, cp;
+    safe_unit_c(z, zP, LCM_D, 1e-8f);
+    exp_map_c(zP, zP, LCM_D, 1.0f);
+    int p_idx = 0;
+    float p_best = INFINITY;
+    for (int r = 0; r < T7_M; r++) {
+        exp_map_c(t7_hrq_top + (size_t)r * LCM_D, cp, LCM_D, 1.0f);
+        float s = poincare_similarity_c(zP, cp, LCM_D, 1.0f);
+        if (s < p_best) { p_best = s; p_idx = r; }
+    }
+    CHECK(e_idx != p_idx,
+          "crafted HRQ fixture: Euclidean and Poincaré winners differ");
+
+    dag_t dag;
+    build_dag_v3(z, &t10_mem, &dag);
+    vec_t outputs[LCM_MAX_LATTICES];
+    float conf[LCM_MAX_LATTICES];
+    int active[LCM_MAX_LATTICES];
+    vec_t selected_rows[LCM_MAX_LATTICES];
+    float selected_values[LCM_MAX_LATTICES];
+    memset(outputs, 0, sizeof(outputs));
+    memset(conf, 0, sizeof(conf));
+    memset(active, 0, sizeof(active));
+    memset(selected_rows, 0, sizeof(selected_rows));
+    memset(selected_values, 0, sizeof(selected_values));
+    execute_dag_v3(&dag, &t10_mem, 0.0f, outputs, conf, active,
+                   selected_rows, selected_values);
+
+    vec_t expected;
+    exp_map_c(t7_hrq_top + (size_t)p_idx * LCM_D, expected, LCM_D, 1.0f);
+    float diff = 0.0f;
+    for (int j = 0; j < LCM_D; j++)
+        diff = fmaxf(diff, fabsf(selected_rows[LATTICE_HRQ][j] - expected[j]));
+    CHECK(diff < 1e-5f,
+          "value evidence uses the forward's Poincaré-selected row, not "
+          "the Euclidean re-search");
+}
+
 static void test_value_consistency_nonzero(void) {
     t10_prepare();
     t10_hrq_value[0] = 0.5f;
     t10_mem.hrq.value_top = t10_hrq_value;
 
-    vec_t outputs[LCM_MAX_LATTICES];
-    memset(outputs, 0, sizeof(outputs));
-    /* Deliberately point the fused output away from the selected row: the
-     * metric must use C_top[0] (the row the value scalar annotates), not the
-     * lattice output. If outputs[li] leaked back in, cos would be -0.6 → 0. */
-    outputs[LATTICE_HRQ][0] = -1.0f;
+    /* R13 data-flow regression: the metric must use the row the forward
+     * actually selected (passed as selected_rows), not a second Euclidean
+     * nearest-row search over z_cur. Make the selected row +e0 while the
+     * pre-existing z_cur points elsewhere; the cosine must be 0.6. */
+    vec_t selected_rows[LCM_MAX_LATTICES];
+    float selected_values[LCM_MAX_LATTICES];
+    memset(selected_rows, 0, sizeof(selected_rows));
+    memset(selected_values, 0, sizeof(selected_values));
+    selected_rows[LATTICE_HRQ][0] = 1.0f;
+    selected_values[LATTICE_HRQ] = 0.5f;
     int active[LCM_MAX_LATTICES] = {0};
     active[LATTICE_HRQ] = 1;
 
-    float z_cur[LCM_D] = {0};
     float z_next[LCM_D] = {0};
-    z_cur[0] = 0.12f;
     z_next[0] = 0.6f;
     z_next[1] = 0.8f;
 
-    float vc = lcm_value_consistency_v3(&t10_mem, (const float*)outputs,
-                                        active, z_cur, z_next);
+    float vc = lcm_value_consistency_v3(&t10_mem, selected_rows,
+                                        selected_values, active, z_next);
     CHECK(fabsf(vc - 0.6f) < 1e-5f,
-          "value consistency uses the selected row + clip(cos,0,1)");
+          "value consistency uses the forward-selected row + clip(cos,0,1)");
     CHECK(vc > LCM_CONSISTENCY_THRESHOLD,
           "a normal positive cosine clears the recalibrated threshold");
 
     /* A cosine of -1 must clip to 0, not stay negative or affine-map to 0.5. */
     float z_neg[LCM_D] = {0};
     z_neg[0] = -1.0f;
-    float vc_neg = lcm_value_consistency_v3(&t10_mem, (const float*)outputs,
-                                            active, z_cur, z_neg);
+    float vc_neg = lcm_value_consistency_v3(&t10_mem, selected_rows,
+                                            selected_values, active, z_neg);
     CHECK(fabsf(vc_neg - 0.0f) < 1e-5f,
           "value consistency clips cosine -1 to 0.0");
 }
@@ -2643,6 +2710,7 @@ int main(void) {
     test_loop_v3_graceful_and_hard();
     test_loop_v3_self_only();
     test_value_consistency_nonzero();
+    test_value_consistency_uses_actual_poincare_idx();
     test_loop_v3_positive_input_does_not_abort();
     test_retrieval_count_resource_abuse();
     test_flat_gvalue_pair_count();

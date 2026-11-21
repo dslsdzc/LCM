@@ -192,7 +192,8 @@ void contrast_forward_c(const float* z, const contrast_mem_t* m,
 /* ─── Binding: cross-layer HRR bind + conjugate unbind (b.md §4.5) ──────── */
 
 void binding_forward_c(const float* z, const binding_mem_t* m, const float* V,
-                       float alpha_val, float* out, float* b_q, float* k_q) {
+                       float alpha_val, float* out, float* b_q, float* k_q,
+                       int* val_idx) {
     if (!out) return;
     if (!z || !m || !V || !m->key_cb || !m->val_cb || !m->bind_cb
         || !m->A_k || !m->A_v || m->M <= 0 || m->M > LCM_MAX_M
@@ -201,6 +202,7 @@ void binding_forward_c(const float* z, const binding_mem_t* m, const float* V,
         memset(out, 0, sizeof(vec_t));
         if (b_q) memset(b_q, 0, sizeof(vec_t));
         if (k_q) memset(k_q, 0, sizeof(vec_t));
+        if (val_idx) *val_idx = -1;
         return;
     }
 
@@ -298,6 +300,7 @@ void binding_forward_c(const float* z, const binding_mem_t* m, const float* V,
     }
 
     memcpy(out, m->val_cb + (size_t)best * LCM_D, sizeof(vec_t));
+    if (val_idx) *val_idx = best;
     if (b_q) memcpy(b_q, bq_acc, sizeof(vec_t));
     if (k_q) memcpy(k_q, kq, sizeof(vec_t));
 }

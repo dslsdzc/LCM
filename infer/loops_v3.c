@@ -294,11 +294,14 @@ static void v3_self_output(const float* z, const fusion_mem_t* f, float* out) {
 }
 
 bool execute_dag_v3(dag_t* dag, const lcm_memory_v3* mem, float alpha_val,
-                    vec_t* outputs, float* confidences, int* active) {
+                    vec_t* outputs, float* confidences, int* active,
+                    vec_t* selected_rows, float* selected_values) {
     if (!dag || !mem || !outputs || !confidences) return false;
 
     for (int i = 0; i < LCM_MAX_LATTICES; i++) {
         if (active) active[i] = 0;
+        if (selected_rows) memset(selected_rows[i], 0, sizeof(vec_t));
+        if (selected_values) selected_values[i] = 0.0f;
     }
 
     for (int ni = 0; ni < dag->n_nodes; ni++) {
@@ -327,11 +330,17 @@ bool execute_dag_v3(dag_t* dag, const lcm_memory_v3* mem, float alpha_val,
             if (li < 0 || li >= mem->n_lattices) continue;
             switch (li) {
             case LATTICE_HRQ: {
+                int idx = 0;
                 float top_sim = 0.0f;
                 if (hrq_forward_v31(node->inputs[0], &mem->hrq, alpha_val,
                                     LCM_V3_VALUE_TOPK,
                                     mem->tau_route_fallback, result,
-                                    NULL, &top_sim) == 0) {
+                                    &idx, &top_sim) == 0) {
+                    if (selected_rows)
+                        exp_map_c(mem->hrq.C_top + (size_t)idx * LCM_D,
+                                  selected_rows[li], LCM_D, 1.0f);
+                    if (selected_values && mem->hrq.value_top)
+                        selected_values[li] = mem->hrq.value_top[idx];
                     /* Ruling 21: Sparse's d_top is the HRQ top similarity in
                      * the same Poincaré domain sparse_forward_c measures. */
                     for (int k = 0; k < dag->n_nodes; k++) {
@@ -344,28 +353,90 @@ bool execute_dag_v3(dag_t* dag, const lcm_memory_v3* mem, float alpha_val,
                 }
                 break;
             }
-            case LATTICE_SPARSE:
+            case LATTICE_SPARSE: {
+                int idx = 0;
                 sparse_forward_c(node->inputs[0], &mem->sparse,
                                  mem->lambda_lfq, alpha_val,
-                                 node->dep_dist, 0, result, NULL);
+                                 node->dep_dist, 0, result, &idx);
+                if (selected_rows) {
+                    if (idx > 0 && mem->sparse.C)
+                        memcpy(selected_rows[li],
+                               mem->sparse.C + (size_t)(idx - 1) * LCM_D,
+                               sizeof(vec_t));
+                    else if (mem->sparse.zero_vec)
+                        memcpy(selected_rows[li], mem->sparse.zero_vec,
+                               sizeof(vec_t));
+                }
+                if (selected_values && mem->sparse.value && idx > 0)
+                    selected_values[li] = mem->sparse.value[idx - 1];
                 break;
-            case LATTICE_LOWRANK:
+            }
+            case LATTICE_LOWRANK: {
+                int idxs[LCM_MAX_BIND_LAYERS];
+                memset(idxs, 0xff, sizeof(idxs));
                 lowrank_forward_c(node->inputs[0], &mem->lowrank, alpha_val,
-                                  result, NULL);
+                                  result, idxs);
+                if (selected_rows && mem->lowrank.n_layers > 0
+                    && idxs[0] >= 0 && idxs[0] < mem->lowrank.M_lr) {
+                    int rank = mem->lowrank.ranks[0];
+                    int r0 = idxs[0];
+                    for (int j = 0; j < LCM_D; j++) {
+                        float a = 0.0f;
+                        for (int k = 0; k < rank; k++) {
+                            a += mem->lowrank.U[
+                                ((size_t)r0 * (size_t)mem->lowrank.r_max
+                                 + (size_t)k)]
+                                * mem->lowrank.V[
+                                    (size_t)j * (size_t)mem->lowrank.r_max
+                                    + (size_t)k];
+                        }
+                        selected_rows[li][j] = a;
+                    }
+                    if (selected_values && mem->lowrank.value)
+                        selected_values[li] = mem->lowrank.value[r0];
+                }
                 break;
-            case LATTICE_MANIFOLD:
+            }
+            case LATTICE_MANIFOLD: {
+                int idx = 0;
                 manifold_forward_c(node->inputs[0], &mem->manifold,
-                                   alpha_val, result, NULL);
+                                   alpha_val, result, &idx);
+                if (selected_rows && idx >= 0 && idx < mem->manifold.M)
+                    exp_map_c(mem->manifold.C + (size_t)idx * LCM_D,
+                              selected_rows[li], LCM_D, 1.0f);
+                if (selected_values && mem->manifold.value)
+                    selected_values[li] = mem->manifold.value[idx];
                 break;
-            case LATTICE_BINDING:
+            }
+            case LATTICE_BINDING: {
+                int vidx = -1;
                 binding_forward_c(node->inputs[0], &mem->binding,
                                   mem->lowrank.V, alpha_val, result,
-                                  NULL, NULL);
+                                  NULL, NULL, &vidx);
+                if (selected_rows && vidx >= 0
+                    && vidx < mem->binding.n_layers * mem->binding.M)
+                    memcpy(selected_rows[li],
+                           mem->binding.val_cb + (size_t)vidx * LCM_D,
+                           sizeof(vec_t));
+                if (selected_values && mem->binding.value_val && vidx >= 0)
+                    selected_values[li] = mem->binding.value_val[vidx];
                 break;
-            case LATTICE_CONTRAST:
-                contrast_forward_c(node->inputs[0], &mem->contrast,
-                                   alpha_val, result);
+            }
+            case LATTICE_CONTRAST: {
+                int ia[LCM_MAX_BIND_LAYERS], ib[LCM_MAX_BIND_LAYERS];
+                memset(ia, 0xff, sizeof(ia));
+                memset(ib, 0xff, sizeof(ib));
+                contrast_forward_v31(node->inputs[0], &mem->contrast,
+                                     alpha_val, result, ia, ib);
+                if (selected_rows && ia[0] >= 0
+                    && mem->contrast.n_layers > 0)
+                    memcpy(selected_rows[li],
+                           mem->contrast.C_a + (size_t)ia[0] * LCM_D,
+                           sizeof(vec_t));
+                if (selected_values && mem->contrast.value_a && ia[0] >= 0)
+                    selected_values[li] = mem->contrast.value_a[ia[0]];
                 break;
+            }
             default:
                 break;
             }
@@ -442,112 +513,34 @@ int lcm_fuse_canonical(const float* outputs, int n_lattices, int d,
 
 /* ─── Value consistency (R13) ─────────────────────────────────────────────── *
  * value_consistency = clip(cosine(Σ_j tanh(v_j)·c_j, z_next), 0, 1), where
- * c_j is the *selected codebook row* of each active lattice (the row nearest
- * to z_cur that produced the value scalar), not the fused lattice output.
- * Using the output made the metric a self-comparison of z_next with itself;
- * the selected row is the memory entry the value scalar actually annotates.
- * If no value vector is supplied, or the accumulated direction is zero,
- * consistency is defined as 1.0 (no evidence of deception) so uncalibrated
- * checkpoints do not block inference.
+ * c_j is the *actual selected codebook row* returned by each lattice forward
+ * in this DAG step (HRQ uses its Poincaré + top-k value winner; sparse uses
+ * its LFQ winner; binding uses the unbind value row; contrast uses C_a's
+ * layer-0 winner). The evidence is filled by execute_dag_v3 and passed in;
+ * we deliberately do not re-search a nearest row here, because a second
+ * Euclidean search can disagree with the forward's Poincaré/value-biased
+ * choice. If no value vector is supplied, or the accumulated direction is
+ * zero, consistency is 1.0 (no evidence of deception).
  */
-static int v3_nearest_value_row(const float* z, const float* cb, int M,
-                                const float* value, const float** out_row,
-                                float* out_v) {
-    if (!cb || !value || M <= 0) return 0;
-    int best = 0;
-    float best_d2 = INFINITY;
-    for (int j = 0; j < M; j++) {
-        float d2 = v3_d2(z, cb + (size_t)j * LCM_D);
-        if (d2 < best_d2) { best_d2 = d2; best = j; }
-    }
-    if (out_row) *out_row = cb + (size_t)best * LCM_D;
-    *out_v = value[best];
-    return 1;
-}
-
 static float v3_value_consistency_impl(const lcm_memory_v3* mem,
-                                        const vec_t* outputs,
+                                        vec_t* selected_rows,
+                                        const float* selected_values,
                                         const int* active,
-                                        const float* z_cur,
                                         const float* z_next) {
-    (void)outputs;  /* kept for ABI parity; the metric uses selected rows */
     vec_t acc;
     memset(acc, 0, sizeof(acc));
     int used = 0;
 
     for (int li = 0; li < mem->n_lattices; li++) {
         if (!active || !active[li]) continue;
-        vec_t lr_row;
-        const float* row = NULL;
-        float v = 0.0f;
-        int ok = 0;
-        switch (li) {
-        case LATTICE_HRQ:
-            ok = v3_nearest_value_row(
-                z_cur, mem->hrq.C_top, mem->hrq.M_top,
-                mem->hrq.value_top, &row, &v);
-            break;
-        case LATTICE_SPARSE:
-            ok = v3_nearest_value_row(
-                z_cur, mem->sparse.C, mem->sparse.M,
-                mem->sparse.value, &row, &v);
-            break;
-        case LATTICE_LOWRANK: {
-            /* Layer-0 codebook rows are U_0 @ V[:, :r_0]^T. */
-            const lowrank_mem_t* lm = &mem->lowrank;
-            int rank = lm->ranks[0];
-            int best = 0;
-            float best_d2 = INFINITY;
-            for (int r = 0; r < lm->M_lr; r++) {
-                const float* u = lm->U + (size_t)r * (size_t)lm->r_max;
-                float d2 = 0.0f;
-                for (int j = 0; j < LCM_D; j++) {
-                    const float* vv = lm->V
-                        + (size_t)j * (size_t)lm->r_max;
-                    float a = 0.0f;
-                    for (int k = 0; k < rank; k++) a += u[k] * vv[k];
-                    float t = z_cur[j] - a;
-                    d2 += t * t;
-                }
-                if (d2 < best_d2) { best_d2 = d2; best = r; }
-            }
-            if (lm->value != NULL && lm->M_lr > 0) {
-                for (int j = 0; j < LCM_D; j++) {
-                    const float* u = lm->U
-                        + (size_t)best * (size_t)lm->r_max;
-                    const float* vv = lm->V
-                        + (size_t)j * (size_t)lm->r_max;
-                    float a = 0.0f;
-                    for (int k = 0; k < rank; k++) a += u[k] * vv[k];
-                    lr_row[j] = a;
-                }
-                row = lr_row;
-                v = lm->value[best];
-                ok = 1;
-            }
-            break;
+        if (!selected_rows) continue;
+        const float* row = selected_rows[li];
+        float g = tanhf(selected_values ? selected_values[li] : 0.0f);
+        int nonzero = 0;
+        for (int j = 0; j < LCM_D; j++) {
+            if (row[j] != 0.0f) { nonzero = 1; break; }
         }
-        case LATTICE_MANIFOLD:
-            ok = v3_nearest_value_row(
-                z_cur, mem->manifold.C, mem->manifold.M,
-                mem->manifold.value, &row, &v);
-            break;
-        case LATTICE_BINDING:
-            ok = v3_nearest_value_row(
-                z_cur, mem->binding.val_cb, mem->binding.M,
-                mem->binding.value_val, &row, &v);
-            break;
-        case LATTICE_CONTRAST:
-            ok = v3_nearest_value_row(
-                z_cur, mem->contrast.C_a, mem->contrast.M,
-                mem->contrast.value_a, &row, &v);
-            break;
-        default:
-            ok = 0;
-            break;
-        }
-        if (!ok || row == NULL) continue;
-        float g = tanhf(v);
+        if (!nonzero) continue;
         for (int j = 0; j < LCM_D; j++) acc[j] += g * row[j];
         used = 1;
     }
@@ -563,17 +556,18 @@ static float v3_value_consistency_impl(const lcm_memory_v3* mem,
     float c = dot / (sqrtf(n_acc) * sqrtf(n_next));
     if (c > 1.0f) c = 1.0f;
     if (c < 0.0f) c = 0.0f;
-    /* d.md §4.2: clip(cos, 0, 1). Threshold recalibrated from the old
-     * affine-equivalent 0.7 to 0.4 so a normal positive cosine can pass. */
+    /* d.md §4.2: clip(cos, 0, 1). Threshold 0.4 is the clip-domain equivalent
+     * of the old affine 0.7 working point (cos >= 0.4). */
     return c;
 }
 
 float lcm_value_consistency_v3(const lcm_memory_v3* mem,
-                               const float* outputs, const int* active,
-                               const float* z_cur, const float* z_next) {
-    if (!mem || !outputs || !z_cur || !z_next) return 1.0f;
-    return v3_value_consistency_impl(mem, (const vec_t*)outputs, active,
-                                     z_cur, z_next);
+                               vec_t* selected_rows,
+                               const float* selected_values,
+                               const int* active, const float* z_next) {
+    if (!mem || !selected_rows || !z_next) return 1.0f;
+    return v3_value_consistency_impl(mem, selected_rows, selected_values,
+                                     active, z_next);
 }
 
 /* Retrieval operations performed by one active step: one per codebook layer
@@ -870,10 +864,15 @@ int lcm_infer_loop_v3(const lcm_memory_v3* mem, const gvalue_t* gv,
         vec_t outputs[LCM_MAX_LATTICES];
         float confidences[LCM_MAX_LATTICES];
         int active[LCM_MAX_LATTICES];
+        vec_t selected_rows[LCM_MAX_LATTICES];
+        float selected_values[LCM_MAX_LATTICES];
         memset(outputs, 0, sizeof(outputs));
         memset(confidences, 0, sizeof(confidences));
         memset(active, 0, sizeof(active));
-        execute_dag_v3(&dag, &work, alpha_val, outputs, confidences, active);
+        memset(selected_rows, 0, sizeof(selected_rows));
+        memset(selected_values, 0, sizeof(selected_values));
+        execute_dag_v3(&dag, &work, alpha_val, outputs, confidences, active,
+                       selected_rows, selected_values);
 
         /* Routing gate: deterministic hard mask over the routed lattices. */
         float soft_mask[LCM_MAX_LATTICES];
@@ -944,7 +943,7 @@ int lcm_infer_loop_v3(const lcm_memory_v3* mem, const gvalue_t* gv,
         int retrieval_total = lcm_retrieval_count_v3(&work, active);
 
         float value_consistency = v3_value_consistency_impl(
-            &work, (const vec_t*)outputs, active, z_cur, z_next);
+            &work, selected_rows, selected_values, active, z_next);
 
         conflict_t conflict;
         memset(&conflict, 0, sizeof(conflict));
