@@ -1478,6 +1478,30 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     last_is_safe = True  # danger priority for the next behavior-plan step
     obs_error_logged = False
 
+    # R13: C_normal is generated from a bank of safe encoder states over many
+    # batches, not one batch tiled. A single-batch normal set cannot cover the
+    # input distribution and makes random threat rows win by chance. Frozen
+    # write; never enters the optimizer.
+    if 'danger' in params and 'C_normal' in params.get('danger', {}):
+        try:
+            M_d = int(params['danger']['C'].shape[0])
+            normal_iter = WikiDataIter(data_path, shape_path, spans_path,
+                                       B=1, N=seq_len)
+            rows = []
+            for _ in range(M_d):
+                xn, _ = next(normal_iter)
+                zn = safe_unit(encoder_forward(
+                    params['encoder'], xn, cfg.n_heads))
+                rows.append(np.asarray(jax.device_get(zn))[0])
+            params['danger'] = dict(
+                params['danger'],
+                C_normal=jnp.asarray(np.stack(rows), dtype=jnp.float32))
+            print(f"[COG] danger: C_normal seeded from {M_d} safe encoder "
+                  f"states (structural placeholder, frozen)")
+        except Exception as exc:
+            print(f"[COG] danger: normal-bank seeding failed ({exc}); "
+                  f"keeping structural C_normal", file=sys.stderr)
+
     for item in plan:
         # item['offset'] is loop-relative (schedule/log/save/bank guards);
         # abs_step is the state clock (EMA last_used, dead-code detection,
@@ -1552,22 +1576,6 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
                 self_state_backup)
             pbar.update(1)
             continue
-
-        # R13: the normal danger half is a structural placeholder drawn from the
-        # first clean batch's cognitive state, not a semantic normal set. The
-        # threat half stays the fixed random basis; the two halves are
-        # therefore different data and different rows, which is what the C
-        # loader requires. This is a frozen write: it never enters the
-        # optimizer, and it happens once.
-        if abs_step == 0 and 'danger' in params:
-            z0 = np.asarray(jax.device_get(aux_out['z_cur'])).astype(np.float32)
-            z0 = z0.reshape(-1, cfg.d_model)
-            M_d = int(params['danger']['C'].shape[0])
-            reps = np.tile(z0, (int(np.ceil(M_d / z0.shape[0])), 1))[:M_d]
-            params['danger'] = dict(
-                params['danger'], C_normal=jnp.asarray(reps))
-            print(f"[COG] danger: C_normal seeded from first-batch z "
-                  f"({M_d} rows, structural placeholder)")
 
         # Feature bank: contrast's usage clock is updated EVERY step (R17);
         # dead detection/replacement and bank collection only at the interval.

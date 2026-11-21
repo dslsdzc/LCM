@@ -225,7 +225,8 @@ def load_parity_lib(path=None, d=PARITY_D):
         _FP, ctypes.POINTER(ContrastMem), ctypes.c_float, _FP, _IP, _IP]
     lib.binding_forward_c.restype = None
     lib.binding_forward_c.argtypes = [
-        _FP, ctypes.POINTER(BindingMem), _FP, ctypes.c_float, _FP, _FP, _FP]
+        _FP, ctypes.POINTER(BindingMem), _FP, ctypes.c_float, _FP, _FP, _FP,
+        _IP]
     lib.routing_gate_c.restype = None
     lib.routing_gate_c.argtypes = [
         _FP, _FP, _FP, ctypes.c_int, _FP]
@@ -717,7 +718,7 @@ def _binding_parity(case, lib, alpha):
     k_q = np.zeros(d, dtype=np.float32)
     lib.binding_forward_c(_ptr(z_np), ctypes.byref(m), _ptr(V),
                           ctypes.c_float(float(alpha)), _ptr(out),
-                          _ptr(b_q), _ptr(k_q))
+                          _ptr(b_q), _ptr(k_q), None)
 
     return _parity_result(
         "binding", case, alpha, ("v_out", "b_q", "k_q"), [],
@@ -986,7 +987,7 @@ def _binding_pair(lib, key, val, bind, A_k, A_v, V, z):
     k_q = np.zeros(d, dtype=np.float32)
     lib.binding_forward_c(_ptr(z), ctypes.byref(m), _ptr(V),
                           ctypes.c_float(0.0), _ptr(out), _ptr(b_q),
-                          _ptr(k_q))
+                          _ptr(k_q), None)
 
     return _parity_result(
         "binding_crafted", {"seed": 0, "d": d}, 0.0,

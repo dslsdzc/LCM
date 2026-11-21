@@ -530,12 +530,16 @@ static float v3_value_consistency_impl(const lcm_memory_v3* mem,
     vec_t acc;
     memset(acc, 0, sizeof(acc));
     int used = 0;
+    float max_abs_v = 0.0f;
 
     for (int li = 0; li < mem->n_lattices; li++) {
         if (!active || !active[li]) continue;
         if (!selected_rows) continue;
         const float* row = selected_rows[li];
-        float g = tanhf(selected_values ? selected_values[li] : 0.0f);
+        float v = selected_values ? selected_values[li] : 0.0f;
+        float av = fabsf(v);
+        if (av > max_abs_v) max_abs_v = av;
+        float g = tanhf(v);
         int nonzero = 0;
         for (int j = 0; j < LCM_D; j++) {
             if (row[j] != 0.0f) { nonzero = 1; break; }
@@ -546,6 +550,9 @@ static float v3_value_consistency_impl(const lcm_memory_v3* mem,
     }
 
     if (!used) return 1.0f;
+    /* Placeholder guard (R13): untrained value scalars are not a semantic
+     * signal. Report no evidence rather than aborting every normal input. */
+    if (max_abs_v < LCM_VALUE_CONFIDENCE_MIN) return 1.0f;
     float n_acc = 0.0f, n_next = 0.0f, dot = 0.0f;
     for (int j = 0; j < LCM_D; j++) {
         n_acc += acc[j] * acc[j];

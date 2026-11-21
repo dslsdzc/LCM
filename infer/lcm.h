@@ -70,6 +70,11 @@ extern "C" {
 
 /* Derived constants */
 #define LCM_CONSISTENCY_THRESHOLD 0.4f   /* R17 recalibrated: clip(cos,0,1) */
+/* R13 value scalars are only semantic when trained. Placeholder checkpoints
+ * carry |v_j| ~ 0.01; tanh(v_j) then points in an arbitrary direction and a
+ * cosine gate would abort normal inputs. Below this confidence we report "no
+ * evidence of deception" (1.0) instead of using a placeholder as a verdict. */
+#define LCM_VALUE_CONFIDENCE_MIN  0.1f
 #define LCM_ENTROPY_THRESHOLD     2.0f  /* v1: unnormalised H, effectively off */
 #define LCM_ENTROPY_THRESHOLD_NORM 0.5f /* R9: v3 H(w)/ln(n_active) */
 #define LCM_CONVERGENCE_TOL       1e-3f

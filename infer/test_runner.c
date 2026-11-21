@@ -2526,6 +2526,16 @@ static void test_value_consistency_nonzero(void) {
     CHECK(vc > LCM_CONSISTENCY_THRESHOLD,
           "a normal positive cosine clears the recalibrated threshold");
 
+    /* R13 placeholder guard: |v| < 0.1 is untrained/placeholder; the metric
+     * must report no evidence (1.0), not abort a normal input with cos≈0. */
+    float placeholder_values[LCM_MAX_LATTICES];
+    memset(placeholder_values, 0, sizeof(placeholder_values));
+    placeholder_values[LATTICE_HRQ] = 0.01f;
+    float vc_placeholder = lcm_value_consistency_v3(
+        &t10_mem, selected_rows, placeholder_values, active, z_next);
+    CHECK(fabsf(vc_placeholder - 1.0f) < 1e-6f,
+          "untrained value scalars are not a deception verdict");
+
     /* A cosine of -1 must clip to 0, not stay negative or affine-map to 0.5. */
     float z_neg[LCM_D] = {0};
     z_neg[0] = -1.0f;
