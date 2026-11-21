@@ -19,7 +19,7 @@ smoke 运行 HEAD：`661a26b`（I7 修复尚未提交的工作树）；Task 15 e
 | 设备 | CPU（`JAX_PLATFORMS=cpu`；GTX 1650 4GB 不参与） |
 | smoke 运行 HEAD | `661a26b` + I7 未提交工作树（Task 15 evidence 提交 `ef7136b`，pre-docs；最后行为变更 `661a26b`） |
 | 总耗时 | 174.86s |
-| C 参考 | `make -C infer clean && make -C infer test`（243 PASS） |
+| C 参考 | `make -C infer clean && make -C infer test`（249 PASS） |
 
 ## 2. 配置
 
@@ -81,25 +81,25 @@ smoke 运行 HEAD：`661a26b`（I7 修复尚未提交的工作树）；Task 15 e
 
 ## 4. 100 步 loss
 
-- 首 10 步均值：**18.1850**
-- 末 10 步均值：**9.4098**
-- 比值：**0.5174**（< 0.8：PASS）
+- 首 10 步均值：**18.3438**
+- 末 10 步均值：**12.9269**
+- 比值：**0.7047**（< 0.8：PASS）
 - 全部有限：PASS
 
 | 步区间 | 均值 | 最小 | 最大 |
 |---|---|---|---|
-| 0–9 | 18.1850 | 17.3898 | 18.8471 |
-| 10–19 | 16.4476 | 15.5952 | 17.8353 |
-| 20–29 | 16.4532 | 14.1120 | 21.9720 |
-| 30–39 | 14.5515 | 13.8209 | 15.6040 |
-| 40–49 | 14.0490 | 13.4874 | 14.9853 |
-| 50–59 | 15.1361 | 12.8622 | 21.5460 |
-| 60–69 | 15.0006 | 11.4759 | 23.1499 |
-| 70–79 | 12.4611 | 10.2892 | 19.0864 |
-| 80–89 | 10.8852 | 9.3605 | 20.9628 |
-| 90–99 | 9.4098 | 8.9333 | 10.1922 |
+| 0–9 | 18.3438 | 17.3922 | 19.0286 |
+| 10–19 | 16.8645 | 15.1980 | 18.6407 |
+| 20–29 | 16.6089 | 14.8846 | 22.0831 |
+| 30–39 | 15.7963 | 14.0700 | 22.1303 |
+| 40–49 | 15.1026 | 14.1758 | 17.0367 |
+| 50–59 | 14.3549 | 13.8970 | 14.7857 |
+| 60–69 | 17.2930 | 14.2266 | 22.6053 |
+| 70–79 | 14.0705 | 13.4196 | 14.6677 |
+| 80–89 | 13.2742 | 12.9852 | 13.7118 |
+| 90–99 | 12.9269 | 12.5071 | 13.5218 |
 
-完整逐 step 曲线在 `checkpoints/conformance_smoke/smoke_report.json` 的 `loss.per_step`。
+完整逐 step 曲线在 `checkpoints/conformance_smoke_final/smoke_report.json` 的 `loss.per_step`。
 
 ## 5. 逐格更新、真实梯度、方差与利用率
 
@@ -107,17 +107,17 @@ smoke 运行 HEAD：`661a26b`（I7 修复尚未提交的工作树）；Task 15 e
 
 | 晶格 | grad norm | grad>1e-6 | Δmax abs (secondary) | var ratio | utilization |
 |---|---|---|---|---|---|
-| encoder | 1090.4047 | PASS | 0.0153 | — | — |
-| hrq | 678.5829 | PASS | 0.0155 | 3.7784 | 4.69% |
-| sparse | — | — | 2.9417 | 31.8964 | 3.12% |
-| lowrank | 0.2075 | PASS | 0.0085 | 0.9728 | 6.25% |
-| manifold | 0.0023 | PASS | 2.9561 | 32.4692 | 3.12% |
-| binding | 0.1521 | PASS | 1.3014 | 86.4118 | 1.32% |
-| contrast | 1.0704 | PASS | 0.0198 | 296.1576 | 3.16% |
-| route | 39.1719 | PASS | 0.0155 | 1.0823 | 83.33% |
-| fusion | 22.7596 | PASS | 0.0161 | — | — |
-| self | — | — | 2.8644 | 26.9464 | 25.00% |
-| value_scalars | 55.4642 | PASS | 0.0162 | — | — |
+| encoder | 1090.9929 | PASS | 0.0155 | — | — |
+| hrq | 680.3317 | PASS | 0.0156 | 4.7843 | 5.08% |
+| sparse | — | — | 2.8703 | 38.2559 | 3.91% |
+| lowrank | 0.5485 | PASS | 0.0087 | 1.0361 | 5.47% |
+| manifold | 0.0023 | PASS | 2.8854 | 38.8239 | 3.91% |
+| binding | 0.3061 | PASS | 1.9091 | 70.6662 | 1.26% |
+| contrast | 1.4561 | PASS | 0.0202 | 211.0913 | 2.80% |
+| route | 39.1918 | PASS | 0.0152 | 1.0576 | 100.00% |
+| fusion | 22.7596 | PASS | 0.0163 | — | — |
+| self | — | — | 2.8232 | 32.1763 | 31.25% |
+| value_scalars | 55.4405 | PASS | 0.0165 | — | — |
 
 sparse/self 无 trainable 子树，用 N/m 判据；manifold/binding 同时有 `T`/`A_k`/`A_v` 的梯度和码本 EMA。
 
@@ -125,31 +125,31 @@ sparse/self 无 trainable 子树，用 N/m 判据；manifold/binding 同时有 `
 
 | 晶格 | training probe (fixed batch) | streaming probe (100 batches) | 阈值 | verdict |
 |---|---|---|---|---|
-| hrq | 4.69% | 8.40% | 10% | **FAIL** |
-| sparse | 3.12% | 6.84% | 10% | **FAIL** |
-| lowrank | 6.25% | 0.39% | 10% | **FAIL** |
-| manifold | 3.12% | 5.86% | 10% | **FAIL** |
-| binding | 1.32% | 0.20% | 10% | **FAIL** |
-| contrast | 3.16% | 1.01% | 10% | **FAIL** |
-| route | 83.33% | 66.67% | 10% | PASS |
-| self | 25.00% | 1.56% | 10% | **FAIL** |
+| hrq | 5.08% | 6.45% | 10% | **FAIL** |
+| sparse | 3.91% | 4.49% | 10% | **FAIL** |
+| lowrank | 5.47% | 0.78% | 10% | **FAIL** |
+| manifold | 3.91% | 8.01% | 10% | **FAIL** |
+| binding | 1.26% | 0.20% | 10% | **FAIL** |
+| contrast | 2.80% | 0.91% | 10% | **FAIL** |
+| route | 100.00% | 83.33% | 10% | PASS |
+| self | 31.25% | 1.56% | 10% | **FAIL** |
 
 Streaming verdict：**FAIL**；batches=100，B=1。
 Training probe（固定单 batch，secondary）：**FAIL**。
-Ruling 51 的 streaming probe 仍低于 10%：这不是“码本没更新”，而是路由/码本在 100 步内高度集中。正式验收需要更多步数、B≥4 或路由探索；本次如实记为unresolved（D-9），不调低阈值。
+Ruling 51 的 streaming probe 仍低于 10%：这不是“码本没更新”，而是路由/码本在 100 步内高度集中。正式验收需要更多步数、B≥4 或路由探索；本次如实记为 unresolved（D-9），不调低阈值。只读诊断（`train/research_d9_probe.py`）进一步显示 Binding 与 Self 的选择输入无关、LowRank 每层只有 2 个吸引子；见 `docs/d9-codebook-utilization-research-plan.md`。
 
 ### 5.2 码本方差（final/initial ≥ 0.5）
 
 | 晶格 | ratio |
 |---|---|
-| hrq | 3.7784 |
-| sparse | 31.8964 |
-| lowrank | 0.9728 |
-| manifold | 32.4692 |
-| binding | 86.4118 |
-| contrast | 296.1576 |
-| route | 1.0823 |
-| self | 26.9464 |
+| hrq | 4.7843 |
+| sparse | 38.2559 |
+| lowrank | 1.0361 |
+| manifold | 38.8239 |
+| binding | 70.6662 |
+| contrast | 211.0913 |
+| route | 1.0576 |
+| self | 32.1763 |
 
 Result: PASS
 
@@ -159,10 +159,10 @@ Result: PASS
 
 | 分支 | ΔN abs | N sum | 使用行 | Δm norm | changed |
 |---|---|---|---|---|---|
-| sparse | 63.3968 | 63.3968 | 16/512 | 582.0833 | PASS |
-| manifold | 63.3968 | 63.3968 | 16/512 | 582.0833 | PASS |
-| self | 63.3968 | 63.3968 | 16/64 | 582.0833 | PASS |
-| binding | 570.5711 | 570.5711 | 61/4608 | 284.7834 | PASS |
+| sparse | 63.3968 | 63.3968 | 20/512 | 606.8900 | PASS |
+| manifold | 63.3968 | 63.3968 | 20/512 | 606.8900 | PASS |
+| self | 63.3968 | 63.3968 | 20/64 | 606.8900 | PASS |
+| binding | 570.5711 | 570.5711 | 58/4608 | 409.3718 | PASS |
 
 EMA 总结果：PASS
 
@@ -227,7 +227,7 @@ EMA 总结果：PASS
 
 - crafted peaked：0.0396 → PASS
 - crafted uniform：1.0000 → 不通过=PASS
-- **真实训练 mask**：H_norm=0.5587 → **FAIL**（阈值 0.5）
+- **真实训练 mask**：H_norm=0.5848 → **FAIL**（阈值 0.5）
 - 总 pass：**FAIL**；JAX 训练门按归一化 0.5 解释。
 
 ### 8.4 Feature bank（synthetic policy probe）
@@ -250,9 +250,9 @@ EMA 总结果：PASS
 | 导出 danger pattern：threat blocked / type | PASS / 1 (1=PATTERN_MATCH) |
 | 导出 danger pattern：normal not blocked / type | PASS / 0 |
 | 导出 danger pattern pass | PASS |
-| 真实 v3 loop 威胁输入 ret | -2 (CONFLICT_DANGER/THREAT_DECEPTION) |
+| 真实 v3 loop 威胁输入 ret | -2 (CONFLICT_DANGER/THREAT_PATTERN_MATCH) |
 | `generate` 威胁输入 ret / tokens | -2 / 0 |
-| alert callback | PASS (CONFLICT_DANGER/THREAT_DECEPTION) |
+| alert callback | PASS (CONFLICT_DANGER/THREAT_PATTERN_MATCH) |
 | trace file written | PASS |
 | v3 abort any conflict | PASS |
 | C gvalue margin=0.5：pos safe / neutral abort / neg abort | 1.0000 / 1.0000 / 1.0000 (n=12) |
@@ -260,9 +260,9 @@ EMA 总结果：PASS
 | danger hash unchanged after step 0 | PASS |
 | 导出 gvalue pos≠neg / danger threat≠normal | PASS / PASS |
 
-Ruling 50：v3 loop 的 abort 实际是 `THREAT_DECEPTION`（source 仍是 CONFLICT_DANGER；consistency 分支先触发，value_consistency < 0.4），所以 `safety_chain` 只由导出 danger pattern probe 的 `THREAT_PATTERN_MATCH` 决定；`safety_abort_any_conflict` 单独记录 hard-stop。normal input 的 abort 也是 consistency/deception，不是 danger pattern 过阻断。
+Ruling 50：v3 loop 的 threat 输入现在由 `CONFLICT_DANGER/THREAT_PATTERN_MATCH` 中断：`detect_any_conflict` 同时检查进入步的 `z_cur` 和离开步的 `z_next`。只查 `z_next` 会让被 DAG 一步变换掉的威胁输入逃逸；这个洞此前被 value consistency 的占位误报掩盖。`safety_abort_any_conflict` 记录该 hard-stop；导出的 danger pattern probe 仍单独验证 `THREAT_PATTERN_MATCH`。normal 输入在 `use_safety=True` 时按严格三法则由 `CONFLICT_GVALUE/THREE_LAWS` 中断，这是已确认的预期行为；`use_safety=False` 时不触发 gvalue，且不匹配 danger pattern。
 
-gvalue/danger are structural placeholders built from fixed anchors and the first batch's z. They exercise the trigger chain; they do not establish semantic safety.
+gvalue/danger are structural placeholders built from fixed anchors and a bank of safe encoder states. They exercise the trigger chain; they do not establish semantic safety.
 
 ## 10. 逐格 JAX↔C parity
 
@@ -281,7 +281,7 @@ gvalue/danger are structural placeholders built from fixed anchors and the first
 | engine fusion | 六格 + distance | 1e-5 | PASS |
 | 判别性 | Poincaré≠Euclidean、相对 gap、binding 投影、NaN 不可假通过 | — | PASS |
 
-C `test_runner` 243 PASS；`nm` 含 `lcm_infer_loop_v3`/`hrq_forward_v31`。Manifest per-tensor sha256 由 `train/c_load.py` 校验；`test_c_load.py::test_manifest_tensor_sha256_rejects_tampered_payload` 和 `test_manifest_missing_sha256_is_rejected` 覆盖篡改/缺 hash。
+C `test_runner` 249 PASS；`nm` 含 `lcm_infer_loop_v3`/`hrq_forward_v31`。Manifest per-tensor sha256 由 `train/c_load.py` 校验；`test_c_load.py::test_manifest_tensor_sha256_rejects_tampered_payload` 和 `test_manifest_missing_sha256_is_rejected` 覆盖篡改/缺 hash。
 
 ## 11. 自观测 5% 开销
 
@@ -323,9 +323,9 @@ Optimizer moments are deliberately not part of the v2 checkpoint (R10: params/EM
 ## 14. 已知局限
 
 1. **100 步不证明语言能力**。
-2. **gvalue/danger 是结构占位**，不是语义安全锚点；导出 danger pattern path 用 value_consistency=1.0 单独验证，真实 v3 loop 的 abort 是 consistency/deception。normal input 的 abort 不是 danger pattern 结果。
-3. **10% 码本利用率未通过**：streaming probe 全列为 HRQ 8.40%、Sparse 6.84%、LowRank 0.39%、Manifold 5.86%、Binding 0.20%、Contrast 1.01%、Self 1.56%（Route 66.67% PASS）。结构原因见 §5.1。
-4. **真实 mask 的归一化熵 0.5587 > 0.5**，熵门未通过；crafted peaked/uniform 只证明门本身可过可不过。
+2. **gvalue/danger 是结构占位**，不是语义安全锚点；导出 danger pattern path 用 value_consistency=1.0 单独验证，真实 v3 loop 的威胁输入由 `CONFLICT_DANGER/THREAT_PATTERN_MATCH` 中断（同时检查 `z_cur`/`z_next`）。normal input 在 `use_safety=True` 时按严格三法则 abort，这是已确认的预期行为，不是语义安全通过。
+3. **10% 码本利用率未通过**：streaming probe 全列为 HRQ 6.45%、Sparse 4.49%、LowRank 0.78%、Manifold 8.01%、Binding 0.20%、Contrast 0.91%、Self 1.56%（Route 83.33% PASS）。结构原因与诊断见 §5.1 和 `docs/d9-codebook-utilization-research-plan.md`。
+4. **真实 mask 的归一化熵 0.5848 > 0.5**，熵门未通过；crafted peaked/uniform 只证明门本身可过可不过。
 5. ~~规范文字未同步到 v3.1（D-1）~~ **已在 Task 0 + review 修正中解决**：`docs/a–e.md` 与 `docs/a–e_cn.md` 均按 R1–R22 同步并带 v3.1-conformance changelog。
 6. **外部验证器是本地形态**（未做 HSM）；`causal_subject.py` 不扩展（accepted deviation）。
 7. **优化器矩没有进 checkpoint**；2 步一致性用 fresh optimizer 测状态 round-trip。

@@ -283,6 +283,40 @@ static void test_danger_threshold_relative_gap(void) {
     CHECK(block, "danger relative_gap≈0.02 > 0.005 → blocked (discriminating)");
 }
 
+static void test_danger_checks_input_state(void) {
+    danger_lattice_t dl;
+    float threats[1][LCM_D];
+    float normals[1][LCM_D];
+    memset(threats, 0, sizeof(threats));
+    memset(normals, 0, sizeof(normals));
+    threats[0][0] =  0.5f;
+    normals[0][0] = -0.5f;
+    danger_init(&dl, &threats[0][0], &normals[0][0], 1, LCM_D);
+
+    int counts[LCM_MAX_LATTICES] = {0};
+    conflict_t conflict;
+
+    /* A threat input that the DAG transforms away must still abort. */
+    float z_cur[LCM_D] = {0};
+    float z_next[LCM_D] = {0};
+    z_cur[0] = 0.5f;
+    z_next[0] = -0.5f;
+    memset(&conflict, 0, sizeof(conflict));
+    bool blocked = detect_any_conflict(
+        z_next, z_cur, 0, &dl, NULL, counts, 1.0f, 0.5f, 16, &conflict);
+    CHECK(blocked && conflict.source == CONFLICT_DANGER,
+          "danger gate checks the input state z_cur, not only z_next");
+
+    /* And the post-step state is still checked. */
+    z_cur[0] = -0.5f;
+    z_next[0] = 0.5f;
+    memset(&conflict, 0, sizeof(conflict));
+    blocked = detect_any_conflict(
+        z_next, z_cur, 0, &dl, NULL, counts, 1.0f, 0.5f, 16, &conflict);
+    CHECK(blocked && conflict.source == CONFLICT_DANGER,
+          "danger gate still checks the post-step state z_next");
+}
+
 static void test_danger_hash_tamper(void) {
     danger_lattice_t dl;
     float threats[1][LCM_D];
@@ -2686,6 +2720,7 @@ int main(void) {
     test_danger_neutral_no_block();
     test_danger_direction();
     test_danger_threshold_relative_gap();
+    test_danger_checks_input_state();
     test_danger_hash_tamper();
     test_bridge_uses_projected_anchors();
     test_memory_v3_layout();

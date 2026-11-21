@@ -10,7 +10,7 @@
 
 ---
 
-LCM est une architecture cognitive qui extrait la mémoire des poids des réseaux de neurones et l'injecte dans des « cristaux de treillis » aux structures mathématiques variées. Il utilise **6 codebooks spécialisés en treillis** pour stocker différents types de connaissances, un encodeur à attention linéaire extrêmement léger pour la récupération, et un **moteur d'inférence à zéro paramètre implémenté en C pur** pour exécuter des opérations cognitives multi-étapes. Toutes les propriétés critiques de sécurité sont **formellement vérifiées avec Z3**.
+LCM est une architecture cognitive qui extrait la mémoire des poids des réseaux de neurones et l'injecte dans des « cristaux de treillis » aux structures mathématiques variées. Il utilise **6 codebooks spécialisés en treillis** pour stocker différents types de connaissances, un encodeur à attention linéaire extrêmement léger pour la récupération, et un **moteur d'inférence à zéro paramètre implémenté en C pur** pour exécuter des opérations cognitives multi-étapes. Les contrats de sécurité sont modélisés et vérifiés avec Z3 ; les preuves portent sur les modèles abstraits, pas sur l'implémentation C.
 
 > Les Transformers traditionnels sont confrontés à trois malédictions rigides : pour stocker plus de connaissances, il faut augmenter les paramètres (malédiction de l'échelle), les anciennes connaissances sont écrasées lors de l'apprentissage incrémental (malédiction de l'oubli), et le processus d'inférence n'est pas traçable (malédiction de la boîte noire). LCM brise fondamentalement ces goulots d'étranglement grâce au découplage architectural entre la mémoire et le raisonnement.
 
@@ -142,17 +142,25 @@ La constante de dimension `LCM_D` au moment de la compilation garantit que tous 
 
 ## Système de sécurité
 
+> **État : contrats et infrastructure implémentés ; les ancres de sécurité sont structurelles, pas sémantiques.**
+> Les ancres `gvalue` sont des axes positifs/négatifs fixes conçus à la main ; les deux moitiés `danger` sont une base de menace aléatoire fixe et une banque d'états encoder sûrs. Les deux sont gelées et structurellement distinctes : les chemins de déclenchement fonctionnent et sont testés, mais ils ne constituent pas une sécurité sémantique. Avec la marge stricte des Trois Lois (`0.5`), une entrée neutre a `balance = 0` et est insécurisée par définition ; les entrées normales sont donc censées s'interrompre jusqu'à l'entraînement d'ancres sémantiques.
+
 Le système de sécurité de LCM est constitué de trois sous-systèmes indépendants, par ordre décroissant de priorité :
 
-| Niveau | Module | Rôle | Mode de mise à jour |
-|--------|--------|------|-------------------|
-| 1 | **Treillis de danger** `Λ_danger` | Surveille en continu l'état d'inférence pour détecter des motifs dangereux | Gelé en permanence |
-| 2 | **Treillis de valeur globale** `Λ_gvalue` | Encodage mathématisé des trois lois d'Asimov (y compris la loi zéro) | Gelé en permanence |
-| 3 | **Vérificateur externe** | Vérification de cohérence et détection de conflits | Lecture seule |
+| Niveau | Module | Rôle | Mode de mise à jour | Opérationnel ? |
+|--------|--------|------|-------------------|----------------|
+| 1 | **Treillis de danger** `Λ_danger` | Surveille en continu l'état d'inférence pour détecter des motifs dangereux | Gelé en permanence | Structurel seulement — base de menace aléatoire + états sûrs |
+| 2 | **Treillis de valeur globale** `Λ_gvalue` | Encodage mathématisé des trois lois d'Asimov (y compris la loi zéro) | Gelé en permanence | Structurel seulement — axes ± fixes, non calibrés |
+| 3 | **Vérificateur externe** | Vérification de cohérence et détection de conflits | Lecture seule | Oui — forme locale ; isolation HSM et `SelfActivationState` de production différés |
 
 **Principe d'interruption matérielle** : en cas de détection d'un conflit logique, l'inférence s'arrête immédiatement avec une alerte claire, sans tentative de contournement, de retour en arrière ou d'auto-réparation.
 
-Tous les contrats de sécurité sont formellement vérifiés par le solveur SMT Z3 (105 preuves toutes réussies).
+Les portes danger et gvalue vérifient l'état entrant (`z_cur`) et l'état sortant
+(`z_next`) de chaque étape.
+
+Les contrats de sécurité sont modélisés et vérifiés par le solveur SMT Z3
+(107 lemmes réussis). Ces preuves portent sur les modèles abstraits de
+`train/verify.py`, pas sur l'implémentation C.
 
 ---
 
@@ -231,7 +239,7 @@ LCM/
 │   ├── data.py             # Chargement des données
 │   ├── checkpoint.py       # Format de point de contrôle binaire
 │   ├── monitor.py          # Enregistrement des métriques + graphiques HTML
-│   ├── verify.py           # Suite de vérification formelle Z3 (105 preuves)
+│   ├── verify.py           # Lemmes Z3 sur modèles abstraits (107)
 │   ├── continual.py        # Apprentissage continu (EWC/rejeu)
 │   ├── causal_subject.py   # Sujet causal
 │   ├── narrative_memory.py # Mémoire narrative

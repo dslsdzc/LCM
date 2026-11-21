@@ -493,13 +493,24 @@ bool detect_any_conflict(const float* z_next, const float* z_cur, int step,
                           const danger_lattice_t* dl, const gvalue_t* gv,
                           const int* retrieval_counts, float value_consistency,
                           float safety_margin, int max_steps, conflict_t* out) {
-    (void)z_cur;
+    /* Safety is a gate on the state entering the step and on the state leaving
+     * it. Checking only z_next let a threat input that the DAG transforms away
+     * in one step pass unblocked (the transformed vector is no longer near the
+     * threat row). Both probes use the same thresholds and conflict types. */
+    const float* state_probes[2] = {z_cur, z_next};
+
     /* 1. Danger lattice pattern match (optional — NULL = no danger check) */
     if (dl) {
-        float danger_score; int threat_type; bool should_block;
-        int rc = retrieval_counts ? retrieval_counts[0] : 0;  /* counts are optional */
-        danger_assess(dl, z_next, step, rc, max_steps, value_consistency,
-                      &danger_score, &threat_type, &should_block);
+        float danger_score = 0.0f; int threat_type = THREAT_NONE;
+        bool should_block = false;
+        int rc = retrieval_counts ? retrieval_counts[0] : 0;  /* optional */
+        for (int p = 0; p < 2; p++) {
+            if (!state_probes[p]) continue;
+            danger_assess(dl, state_probes[p], step, rc, max_steps,
+                          value_consistency, &danger_score, &threat_type,
+                          &should_block);
+            if (should_block) break;
+        }
         if (should_block) {
             out->source = CONFLICT_DANGER;
             out->type = (threat_type_t)threat_type;
@@ -512,16 +523,19 @@ bool detect_any_conflict(const float* z_next, const float* z_cur, int step,
 
     /* 2. Global value (three laws violation) — optional, skip if NULL */
     if (gv) {
-        int violated_law;
-        bool safe = gvalue_check_safety(gv, z_next, safety_margin, &violated_law);
-        if (!safe) {
-            out->source = CONFLICT_GVALUE;
-            out->type = THREAT_THREE_LAWS;
-            snprintf(out->detail, sizeof(out->detail),
-                     "relative_margin_violation (margin=%.2f)", safety_margin);
-            out->step = step;
-            out->timestamp = (double)time(NULL);
-            return true;
+        int violated_law = -1;
+        for (int p = 0; p < 2; p++) {
+            if (!state_probes[p]) continue;
+            if (!gvalue_check_safety(gv, state_probes[p], safety_margin,
+                                     &violated_law)) {
+                out->source = CONFLICT_GVALUE;
+                out->type = THREAT_THREE_LAWS;
+                snprintf(out->detail, sizeof(out->detail),
+                         "relative_margin_violation (margin=%.2f)", safety_margin);
+                out->step = step;
+                out->timestamp = (double)time(NULL);
+                return true;
+            }
         }
     }
 

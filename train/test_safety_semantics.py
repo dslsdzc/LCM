@@ -1,7 +1,28 @@
 import jax.numpy as jnp
 import pytest
+import re
+from pathlib import Path
+
+from train.config import LCMConfig
 from train.hyp import to_poincare, poincare_similarity, poincare_distance
 from train.gvalue import make_global_value_vectors, GValueCodebook
+
+
+def test_python_consistency_threshold_matches_c_header():
+    """D-8: the Python default and the compiled C constant must not drift.
+
+    The C v3 loop uses the compile-time ``LCM_CONSISTENCY_THRESHOLD``; it does
+    not read ``config.json`` at runtime. This test makes a one-sided change fail
+    loudly instead of silently producing different training and inference
+    verdicts.
+    """
+    header = Path(__file__).resolve().parents[1] / "infer" / "lcm.h"
+    text = header.read_text()
+    match = re.search(
+        r"#define\s+LCM_CONSISTENCY_THRESHOLD\s+([0-9.]+)f", text)
+    assert match is not None, "LCM_CONSISTENCY_THRESHOLD missing from lcm.h"
+    c_value = float(match.group(1))
+    assert LCMConfig().consistency_threshold == c_value == 0.4
 
 
 def test_poincare_similarity_finite_at_degenerate_norms():

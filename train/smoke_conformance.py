@@ -698,11 +698,11 @@ def _c_danger_probe(so_path):
 def _exported_danger_pattern_probe(final_dir):
     """Direct C ``danger_assess`` on the exported danger codebook.
 
-    Ruling 50: the v3 loop abort in the real checkpoint can be the consistency
-    branch (``THREAT_DECEPTION``) before pattern matching. This probe isolates
-    the pattern branch: real exported ``danger_codebook.bin`` halves,
-    ``value_consistency=1.0``, one threat-aligned z and one normal z. It must
-    return ``THREAT_PATTERN_MATCH`` for the threat and no block for the normal.
+    The v3 loop can also abort on the consistency branch when value scalars are
+    trained; this probe isolates the pattern branch: real exported
+    ``danger_codebook.bin`` halves, ``value_consistency=1.0``, one threat-aligned
+    z and one normal z. It must return ``THREAT_PATTERN_MATCH`` for the threat
+    and no block for the normal.
     """
     import lcm
 
@@ -1656,8 +1656,8 @@ def run_smoke(*, steps, data, shape, spans, output,
             "verdict."),
         "structural_placeholder_note": (
             "gvalue/danger are structural placeholders built from fixed "
-            "anchors and the first batch's z. They exercise the trigger chain; "
-            "they do not establish semantic safety."),
+            "anchors and a bank of safe encoder states. They exercise the "
+            "trigger chain; they do not establish semantic safety."),
         "frozen_hashes": {
             "gvalue_hash_start": gv_hash_start,
             "gvalue_hash_end": gv_hash_end,
@@ -2212,12 +2212,12 @@ def _markdown(report):
         f"trace={_fmt(real.get('trace_written'))}")
     lines.append(
         f"- v3 abort any conflict: {_fmt(real.get('abort_any_conflict'))} "
-        f"(hard-stop evidence; the type may be THREAT_DECEPTION)")
+        f"(hard-stop evidence)")
     lines.append(
         f"- normal input through the real loop: ret={real.get('normal_input_ret')}, "
         f"source={real.get('normal_input_source')}, "
-        f"type={real.get('normal_input_type')} — consistency/deception, not "
-        f"the exported pattern path")
+        f"type={real.get('normal_input_type')} — gvalue disabled for this probe; "
+        f"danger pattern not matched (strict normal abort requires use_safety=True)")
     gvc = s.get("gvalue_abort_rate", {})
     lines.append(
         f"- C gvalue margin=0.5: pos_safe={_fmt(gvc.get('positive_safe_rate'))}, "
@@ -2276,10 +2276,10 @@ def _markdown(report):
     lines.append(
         "- 100 steps do not prove language ability; only conformance.\n"
         "- gvalue/danger codebooks are structural placeholders, not semantic "
-        "safety anchors. The exported danger pattern path is tested separately "
-        "with value_consistency=1.0; the real v3 abort may be the consistency "
-        "(THREAT_DECEPTION) branch. Normal-input abort is not a danger-pattern "
-        "result.\n"
+        "safety anchors. The exported danger pattern path and the real v3 "
+        "threat-input hard-stop are tested separately. Under the confirmed "
+        "strict Three Laws margin a neutral input aborts by design; normal "
+        "input passing is not a conformance claim.\n"
         "- The entropy gate includes the real training mask in its verdict; "
         "a crafted gate pass alone is not enough.\n"
         "- Per-tensor manifest sha256 is verified for .bin tensors; pickle "

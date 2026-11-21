@@ -409,7 +409,7 @@ should_block = relative_gap > safety_threshold
 | 参数 | 规范值 | 处理 |
 |---|---|---|
 | `max_retrievals_per_step` | 128 | 改为 128；配合 R13 的全晶格计数 |
-| `consistency_threshold` | 0.7 | 改为 0.7；配合 R13 的真实 `value_consistency` |
+| `consistency_threshold` | 0.4（R17 重标定） | 实现改为 0.4。原设计写 0.7；Ruling 47 把 `value_consistency` 从仿射改为 `clip(cos,0,1)` 后，旧仿射 0.7 的等价工作点是 cos≥0.4。另有占位保护：选中 value 的 `max|v|<0.1` 时一致性返回 1.0（无欺骗证据） |
 | `tau_contrast` | 0.1 | 改为 0.1 |
 | `tau_val` | 0.05 | 改为 0.05 |
 | `max_inference_steps` | 调度 16 / 安全硬限 16 | 见 R9：调度默认 `max_inference_steps=16`（graceful 返回）；安全硬限 `max_inference_steps_hard=64`（abort）。规范里写清两者区别 |
@@ -688,7 +688,7 @@ fusion + 全晶格 + 安全 + trace），不能继续走 v1。测试断言：
 | EMA + feature bank 改动大，checkpoint 不兼容 | 新 checkpoint 格式带 `format_version=2`；旧 checkpoint 明确拒绝加载，不静默迁移；schema 在 Task 0 冻结 |
 | 100 步太短，EMA 统计量未收敛 | 报告只声称"更新发生"，不声称"收敛"；EMA 的 N/m 初值用首步 batch 冷启动 |
 | 100 步内 routing 仍近均匀，熵门到不了 0.5 | smoke 用构造的 peaked softmask 验证门可过；真实 mask 未过就如实写"未通过"，不算验收通过 |
-| 安全阈值未校准，正常路径假阳性 | 先做独立的安全闭环（正常 abort=0、构造危险 abort=1），再接入训练/部署；Z3 合同按新公式重写 |
+| 安全阈值未校准，正常路径假阳性 | 独立安全闭环使用构造的正/负锚点验证触发；已确认的严格三法则（`margin=0.5`）下中性输入按定义不安全，normal abort 是预期行为，不是“正常通过”验收项。语义锚点训练前不得声称安全层可用；Z3 合同按新公式重写，且只覆盖抽象模型 |
 | 安全码本在 100 步内没有语义 | 明确区分"结构验证"和"语义验证"；报告不得把结构占位说成语义安全 |
 | C 端全参数加载超出 4GB 显存 | C 端只读 CPU 内存；显存只用于 JAX 训练 smoke |
 | R15 重写 self 导致旧 checkpoint 全废 | 这是已接受的代价；100 步 smoke 从随机初始化开始，不依赖旧 checkpoint |

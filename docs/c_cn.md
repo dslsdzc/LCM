@@ -174,9 +174,13 @@ int detect_any_conflict(const float* z_next, const float* z_cur, int step,
                          DangerLattice* dl, GValue* gv,
                          int ret_counts, float val_consistency,
                          float safety_margin_rel, Conflict* out) {
-    float danger_score; int threat_type; int should_block;
-    danger_assess(dl, z_next, step, ret_counts, val_consistency,
+    float danger_score = 0.0f; int threat_type = 0; int should_block = 0;
+    /* 安全门同时检查进入该步和离开该步的状态。 */
+    danger_assess(dl, z_cur, step, ret_counts, val_consistency,
                   &danger_score, &threat_type, &should_block);
+    if (!should_block)
+        danger_assess(dl, z_next, step, ret_counts, val_consistency,
+                      &danger_score, &threat_type, &should_block);
     if (should_block) {
         out->source = CONFLICT_DANGER;
         out->type = (ConflictType)threat_type;
@@ -185,8 +189,11 @@ int detect_any_conflict(const float* z_next, const float* z_cur, int step,
         out->step = step; out->timestamp = now();
         return 1;
     }
-    int is_safe; int violated_law;
-    gvalue_check_safety(gv, z_next, safety_margin_rel, &is_safe, &violated_law);
+    int is_safe = 1; int violated_law = -1;
+    gvalue_check_safety(gv, z_cur, safety_margin_rel, &is_safe, &violated_law);
+    if (is_safe)
+        gvalue_check_safety(gv, z_next, safety_margin_rel,
+                            &is_safe, &violated_law);
     if (!is_safe) {
         out->source = CONFLICT_GVALUE;
         out->type = THREAT_THREE_LAWS;

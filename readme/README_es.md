@@ -10,7 +10,7 @@
 
 ---
 
-LCM es una arquitectura cognitiva que extrae la memoria de los pesos de la red neuronal y la inyecta en múltiples estructuras matemáticas denominadas "cristales reticulados". Utiliza **6 codebooks reticulados especializados** para almacenar diferentes tipos de conocimiento, emplea un codificador de atención lineal extremadamente ligero para la recuperación, y lo combina con un **motor de inferencia de cero parámetros implementado puramente en C** que ejecuta operaciones cognitivas en múltiples pasos. Todas las propiedades críticas de seguridad están **verificadas formalmente con Z3**.
+LCM es una arquitectura cognitiva que extrae la memoria de los pesos de la red neuronal y la inyecta en múltiples estructuras matemáticas denominadas "cristales reticulados". Utiliza **6 codebooks reticulados especializados** para almacenar diferentes tipos de conocimiento, emplea un codificador de atención lineal extremadamente ligero para la recuperación, y lo combina con un **motor de inferencia de cero parámetros implementado puramente en C** que ejecuta operaciones cognitivas en múltiples pasos. Los contratos de seguridad se modelan y comprueban con Z3; las pruebas cubren los modelos abstractos, no la implementación en C.
 
 > Los Transformers tradicionales enfrentan tres maldiciones rígidas: para almacenar más conocimiento deben aumentar los parámetros (maldición de escala), el conocimiento antiguo se sobrescribe durante el aprendizaje incremental (maldición del olvido), y el proceso de inferencia no es rastreable (maldición de la caja negra). LCM supera fundamentalmente estos cuellos de botella mediante el desacoplamiento arquitectónico entre memoria y razonamiento.
 
@@ -142,17 +142,25 @@ La constante de dimensión en tiempo de compilación `LCM_D` garantiza que todos
 
 ## Sistema de seguridad
 
+> **Estado: contratos e infraestructura implementados; los anclajes de seguridad son estructurales, no semánticos.**
+> Los anclajes `gvalue` son ejes positivos/negativos fijos diseñados a mano; las dos mitades de `danger` son una base de amenaza aleatoria fija y un banco de estados seguros del encoder. Ambos están congelados y son estructuralmente distintos: las rutas de activación funcionan y están probadas, pero no constituyen seguridad semántica. Con el margen estricto de las Tres Leyes (`0.5`), una entrada neutra tiene `balance = 0` y es insegura por definición; por tanto, las entradas normales deben abortar hasta que se entrenen anclajes semánticos.
+
 El sistema de seguridad de LCM consta de tres subsistemas independientes en orden decreciente de prioridad:
 
-| Capa | Módulo | Responsabilidad | Método de actualización |
-|------|--------|-----------------|------------------------|
-| 1 | **Retículo de peligro** `Λ_danger` | Monitoreo continuo del estado de inferencia en busca de patrones peligrosos | Congelado permanentemente |
-| 2 | **Retículo de valor global** `Λ_gvalue` | Incorporación matemática de las Tres Leyes de Asimov (incluyendo la Ley Cero) | Congelado permanentemente |
-| 3 | **Verificador externo** | Verificación de consistencia y detección de conflictos | Solo lectura |
+| Capa | Módulo | Responsabilidad | Método de actualización | ¿Operativo? |
+|------|--------|-----------------|------------------------|-------------|
+| 1 | **Retículo de peligro** `Λ_danger` | Monitoreo continuo del estado de inferencia en busca de patrones peligrosos | Congelado permanentemente | Solo estructural — base de amenaza aleatoria + estados seguros |
+| 2 | **Retículo de valor global** `Λ_gvalue` | Incorporación matemática de las Tres Leyes de Asimov (incluyendo la Ley Cero) | Congelado permanentemente | Solo estructural — ejes ± fijos, sin calibrar |
+| 3 | **Verificador externo** | Verificación de consistencia y detección de conflictos | Solo lectura | Sí — forma local; aislamiento HSM y `SelfActivationState` de producción diferidos |
 
 **Principio de interrupción forzosa**: Al detectar cualquier conflicto lógico, se detiene inmediatamente la inferencia y se genera una alerta clara, sin intentar eludir, retroceder o auto-reparar.
 
-Todos los contratos de seguridad han sido verificados formalmente con el solucionador Z3 SMT (las 105 pruebas pasan en su totalidad).
+Las puertas de danger y gvalue comprueban tanto el estado entrante (`z_cur`) como
+el estado saliente (`z_next`) de cada paso.
+
+Los contratos de seguridad se modelan y comprueban con el solucionador Z3 SMT
+(107 lemas superados). Estas pruebas cubren los modelos abstractos de
+`train/verify.py`, no la implementación en C.
 
 ---
 
@@ -231,7 +239,7 @@ LCM/
 │   ├── data.py             # Carga de datos
 │   ├── checkpoint.py       # Formato binario de puntos de control
 │   ├── monitor.py          # Registro de métricas + gráficos HTML
-│   ├── verify.py           # Suite de verificación formal Z3 (105 pruebas)
+│   ├── verify.py           # Lemas Z3 sobre modelos abstractos (107)
 │   ├── continual.py        # Aprendizaje continuo (EWC/repetición)
 │   ├── causal_subject.py   # Sujeto causal
 │   ├── narrative_memory.py # Memoria narrativa

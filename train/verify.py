@@ -1445,8 +1445,9 @@ def main() -> None:
     print("=" * 72)
     total = _passed + _failed
     if _failed == 0:
-        print(f"  ALL {total} PROOFS PASSED  ✓")
-        print(f"  All safety contracts verified for all possible inputs.")
+        print(f"  ALL {total} LEMMAS PASSED  ✓")
+        print(f"  Abstract models in this file satisfy their contracts.")
+        print(f"  This is not a proof of the C implementation; see the module docstring.")
     else:
         print(f"  {_passed}/{total} passed, {_failed} FAILED  ✗")
         print(f"  See counterexample models above for failing proofs.")

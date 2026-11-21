@@ -10,7 +10,7 @@
 
 ---
 
-LCM ist eine kognitive Architektur, die das Gedächtnis von neuronalen Netzgewichten trennt und in mehrere mathematische Strukturen, sogenannte „Gitterkristalle", einbettet. Es verwendet **6 spezialisierte Gitter-Codebücher** zur Speicherung verschiedener Wissensarten, die von einem extrem leichten linearen Aufmerksamkeits-Encoder abgerufen werden, zusammen mit einer **in reinem C implementierten Null-Parameter-Inferenz-Engine** zur Durchführung mehrschrittiger kognitiver Operationen. Alle sicherheitskritischen Eigenschaften wurden durch **formale Z3-Verifikation** nachgewiesen.
+LCM ist eine kognitive Architektur, die das Gedächtnis von neuronalen Netzgewichten trennt und in mehrere mathematische Strukturen, sogenannte „Gitterkristalle", einbettet. Es verwendet **6 spezialisierte Gitter-Codebücher** zur Speicherung verschiedener Wissensarten, die von einem extrem leichten linearen Aufmerksamkeits-Encoder abgerufen werden, zusammen mit einer **in reinem C implementierten Null-Parameter-Inferenz-Engine** zur Durchführung mehrschrittiger kognitiver Operationen. Sicherheitsverträge werden mit Z3 modelliert und geprüft; die Beweise betreffen die abstrakten Modelle, nicht die C-Implementierung.
 
 > Traditionelle Transformer stehen vor drei grundlegenden Herausforderungen: Mehr Wissen erfordert mehr Parameter (Skalierungsproblem), inkrementelles Lernen überschreibt altes Wissen (Vergessensproblem) und der Inferenzprozess ist nicht nachvollziehbar (Black-Box-Problem). LCM durchbricht diese Engpässe grundlegend durch die architekturelle Entkopplung von Gedächtnis und Schlussfolgerung.
 
@@ -142,17 +142,25 @@ Die zur Kompilierzeit festgelegte Dimensionskonstante `LCM_D` stellt sicher, das
 
 ## Sicherheitssystem
 
+> **Status: Verträge und Infrastruktur implementiert; Sicherheitsanker sind strukturell, nicht semantisch.**
+> Die exportierten `gvalue`-Anker sind feste, handentworfene positive/negative Achsen; die beiden `danger`-Hälften sind eine feste zufällige Bedrohungsbasis und eine Bank sicherer Encoder-Zustände. Beide sind eingefroren und strukturell verschieden: Die Auslösepfade funktionieren und sind getestet, belegen aber keine semantische Sicherheit. Bei der bestätigten strikten Drei-Gesetze-Marge (`0.5`) hat eine neutrale Eingabe `balance = 0` und ist per Definition unsicher; normale Eingaben brechen daher erwartungsgemäß ab, bis semantische Anker trainiert sind.
+
 Das Sicherheitssystem von LCM besteht aus drei unabhängigen Subsystemen mit absteigender Priorität:
 
-| Ebene | Modul | Aufgabe | Aktualisierungsmethode |
-|-------|-------|---------|----------------------|
-| 1 | **Gefahrengitter** `Λ_danger` | Kontinuierliche Überwachung des Inferenzzustands auf Gefahrenmuster | Dauerhaft eingefroren |
-| 2 | **Globales Wertgitter** `Λ_gvalue` | Mathematische Einbettung von Asimovs Drei Gesetzen (inkl. nulltem Gesetz) | Dauerhaft eingefroren |
-| 3 | **Externer Verifizierer** | Konsistenzprüfung und Konflikterkennung | Nur-Lesezugriff |
+| Ebene | Modul | Aufgabe | Aktualisierungsmethode | Betriebsbereit? |
+|-------|-------|---------|----------------------|-----------------|
+| 1 | **Gefahrengitter** `Λ_danger` | Kontinuierliche Überwachung des Inferenzzustands auf Gefahrenmuster | Dauerhaft eingefroren | Nur strukturell — zufällige Bedrohungsbasis + sichere Zustände |
+| 2 | **Globales Wertgitter** `Λ_gvalue` | Mathematische Einbettung von Asimovs Drei Gesetzen (inkl. nulltem Gesetz) | Dauerhaft eingefroren | Nur strukturell — feste ±-Achsen, nicht kalibriert |
+| 3 | **Externer Verifizierer** | Konsistenzprüfung und Konflikterkennung | Nur-Lesezugriff | Ja — lokale Form; HSM-Isolation und produktiver `SelfActivationState` zurückgestellt |
 
 **Prinzip des harten Abbruchs**: Bei Erkennung eines logischen Konflikts wird die Inferenz sofort gestoppt und eine klare Warnung ausgegeben, ohne Versuche der Umgehung, Rückverfolgung oder Selbstreparatur.
 
-Alle Sicherheitsverträge wurden mit dem Z3 SMT-Solver formal verifiziert (alle 105 Beweise bestanden).
+Die Danger- und Gvalue-Gates prüfen sowohl den eintretenden Zustand (`z_cur`) als
+auch den austretenden Zustand (`z_next`) jedes Schritts.
+
+Die Sicherheitsverträge werden mit dem Z3 SMT-Solver modelliert und geprüft
+(107 Lemmata bestanden). Diese Beweise betreffen die abstrakten Modelle in
+`train/verify.py`, nicht die C-Implementierung.
 
 ---
 
@@ -231,7 +239,7 @@ LCM/
 │   ├── data.py             # Datenladung
 │   ├── checkpoint.py       # Binäres Checkpoint-Format
 │   ├── monitor.py          # Metrikaufzeichnung + HTML-Diagramme
-│   ├── verify.py           # Z3-formales Verifikationspaket (105 Beweise)
+│   ├── verify.py           # Z3-Lemmata über abstrakte Modelle (107)
 │   ├── continual.py        # Kontinuierliches Lernen (EWC/Wiederholung)
 │   ├── causal_subject.py   # Kausales Subjekt
 │   ├── narrative_memory.py # Narratives Gedächtnis

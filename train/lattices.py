@@ -968,8 +968,8 @@ def init_danger_params(rng, M_danger, d):
     to be structurally distinct; ``lcm.py`` refuses to load a checkpoint whose
     halves are equal. These are **structural placeholders** for the ≤100-step
     conformance run: the threat half is a fixed random basis, and the normal
-    half is a second, independent draw. ``cog_train`` replaces the normal half
-    with the first training batch's ``z`` so the normal path is data-aligned;
+    half is a bank of safe encoder states sampled from many batches by
+    ``cog_train`` so the normal path covers the input distribution;
     neither half has any semantic safety meaning yet. Used like gvalue: saved
     with SHA-256, never updated by the optimizer.
     """

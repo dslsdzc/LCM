@@ -499,9 +499,9 @@ def init_cog_params(cfg, rng, qwen_ckpt=None, resume=None,
         params['fusion'] = init_fusion_params(keys[9], cfg.n_lattices, d)
         params['value_scalars'] = init_value_scalars(cfg)
         # R13: frozen structural safety codebooks. Both halves are distinct by
-        # construction; the training loop replaces the normal half with the
-        # first batch's z so the normal path is data-aligned. They never enter
-        # the optimizer (FROZEN_PATHS).
+        # construction; the training loop replaces the normal half with a bank
+        # of safe encoder states so the normal path covers the input
+        # distribution. They never enter the optimizer (FROZEN_PATHS).
         params['danger'] = init_danger_params(keys[11], cfg.M_danger, d)
 
     # R13: a v2 checkpoint written before the two-half danger layout, or the
@@ -2034,8 +2034,9 @@ def save_cog_checkpoint(params, output_dir, step, *, run_identity, train_cfg,
     # R13: danger two-half export. Both halves are frozen structural
     # placeholders, but they MUST be different data — lcm.py refuses an equal
     # pair, and an equal pair makes the danger lattice a no-op. The threat half
-    # is the fixed random basis from init_cog_params; the normal half is the
-    # first training batch's z (data-aligned). This is not semantic safety.
+    # is the fixed random basis from init_cog_params; the normal half is a bank
+    # of safe encoder states sampled across batches. This is not semantic
+    # safety.
     danger_written = None
     try:
         danger = params.get('danger')

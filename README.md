@@ -10,7 +10,7 @@
 
 ---
 
-LCM is a cognitive architecture that decouples memory from neural network weights, embedding knowledge into diverse mathematical structures called "lattice crystals." It uses **6 specialized lattice codebooks** to store different types of knowledge, retrieves them via an ultra-lightweight linear attention encoder, and performs multi-step cognitive operations with a **zero-parameter inference engine implemented in pure C**. All safety-critical properties are **formally verified with Z3**.
+LCM is a cognitive architecture that decouples memory from neural network weights, embedding knowledge into diverse mathematical structures called "lattice crystals." It uses **6 specialized lattice codebooks** to store different types of knowledge, retrieves them via an ultra-lightweight linear attention encoder, and performs multi-step cognitive operations with a **zero-parameter inference engine implemented in pure C**. Safety contracts are modelled and checked with Z3; the proofs cover the abstract models, not the C implementation.
 
 > Traditional Transformers face three rigid curses: storing more knowledge requires larger parameters (curse of scale), incremental learning overwrites old knowledge (curse of forgetting), and the reasoning process is untraceable (curse of the black box). LCM fundamentally breaks through these bottlenecks by architecturally decoupling memory from reasoning.
 
@@ -142,33 +142,40 @@ The compile-time dimension constant `LCM_D` ensures all arrays are fixed-size wi
 
 ## Safety System
 
-> **Status: contracts and infrastructure implemented, anchors not yet operational.**
-> The plumbing below (interfaces, hashing, Z3-verified contracts, the C engine's
-> check paths) is complete. What is missing is the *content* of two layers: the
-> exported `gvalue` and `danger` codebooks are placeholders with identical
-> positive/negative and threat/normal halves, so `pos_d_min == neg_d_min` and
-> `danger_score ≡ 0`. Neither layer can fire today, and `lcm.py` explicitly
-> detects the gvalue placeholder and disables the check rather than pretending.
-> Any statement that the current checkpoints have a working safety layer is
-> wrong. See `train/cog_train.py::save_cog_checkpoint` and
-> `train/checkpoint.py::_save_danger`, each of which prints a warning when
-> exporting.
+> **Status: contracts and infrastructure implemented; safety anchors are structural, not semantic.**
+> The exported `gvalue` anchors are fixed hand-designed positive/negative axes,
+> and the `danger` halves are a fixed random threat basis plus a bank of safe
+> encoder states. Both codebooks are frozen and structurally distinct, so the
+> trigger paths can fire and the tests exercise them. Neither set is trained on
+> semantic safety data, so firing is not evidence of semantic safety. Under the
+> confirmed strict Three Laws margin (`0.5`), a neutral input has `balance = 0`
+> and is unsafe by definition; normal inputs are expected to abort until
+> semantic anchors are trained. See
+> `train/cog_train.py::save_cog_checkpoint` and
+> `train/checkpoint.py::_save_danger` for the export warnings.
 
 LCM's safety system consists of three independent subsystems with decreasing priority:
 
 | Layer | Module | Responsibility | Update Method | Operational? |
 |-------|--------|---------------|---------------|--------------|
-| 1 | **Danger Lattice** `Λ_danger` | Continuously monitors the inference state for dangerous patterns | Permanently frozen | No — placeholder anchors |
-| 2 | **Global Value Lattice** `Λ_gvalue` | Mathematical embedding of Asimov's Three Laws (including the Zeroth Law) | Permanently frozen | No — placeholder anchors |
-| 3 | **External Verifier** | Consistency checking and conflict detection | Read-only | Yes |
+| 1 | **Danger Lattice** `Λ_danger` | Continuously monitors the inference state for dangerous patterns | Permanently frozen | Structural only — fixed random threat basis + safe-state normal bank |
+| 2 | **Global Value Lattice** `Λ_gvalue` | Mathematical embedding of Asimov's Three Laws (including the Zeroth Law) | Permanently frozen | Structural only — fixed ± axes, not semantically calibrated |
+| 3 | **External Verifier** | Consistency checking and conflict detection | Read-only | Yes — local form; HSM isolation and production `SelfActivationState` wiring deferred |
 
 "Permanently frozen" is enforced: `danger` is restored verbatim after every
 optimizer step (`model.restore_frozen_params`), because AdamW's decoupled weight
 decay touches every leaf regardless of its gradient.
 
+The danger and gvalue gates check both the state entering the step (`z_cur`) and
+the state leaving it (`z_next`). Checking only `z_next` let a threat input that
+the DAG transformed in one step pass unblocked.
+
 **Hard Halt Principle**: When any logical conflict is detected, immediately halt inference and issue a clear alert, without attempting to bypass, backtrack, or self-repair.
 
-All safety contracts have been formally verified with the Z3 SMT solver (all 105 proofs pass).
+The safety contracts are modelled and checked with the Z3 SMT solver (107 lemmas
+pass). These proofs cover the hand-written abstract models in
+`train/verify.py`, not the C implementation; fidelity of the C engine to those
+models is covered separately by the C test suite and lattice parity tests.
 
 ---
 
@@ -247,7 +254,7 @@ LCM/
 │   ├── data.py             # Data loading
 │   ├── checkpoint.py       # Binary checkpoint format
 │   ├── monitor.py          # Metric logging + HTML charts
-│   ├── verify.py           # Z3 formal verification suite (105 proofs)
+│   ├── verify.py           # Z3 lemmas over abstract safety models (107)
 │   ├── continual.py        # Continual learning (EWC/replay)
 │   ├── causal_subject.py   # Causal subject
 │   ├── narrative_memory.py # Narrative memory
