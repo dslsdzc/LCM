@@ -66,8 +66,7 @@ int lattice_pick_row(const float* r, int M, const float* value,
 }
 
 void lattice_cb_row(const void* ctx, int row, float* out) {
-    const float* cb = (const float*)ctx;
-    memcpy(out, cb + (size_t)row * LCM_D, sizeof(vec_t));
+    const float* cb = (const float*)ctx;    memcpy(out, cb + (size_t)row * LCM_D, sizeof(vec_t));
 }
 
 /* ─── LowRank: incremental-rank VQ with one shared basis (b.md §4.3) ─────── */
@@ -191,6 +190,57 @@ void contrast_forward_c(const float* z, const contrast_mem_t* m,
 
 /* ─── Binding: cross-layer HRR bind + conjugate unbind (b.md §4.5) ──────── */
 
+/* Selection-only direction matching. Binding projections can be far below
+ * the codebook row norms, and row norms vary; raw Euclidean NN is then decided
+ * by scale, not direction. The picker compares unit query/rows, then returns
+ * the raw selected row. */
+static void unit_copy(const float* x, float* out) {
+    double n2 = 0.0;
+    for (int i = 0; i < LCM_D; i++) n2 += (double)x[i] * (double)x[i];
+    float n = (float)sqrt(n2);
+    float s = n > 1e-12f ? 1.0f / n : 0.0f;
+    for (int i = 0; i < LCM_D; i++) out[i] = x[i] * s;
+}
+
+static int pick_row_unit(const float* r, int M, const float* value,
+                         float alpha_val, const float* cb, float* c_out) {
+    vec_t ru, rowu;
+    unit_copy(r, ru);
+    int best = 0;
+    if (value != NULL && alpha_val > 0.0f) {
+        float d2[LCM_MAX_M];
+        float sum = 0.0f;
+        for (int j = 0; j < M; j++) {
+            unit_copy(cb + (size_t)j * LCM_D, rowu);
+            d2[j] = 0.0f;
+            for (int i = 0; i < LCM_D; i++) {
+                float diff = ru[i] - rowu[i];
+                d2[j] += diff * diff;
+            }
+            sum += d2[j];
+        }
+        float avg = sum / (float)M;
+        float best_score = -INFINITY;
+        for (int j = 0; j < M; j++) {
+            float score = -d2[j] + alpha_val * tanhf(value[j]) * avg;
+            if (score > best_score) { best_score = score; best = j; }
+        }
+    } else {
+        float best_d2 = INFINITY;
+        for (int j = 0; j < M; j++) {
+            unit_copy(cb + (size_t)j * LCM_D, rowu);
+            float d2 = 0.0f;
+            for (int i = 0; i < LCM_D; i++) {
+                float diff = ru[i] - rowu[i];
+                d2 += diff * diff;
+            }
+            if (d2 < best_d2) { best_d2 = d2; best = j; }
+        }
+    }
+    if (c_out) memcpy(c_out, cb + (size_t)best * LCM_D, sizeof(vec_t));
+    return best;
+}
+
 void binding_forward_c(const float* z, const binding_mem_t* m, const float* V,
                        float alpha_val, float* out, float* b_q, float* k_q,
                        int* val_idx) {
@@ -240,8 +290,7 @@ void binding_forward_c(const float* z, const binding_mem_t* m, const float* V,
     for (int l = 0; l < m->n_layers; l++) {
         const float* cb = m->key_cb
             + (size_t)l * (size_t)m->M * LCM_D;
-        lattice_pick_row(r, m->M, m->value_key, alpha_val,
-                         lattice_cb_row, cb, c);
+        pick_row_unit(r, m->M, m->value_key, alpha_val, cb, c);
         kp[l] = key_rows + (size_t)l * LCM_D;
         memcpy(key_rows + (size_t)l * LCM_D, c, sizeof(vec_t));
         for (int i = 0; i < LCM_D; i++) {
@@ -254,8 +303,7 @@ void binding_forward_c(const float* z, const binding_mem_t* m, const float* V,
     for (int l = 0; l < m->n_layers; l++) {
         const float* cb = m->val_cb
             + (size_t)l * (size_t)m->M * LCM_D;
-        lattice_pick_row(r, m->M, m->value_val, alpha_val,
-                         lattice_cb_row, cb, c);
+        pick_row_unit(r, m->M, m->value_val, alpha_val, cb, c);
         vp[l] = val_rows + (size_t)l * LCM_D;
         memcpy(val_rows + (size_t)l * LCM_D, c, sizeof(vec_t));
         for (int i = 0; i < LCM_D; i++) r[i] -= c[i];
@@ -273,8 +321,7 @@ void binding_forward_c(const float* z, const binding_mem_t* m, const float* V,
     for (int l = 0; l < m->n_layers; l++) {
         const float* cb = m->bind_cb
             + (size_t)l * (size_t)m->M * LCM_D;
-        lattice_pick_row(r, m->M, m->value_bind, alpha_val,
-                         lattice_cb_row, cb, c);
+        pick_row_unit(r, m->M, m->value_bind, alpha_val, cb, c);
         for (int i = 0; i < LCM_D; i++) {
             bq_acc[i] += c[i];
             r[i] -= c[i];
@@ -287,17 +334,8 @@ void binding_forward_c(const float* z, const binding_mem_t* m, const float* V,
     hrr_unbind(bq_acc, kq, recovered, LCM_D);
 
     int n_val = m->n_layers * m->M;
-    int best = 0;
-    float best_d2 = INFINITY;
-    for (int j = 0; j < n_val; j++) {
-        const float* row = m->val_cb + (size_t)j * LCM_D;
-        float d2 = 0.0f;
-        for (int i = 0; i < LCM_D; i++) {
-            float diff = recovered[i] - row[i];
-            d2 += diff * diff;
-        }
-        if (d2 < best_d2) { best_d2 = d2; best = j; }
-    }
+    int best = pick_row_unit(recovered, n_val, NULL, alpha_val,
+                             m->val_cb, NULL);
 
     memcpy(out, m->val_cb + (size_t)best * LCM_D, sizeof(vec_t));
     if (val_idx) *val_idx = best;

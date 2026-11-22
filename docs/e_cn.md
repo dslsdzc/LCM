@@ -242,11 +242,14 @@ agency = n_internal / max(n_total, 1)
 ### 前向
 
 ```
-idx = argmin_j ||z - C_self[j]||²         # 欧氏距离，包含第 0 行
-z_self = C_self[idx]                      # STE：前向 = 精确行，d/dz = 恒等
+idx = argmin_j ||unit(z) - unit(C_self[j])||²   # 等价 cosine 选择，包含第 0 行
+z_self = C_self[idx]                            # STE：前向 = 原始行，d/dz = 恒等
 cosine = clip(cos(z, z_self), 0, 1)
 self_bias = alpha_self * max(0, cosine)   # ∈ [0, alpha_self]
 ```
+
+选择时使用单位化行，因为 frozen core 与 EMA modes 的范数不一致；原始欧氏距离会被行范数
+主导，可能对所有输入都选中同一行。读出仍然是原始码本行。
 
 `z_self` 是选中的码本行；码本侧停止梯度（EMA 是唯一 writer），直通路径保留编码器/承诺损失
 梯度。熟悉度是 cosine 形式，不是学习出来的分数。`mode_activation` 可作为附加诊断保留，但它

@@ -86,8 +86,30 @@ static float v3_contrast_min(const float* z, const contrast_mem_t* m) {
     return a < b ? a : b;
 }
 
+static void v3_unit_copy(const float* x, float* out) {
+    float n2 = 0.0f;
+    for (int i = 0; i < LCM_D; i++) n2 += x[i] * x[i];
+    float n = sqrtf(n2);
+    float s = n > 1e-8f ? 1.0f / n : 0.0f;
+    for (int i = 0; i < LCM_D; i++) out[i] = x[i] * s;
+}
+
+static float v3_unit_d2(const float* a_unit, const float* b) {
+    vec_t b_unit;
+    v3_unit_copy(b, b_unit);
+    float d2 = 0.0f;
+    for (int i = 0; i < LCM_D; i++) {
+        float diff = a_unit[i] - b_unit[i];
+        d2 += diff * diff;
+    }
+    return d2;
+}
+
 static float v3_self_min(const float* z, const fusion_mem_t* f) {
     int rows = f->M_self + 1;   /* row 0 is the frozen core */
+    /* Trigger screening stays in the raw distance domain. Only the output
+     * selector is direction-normalized; the trigger is a separate screening
+     * metric and its EMA/threshold history must not change with the selector. */
     return v3_euclid_min(z, f->self_C, rows);
 }
 
@@ -286,10 +308,12 @@ int build_dag_v3(const float* z, lcm_memory_v3* mem, dag_t* dag) {
 
 static void v3_self_output(const float* z, const fusion_mem_t* f, float* out) {
     int rows = f->M_self + 1;
+    vec_t z_unit;
+    v3_unit_copy(z, z_unit);
     int best = 0;
     float best_d2 = INFINITY;
     for (int r = 0; r < rows; r++) {
-        float d2 = v3_d2(z, f->self_C + (size_t)r * LCM_D);
+        float d2 = v3_unit_d2(z_unit, f->self_C + (size_t)r * LCM_D);
         if (d2 < best_d2) { best_d2 = d2; best = r; }
     }
     memcpy(out, f->self_C + (size_t)best * LCM_D, sizeof(vec_t));

@@ -678,7 +678,22 @@ def normalize_fft(x):
     return X / mag
 
 
-def _residual_vq_chain(codebooks, r, value_scalars, alpha_val):
+def _selection_query(r, C, normalize):
+    """Query/codebook used for nearest-row selection, not for the output.
+
+    With ``normalize`` the selector compares unit directions (cosine ranking).
+    Binding projections can be orders of magnitude smaller than the codebooks,
+    and codebook row norms can vary by ~30x; raw Euclidean selection is then
+    decided by row norm rather than by the input direction. The readout and the
+    residual still use the raw codebook row.
+    """
+    if not normalize:
+        return r, C
+    return safe_unit(r), safe_unit(C)
+
+
+def _residual_vq_chain(codebooks, r, value_scalars, alpha_val,
+                       normalize_selection=False):
     """Multi-layer residual VQ over a list of SimVQ codebooks.
 
     Returns:
@@ -692,15 +707,19 @@ def _residual_vq_chain(codebooks, r, value_scalars, alpha_val):
     relax = None
     for cb in codebooks:
         inputs.append(r)
+        C = cb['A'] @ cb['W']  # (M, d)
+        r_sel, C_sel = _selection_query(r, C, normalize_selection)
         if value_scalars is not None and alpha_val > 0:
-            C = cb['A'] @ cb['W']  # (M, d)
-            scores = value_biased_scores(r, C, value_scalars, alpha_val)
+            scores = value_biased_scores(r_sel, C_sel, value_scalars, alpha_val)
             idx = scores.argmax(axis=-1)
             z_q = r + lax.stop_gradient(C[idx] - r)
-            step = ste_relax(scores, C)
+            step = ste_relax(scores, C_sel)
             relax = step if relax is None else relax + step
         else:
-            z_q, idx, _ = simvq_codebook(cb, r)
+            dist = jnp.linalg.norm(
+                r_sel[:, None, :] - C_sel[None, :, :], axis=-1)
+            idx = dist.argmin(axis=-1)
+            z_q = r + lax.stop_gradient(C[idx] - r)
         quantised.append(z_q)
         indices.append(idx)
         r = r - z_q
@@ -774,9 +793,9 @@ def binding_forward(params, z, V, value_scalars=None, alpha_val=0.0):
 
     # Multi-layer residual VQ for key / value (each family's own value vector).
     k_q_list, key_inputs, key_idx, relax_k = _residual_vq_chain(
-        params['key_cb'], z_k, v_key, alpha_val)
+        params['key_cb'], z_k, v_key, alpha_val, normalize_selection=True)
     v_q_list, val_inputs, val_idx, relax_v = _residual_vq_chain(
-        params['val_cb'], z_v, v_val, alpha_val)
+        params['val_cb'], z_v, v_val, alpha_val, normalize_selection=True)
 
     # Cross-layer HRR binding (n_layers² pairs).
     b_raw = 0.0
@@ -787,7 +806,7 @@ def binding_forward(params, z, V, value_scalars=None, alpha_val=0.0):
 
     # Quantize the bound representation.
     b_q_list, bind_inputs, bind_idx, relax_b = _residual_vq_chain(
-        params['bind_cb'], b_raw, v_bind, alpha_val)
+        params['bind_cb'], b_raw, v_bind, alpha_val, normalize_selection=True)
 
     b_q = jnp.sum(jnp.stack(b_q_list), axis=0)
     k_q = jnp.sum(jnp.stack(k_q_list), axis=0)
@@ -799,7 +818,11 @@ def binding_forward(params, z, V, value_scalars=None, alpha_val=0.0):
         [cb['A'] @ cb['W'] for cb in params['val_cb']], axis=0)
     recovered = jnp.fft.irfft(
         jnp.conj(normalize_fft(k_q)) * normalize_fft(b_q), n=z.shape[-1])
-    dist = jnp.sum((recovered[:, None, :] - C_val[None, :, :]) ** 2, axis=-1)
+    # Same scale-only selection rule as the residual chains: the raw
+    # recovered vector is kept for the readout, but nearest-row selection is
+    # performed in the codebook's norm scale.
+    rec_sel, C_val_sel = _selection_query(recovered, C_val, True)
+    dist = jnp.sum((rec_sel[:, None, :] - C_val_sel[None, :, :]) ** 2, axis=-1)
     val_out_idx = dist.argmin(axis=-1)  # (B,) into the concatenated C_val
     # The readout is a hard codebook row (no gradient through the phase-only
     # `recovered` query; that derivative is O(1/|X|) at init scale).

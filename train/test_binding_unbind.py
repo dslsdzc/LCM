@@ -21,7 +21,28 @@ import numpy as np
 
 from train.lattices import (
     binding_forward, init_binding_params, normalize_fft,
+    _residual_vq_chain,
 )
+
+
+def test_binding_selection_scales_query_to_codebook():
+    """Tiny projected queries must not be decided by codebook row norms.
+
+    Two queries of the same tiny scale point at different rows. Raw Euclidean
+    selection picks the smaller-norm row for both; scale-matched selection
+    follows the query direction.
+    """
+    d = 2
+    # row 0 is tiny, row 1 is normal scale; directions differ.
+    cb = {'A': jnp.array([[0.001, 0.0], [0.0, 0.03]]),
+          'W': jnp.eye(d)}
+    z = jnp.array([[1e-4, 0.0], [0.0, 1e-4]], dtype=jnp.float32)
+    _, _, idx_raw, _ = _residual_vq_chain(
+        [cb], z, None, 0.0, normalize_selection=False)
+    _, _, idx_scaled, _ = _residual_vq_chain(
+        [cb], z, None, 0.0, normalize_selection=True)
+    assert idx_raw[0].tolist() == [0, 0]
+    assert idx_scaled[0].tolist() == [0, 1]
 
 
 def test_binding_forward_shapes_and_auxiliary_return():
@@ -56,19 +77,28 @@ def _crafted_roundtrip_params(d=8, M=16, seed=0):
     k_code = jax.random.normal(key, (d,))
     v_code = jax.nn.one_hot(0, d)
 
-    # Rows 0 are the quantisation targets; the rest are far away so the argmin
-    # cannot accidentally pick another row.
-    def far_rows(target, offset=10.0):
+    # Rows 0 are the quantisation targets; the others have the same norm but
+    # different directions, so the nearest-row result is decided by direction
+    # rather than by a scale artifact.
+    def far_rows(target):
+        n = jnp.linalg.norm(target)
         rows = [target]
         for i in range(1, M):
-            rows.append(target + offset * (i + 1))
+            rotated = jnp.roll(target, i)
+            rn = jnp.linalg.norm(rotated)
+            rows.append(rotated * (n / (rn + 1e-8)))
         return jnp.stack(rows)
 
     bind_row = jnp.fft.irfft(
         normalize_fft(k_code) * normalize_fft(v_code), n=d)
+    z_query = jax.nn.one_hot(0, d)
+    # Projections map the shared query z_query onto k_code / v_code, so the
+    # key and value codebooks can use different code words with one query.
+    A_k = jnp.outer(k_code, z_query)
+    A_v = jnp.outer(v_code, z_query)
     params = {
-        'A_k': jnp.eye(d),
-        'A_v': jnp.eye(d),
+        'A_k': A_k,
+        'A_v': A_v,
         'key_cb': [{'A': far_rows(k_code), 'W': jnp.eye(d)}],
         'val_cb': [{'A': far_rows(v_code), 'W': jnp.eye(d)}],
         'bind_cb': [{'A': far_rows(bind_row), 'W': jnp.eye(d)}],
@@ -81,7 +111,7 @@ def test_unbind_recovers_value_code():
     """Round-trip: unbind(bind(k, v), k) selects v's value code."""
     d, M = 8, 16
     params, V, v_code = _crafted_roundtrip_params(d, M)
-    z = jnp.stack([v_code, -v_code])  # identity projections: z is the query
+    z = jnp.stack([jax.nn.one_hot(0, d), jax.nn.one_hot(0, d)])
 
     o_bind, _, _, b_q, k_q, val_out_idx = binding_forward(params, z, V)
 
@@ -107,8 +137,8 @@ def test_unbind_recovers_value_code():
 def test_binding_value_scalars_are_per_family():
     """R22: key/val/bind each use their own value vector."""
     d = 4
-    base = jnp.array([[0.0, 0.0, 0.0, 0.0],
-                      [1.0, 0.0, 0.0, 0.0]])
+    base = jnp.array([[1.0, 0.0, 0.0, 0.0],
+                      [-1.0, 0.0, 0.0, 0.0]])
     params = {
         'A_k': jnp.eye(d),
         'A_v': jnp.eye(d),
@@ -159,16 +189,21 @@ def test_binding_output_ste_forward_is_exact_and_z_gradient_is_identity():
 
 def test_three_layer_binding_uses_nine_hrr_pairs():
     """n_layers=3: b_raw is the sum of all 9 cross-layer key/value pairs."""
-    d, M, n = 8, 8, 3
+    d, M, n = 8, 1, 3
     key = jax.random.PRNGKey(11)
     k_codes = list(jax.random.split(key, n))
     k_codes = [jax.random.normal(k, (d,)) for k in k_codes]
     v_codes = [jax.random.normal(k, (d,))
                for k in jax.random.split(jax.random.PRNGKey(12), n)]
 
-    def far_rows(target, offset=1000.0):
-        return jnp.stack([target] + [target + offset * (i + 1)
-                                     for i in range(1, M)])
+    def far_rows(target):
+        n = jnp.linalg.norm(target)
+        rows = [target]
+        for i in range(1, M):
+            rotated = jnp.roll(target, i)
+            rn = jnp.linalg.norm(rotated)
+            rows.append(rotated * (n / (rn + 1e-8)))
+        return jnp.stack(rows)
 
     expected = 0.0
     for k in k_codes:

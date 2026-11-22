@@ -242,11 +242,15 @@ The self lattice is a special lattice that does not store external knowledge —
 ### Forward Pass
 
 ```
-idx = argmin_j ||z - C_self[j]||²         # Euclidean, includes row 0
-z_self = C_self[idx]                      # STE: forward = exact row, d/dz = identity
+idx = argmin_j ||unit(z) - unit(C_self[j])||²   # cosine-equivalent, includes row 0
+z_self = C_self[idx]                            # STE: forward = exact raw row, d/dz = identity
 cosine = clip(cos(z, z_self), 0, 1)
 self_bias = alpha_self * max(0, cosine)   # in [0, alpha_self]
 ```
+
+Selection uses unit-normalized rows because the frozen core and EMA modes do not
+share a norm; raw Euclidean distance is dominated by row norm and can select the
+same row for every input. The readout remains the raw codebook row.
 
 `z_self` is the selected codebook row; the codebook side is stop-gradient (EMA is its only
 writer), while the straight-through path keeps encoder/commitment gradients alive. The

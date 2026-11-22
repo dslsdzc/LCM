@@ -519,7 +519,7 @@ score(z, c_j) = -‖z - c_j‖² + α_val · tanh(v_j) · avg_dist²
 - **`n_layers` 层 RVQ 子格**：键码本 `C_key^(k)`、值码本 `C_val^(k)`、绑定码本 `C_bind^(k)`，每层大小 `M_bind`。
 - **键值投影头（复用共享基）**：`W_k = V @ A_k`，`W_v = V @ A_v`，其中 `V ∈ R^{d×r_max}` 为低秩格（4.3）的全局共享基，`A_k, A_v ∈ R^{r_max×d}` 为轻量投影矩阵。参数从 `2d²` 降至 `2·r_max·d`，且绑定操作在规则子空间中进行，结构更优。
 - **跨层绑定**（训练时）：
-  - `z_k = V @ A_k @ z`, `z_v = V @ A_v @ z`；各经 `n_layers` 层残差 VQ 得 `k_q = Σ_i k^(i)`, `v_q = Σ_j v^(j)`。
+  - `z_k = V @ A_k @ z`, `z_v = V @ A_v @ z`；各经 `n_layers` 层残差 VQ 得 `k_q = Σ_i k^(i)`, `v_q = Σ_j v^(j)`。最近行选择只把选择查询缩放到码本平均行范数；残差/输出查询保持原始尺度。否则投影查询（`~1e-4`）会被码本行范数（`~2.5e-2`）支配，而不是由输入方向决定。
   - `b_raw = Σ_{i=1}^{n_layers} Σ_{j=1}^{n_layers} IFFT( normalize_fft(k^(i)) ⊙ normalize_fft(v^(j)) )`（全部跨层对；`n_layers=3` 时 9 对）。
   - `b_q = RVQ_3layer(C_bind, b_raw)`。
 - **解绑（R20）**：`k_q = Σ_i k^(i)`；`v_out = NN(C_val, IFFT( conj(normalize_fft(k_q)) ⊙ normalize_fft(b_q) ))`。键是量化后的键和，值在**值码本**中做最近邻检索；单位圆 FFT 域里的共轭乘法就是 HRR 逆运算。

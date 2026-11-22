@@ -63,6 +63,17 @@ def _tiny_cfg(**overrides):
 # ─── Shapes / initialisation ────────────────────────────────────────────────
 
 
+def test_self_selection_uses_direction_not_row_norm():
+    """A tiny frozen core must not win every query by having the smallest norm."""
+    p = {
+        'C_self': jnp.array([[0.1, 0.0], [1.0, 0.0], [0.0, 1.0]]),
+        'bias_self': jnp.array(0.05),
+    }
+    z = jnp.array([[1.0, 0.0], [0.0, 1.0]])
+    _, _, aux = self_lattice_forward(p, z, return_aux=True)
+    assert aux['idx'].tolist() == [1, 2]
+
+
 def test_init_shapes_and_bias():
     p = init_self_params(jax.random.PRNGKey(0), D, M_self=M)
     assert p['C_self'].shape == (M, D)
@@ -144,18 +155,19 @@ def test_self_bias_varies_with_z_and_stays_in_range():
     assert np.all(np.asarray(b_unfamiliar) <= alpha + 1e-6)
 
 
-def test_negative_cosine_clips_self_bias_to_zero():
-    """A state opposite to its nearest prototype is not "familiar"."""
-    # Row 0 is e0; row 1 is far away. z=-e0 is nearest to row 0 with cosine -1.
+def test_self_selection_never_picks_an_opposite_prototype():
+    """Direction-based selection must not call the opposite row "nearest"."""
     C = jnp.zeros((2, D))
     C = C.at[0, 0].set(1.0)
-    C = C.at[1, 1].set(100.0)
+    C = C.at[1, 1].set(1.0)
     p = {'C_self': C, 'bias_self': jnp.array(ALPHA)}
     z = jnp.array([[-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
     _, bias, aux = self_lattice_forward(
         p, z, training=False, return_aux=True)
-    assert int(aux['idx'][0]) == 0
-    assert float(aux['cosine'][0]) < 0.0
+    # e1 is orthogonal to -e0; e0 is opposite. The cosine selector must pick
+    # e1, not the opposite prototype, and the clipped familiarity is 0.
+    assert int(aux['idx'][0]) == 1
+    assert float(aux['cosine'][0]) == 0.0
     assert float(bias[0]) == 0.0
 
 

@@ -3,8 +3,12 @@
 ``e.md §6`` defines the self lattice as a codebook of the system's own
 historical states:
 
-    z_self    = C_self[argmin_j ||z - C_self[j]||²]      (Euclidean, STE)
+    z_self    = C_self[argmin_j ||unit(z) - unit(C_self[j])||²]  (STE)
     self_bias = alpha_self · max(0, cosine_sim(z, z_self))
+
+The selection uses unit-normalized rows (equivalent to cosine nearest
+neighbour); the readout is still the raw codebook row. This prevents a
+small-norm core/anchor row from winning every query by norm alone.
 
 ``C_self`` has ``M_self`` rows. Row 0 is the frozen identity anchor ("我是我"),
 kept from the old ``core`` parameter; rows ``1:`` are the EMA modes
@@ -25,6 +29,8 @@ Usage:
 import jax
 import jax.numpy as jnp
 from jax import lax
+
+from train.hyp import safe_unit
 
 # R15 random fallback: standard deviation of the small random codebook rows
 # used when no early encoder-bottleneck samples are available. The scale is
@@ -136,7 +142,9 @@ def self_lattice_forward(params, z, training=False, return_aux=False,
         raise ValueError(
             f"z must be (B, {C_self.shape[-1]}), got {tuple(z.shape)}")
 
-    dist2 = jnp.sum((z[:, None, :] - C_self[None, :, :]) ** 2, axis=-1)
+    dist2 = jnp.sum(
+        (safe_unit(z)[:, None, :] - safe_unit(C_self)[None, :, :]) ** 2,
+        axis=-1)
     idx = jnp.argmin(dist2, axis=-1)          # (B,)
     # Ruling 37: the codebook row is a stop-gradient. Forward is exactly the
     # row; d/dz is the identity so the commitment path still trains the encoder.

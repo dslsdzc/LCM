@@ -535,7 +535,8 @@ exactly the plain nearest-neighbour `argmin` of the squared distance.
 - **`n_layers` layers of RVQ sub-lattices**: Key codebook `C_key^(k)`, value codebook `C_val^(k)`, binding codebook `C_bind^(k)`, each of size `M_bind`.
 - **Key-value projection head (reusing shared basis)**: `W_k = V @ A_k`, `W_v = V @ A_v`, where `V ∈ R^{d×r_max}` is the global shared basis of the low-rank lattice (4.3), and `A_k, A_v ∈ R^{r_max×d}` are lightweight projection matrices. Parameters are reduced from `2d²` to `2·r_max·d`, and binding operations are performed in a regular subspace, yielding better structure.
 - **Cross-layer binding** (during training):
-  - `z_k = V @ A_k @ z`, `z_v = V @ A_v @ z`; each undergoes `n_layers`-layer residual VQ to obtain `k_q = Σ_i k^(i)`, `v_q = Σ_j v^(j)`.
+  - `z_k = V @ A_k @ z`, `z_v = V @ A_v @ z`; each undergoes `n_layers`-layer residual VQ to obtain `k_q = Σ_i k^(i)`, `v_q = Σ_j v^(j)`. Nearest-row selection scales only the selection query to the codebook's mean row norm; the residual/output query stays raw. This prevents a projected query (`~1e-4`) from being decided by codebook row norms (`~2.5e-2`) instead of input direction.
+
   - `b_raw = Σ_{i=1}^{n_layers} Σ_{j=1}^{n_layers} IFFT( normalize_fft(k^(i)) ⊙ normalize_fft(v^(j)) )` (all cross-layer pairs; 9 pairs for `n_layers=3`).
   - `b_q = RVQ_3layer(C_bind, b_raw)`.
 - **Unbinding (R20)**: `k_q = Σ_i k^(i)`, `v_out = NN(C_val, IFFT( conj(normalize_fft(k_q)) ⊙ normalize_fft(b_q) ))`. The key is the quantized key sum, the value is retrieved by nearest-neighbour against the **value** codebook; conjugate multiplication in the unit-circle FFT domain is the HRR inverse.

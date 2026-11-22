@@ -1683,7 +1683,7 @@ static void test_contrast_value_bias_families(void) {
 /* ── Binding ────────────────────────────────────────────────────────────── */
 
 static void test_binding_unbind_and_cval(void) {
-    enum { L = 3, M = 2 };
+    enum { L = 3, M = 1 };
     static float key_cb[L * M * LCM_D];
     static float val_cb[L * M * LCM_D];
     static float bind_cb[L * M * LCM_D];
@@ -1706,31 +1706,33 @@ static void test_binding_unbind_and_cval(void) {
     memset(z, 0, sizeof(z));
 
     /* Every family has M rows per layer (binding_mem_t has one M). Rows 1 are
-     * far away, so the residual chains select row 0 in every layer. */
+     * far in norm; the query is zero, so selection stays on row 0 and the
+     * test isolates the 9-pair HRR sum from scale matching. */
     t9_seed = 0x9E3779B9u;
     const float* kp[L];
     for (int l = 0; l < L; l++) {
         float* k0 = key_cb + ((size_t)l * M) * LCM_D;
-        float* k1 = k0 + LCM_D;
         t9_unit(k0);
-        memcpy(k1, k0, sizeof(vec_t));
-        k1[0] += 100.0f;
         kp[l] = k0;
+    }
+    /* Cosine selection uses direction: make every layer's row 0 the same
+     * direction so one shared z_k selects row 0 across the residual chain. */
+    for (int l = 1; l < L; l++) {
+        memcpy(key_cb + ((size_t)l * M) * LCM_D, kp[0], sizeof(vec_t));
+        kp[l] = key_cb + ((size_t)l * M) * LCM_D;
     }
 
     t9_unit(v);
     for (int l = 0; l < L; l++) {
         float* v0 = val_cb + ((size_t)l * M) * LCM_D;
-        float* v1 = v0 + LCM_D;
         if (l == L - 1) memcpy(v0, v, sizeof(vec_t));
-        memcpy(v1, v0, sizeof(vec_t));
-        v1[0] += 100.0f;
     }
     memcpy(A_k, kp[0], sizeof(A_k));  /* z_k = k0 (V=e0, A_k row 0) */
     memcpy(A_v, v, sizeof(A_v));
 
     V[0] = 1.0f;   /* V is [D][1]; V^T z = z[0] */
-    z[0] = 1.0f;
+    /* z stays zero: the key/value/query is zero, so the far-norm row 0 is
+     * selected and the test isolates the 9-pair HRR sum. */
 
     const float* vp[L];
     for (int l = 0; l < L; l++) vp[l] = val_cb + ((size_t)l * M) * LCM_D;
@@ -1746,12 +1748,7 @@ static void test_binding_unbind_and_cval(void) {
     }
     hrr_bind(&kp[0], 1, &vp[2], 1, b1, LCM_D);
     /* Plant the 9-pair sum vs a 1-pair competitor. */
-    memcpy(bind_cb, b9, sizeof(b9));                 /* layer 0, row 0 */
-    memcpy(bind_cb + LCM_D, b1, sizeof(b1));         /* layer 0, row 1 */
-    for (int l = 1; l < L; l++) {                    /* layers 1/2: 0, far */
-        float* r1 = bind_cb + ((size_t)l * M + 1) * LCM_D;
-        r1[0] = 100.0f;
-    }
+    memcpy(bind_cb, b9, sizeof(b9));                 /* layer 0 row 0 */
 
     binding_mem_t m;
     memset(&m, 0, sizeof(m));
@@ -1905,15 +1902,15 @@ static void test_binding_value_families(void) {
     V[0] = 1.0f;
     z[0] = 1.0f;
     A_k[0] = 0.55f;                 /* z_k = A_k z = 0.55 e0 */
-    key_cb[0] = 0.5f;               /* row 0 */
-    key_cb[LCM_D] = 0.7f;           /* row 1 */
+    key_cb[0] = 0.5f;               /* row 0: e0 */
+    key_cb[LCM_D + 1] = 0.7f;       /* row 1: 0.7 e1 (different direction) */
     m.value_key = NULL; m.value_val = NULL; m.value_bind = NULL;
     binding_forward_c(z, &m, V, 0.0f, out, NULL, kq, NULL);
     CHECK(fabsf(kq[0] - 0.5f) < 1e-6f,
-          "binding value_key: alpha=0 keeps the Euclidean key row");
+          "binding value_key: alpha=0 keeps the cosine-nearest key row");
     m.value_key = vk;
     binding_forward_c(z, &m, V, 4.0f, out, NULL, kq, NULL);
-    CHECK(fabsf(kq[0] - 0.7f) < 1e-6f,
+    CHECK(fabsf(kq[1] - 0.7f) < 1e-6f,
           "binding value_key: R22 bias selects the farther key row");
 
     /* ── value_val: b_raw/b_q expose the selected value row ── */
