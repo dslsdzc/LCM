@@ -76,6 +76,8 @@ def main() -> int:
     p.add_argument("--data", default="/home/DslsDZC/data/tmp/opencode/conformance_corpus/conformance.dat")
     p.add_argument("--shape", default="/home/DslsDZC/data/tmp/opencode/conformance_corpus/conformance_shape.json")
     p.add_argument("--spans", default="/home/DslsDZC/data/tmp/opencode/conformance_corpus/conformance_docs.npy")
+    p.add_argument("--init-lowrank", action="store_true",
+                   help="Also FPS-initialise the LowRank per-layer codebooks")
     args = p.parse_args()
 
     cfg = dataclasses.replace(LCMConfig(), r_max=args.r_max)
@@ -126,6 +128,22 @@ def main() -> int:
                 cfg.d_model, dtype=jnp.float32)
     print(f"[fps] initialised {n_layers} binding layers from {args.samples} "
           f"samples, r_max={args.r_max}")
+
+    if args.init_lowrank:
+        M_lr = int(params["lowrank"]["U"][0].shape[0])
+        r = z
+        for layer, rank in enumerate(cfg.ranks):
+            rows = _fps(r, M_lr, 44 + layer)
+            Vs = V[:, :rank]  # (d, rank)
+            # Rows = U @ Vs.T; solve the small rank x rank system for U.
+            U = rows @ Vs @ np.linalg.pinv(Vs.T @ Vs)
+            params["lowrank"]["U"][layer] = jnp.asarray(U)
+            idx = np.argmin(
+                np.sum((r[:, None, :] - rows[None, :, :]) ** 2, axis=-1),
+                axis=1)
+            r = r - rows[idx]
+        print(f"[fps] initialised {len(cfg.ranks)} lowrank layers from "
+              f"{args.samples} samples")
 
     train_cog(
         cfg, output_dir=args.output, steps=args.steps, lr=args.lr,
