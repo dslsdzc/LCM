@@ -242,8 +242,10 @@ int build_dag_v3(const float* z, lcm_memory_v3* mem, dag_t* dag) {
         } else if (li == LATTICE_SPARSE) {
             /* C-5/Ruling 21: the LFQ gate is HRQ's R2-domain top similarity,
              * filled by execute_dag_v3 after HRQ runs. Until then 0 disables
-             * LFQ; an inactive HRQ leaves it 0 for the whole step. */
-            node->n_inputs = 2;
+             * LFQ; an inactive HRQ leaves it 0 for the whole step. Do not emit
+             * a second input edge when there is no HRQ node: an empty edge is
+             * not a dependency. */
+            node->n_inputs = hrq_node ? 2 : 1;
             node->inputs[1] = hrq_node ? (const float*)hrq_node->output : NULL;
             node->dep_dist = 0.0f;
         }
@@ -881,18 +883,20 @@ int lcm_infer_loop_v3(const lcm_memory_v3* mem, const gvalue_t* gv,
         execute_dag_v3(&dag, &work, alpha_val, outputs, confidences, active,
                        selected_rows, selected_values);
 
-        /* Routing gate: deterministic hard mask over the routed lattices. */
+        /* Routing gate: deterministic hard mask over the routed lattices.
+         * Self is the additive 7th fusion term, never a routed lattice, so the
+         * gate must see n_routed (not n_lattices). A 7-lattice config used to
+         * let Self win the route argmax while fusion skipped it. */
+        int n_routed = work.n_lattices < LATTICE_SELF
+            ? work.n_lattices : LATTICE_SELF;
         float soft_mask[LCM_MAX_LATTICES];
         memset(soft_mask, 0, sizeof(soft_mask));
         routing_gate_c(z_cur, work.fusion.route_C, work.fusion.route_W,
-                       work.n_lattices, soft_mask);
+                       n_routed, soft_mask);
 
         float weights[LCM_MAX_LATTICES];
         memset(weights, 0, sizeof(weights));
-        /* R15: self is the additive 7th term, not a routed weight. A
-         * 7-lattice config still routes six functional lattices. */
-        int n_routed = work.n_lattices < LATTICE_SELF
-            ? work.n_lattices : LATTICE_SELF;
+        /* R15: self is the additive 7th term, not a routed weight. */
         int n_active = 0;
         for (int i = 0; i < n_routed; i++) {
             weights[i] = active[i] ? soft_mask[i] * work.fusion.alpha[i]

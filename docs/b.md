@@ -788,14 +788,19 @@ L_VQ    = L_codebook + L_commitment
 **EMA Implementation**:
 ```python
 def ema_update(C, N, m, z_sum, count, gamma):
-    N = gamma * N + (1 - gamma) * count
-    m = gamma * m + (1 - gamma) * z_sum
+    # N is the un-normalised effective observation count, m the decayed sum.
+    N = gamma * N + count
+    m = gamma * m + z_sum
     C = m / jnp.clip(N, a_min=1)
 ```
-The decayed-sum form is equivalent to the textbook EMA: for a single observation per step,
-`C_t = m_t / N_t = gamma·C_{t-1} + (1 - gamma)·z_t`. The `(1 - gamma)` factor must appear on
-both `N` and `m`; omitting it on either side changes the effective decay. When a dead code is
-cold-started, set `N = 1`, `m = C_new`, so the new vector does not inherit stale mass.
+This is the **count-based decayed-sum form** and is the canonical definition. For a warm row
+(`N >= 1`) it behaves as a weighted average whose effective horizon is `1/(1-gamma)`:
+`C_t ≈ gamma·C_{t-1} + (1-gamma)·z_t` when `N ≈ 1/(1-gamma)`. It is deliberately *not* the
+constant-decay textbook form at cold start: the first assignment gives `N = count`, `m = z_sum`,
+so a single observation yields `C = z` exactly. A dead code is cold-started with `N = 1`,
+`m = C_new`; a row with `N = 0` keeps its existing vector. The old `(1-gamma)` form with
+`max(N, 1)` multiplied a cold row by `(1-gamma)` (e.g. 0.01 for `gamma = 0.99`) and contradicted
+this cold-start rule; it is not equivalent and must not be reintroduced.
 For the sparse lattice, additionally perform soft threshold shrinkage with `λ_shrink` after `ema_update`:
 ```python
 def sparse_ema_update(C_sparse, N, m, z_sum, count, gamma=γ_sparse, lambda_s=λ_shrink):

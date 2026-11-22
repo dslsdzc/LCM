@@ -770,12 +770,17 @@ L_VQ    = L_codebook + L_commitment
 **EMA 实现**：
 ```python
 def ema_update(C, N, m, z_sum, count, gamma):
-    N = gamma * N + (1 - gamma) * count
-    m = gamma * m + (1 - gamma) * z_sum
+    # N 是未归一化的有效观测计数，m 是衰减和
+    N = gamma * N + count
+    m = gamma * m + z_sum
     C = m / jnp.clip(N, a_min=1)
 ```
-decayed-sum 形式与教科书 EMA 等价：每步单个观测时，
-`C_t = m_t / N_t = gamma·C_{t-1} + (1 - gamma)·z_t`。`(1 - gamma)` 必须同时出现在 `N` 和 `m` 上；任何一边漏掉都会改变有效衰减率。死点冷启动时设 `N = 1`、`m = C_new`，让新向量不继承陈旧质量。
+这是 **count-based decayed-sum** 形式，也是当前规范定义。热行（`N >= 1`）表现为有效窗口
+`1/(1-gamma)` 的加权平均：当 `N ≈ 1/(1-gamma)` 时，`C_t ≈ gamma·C_{t-1} + (1-gamma)·z_t`。
+它有意不在冷启动时采用 constant-decay：第一次写入得到 `N = count`、`m = z_sum`，单个观测
+就是 `C = z`，不会被 `(1-gamma)` 缩小。死码冷启动设 `N = 1`、`m = C_new`；`N = 0` 的行保持
+原向量。旧的 `(1-gamma)` + `max(N,1)` 写法会把冷行乘上 `(1-gamma)`（`gamma=0.99` 时是 0.01），
+与冷启动规则矛盾；两者并不等价，不得重新引入。
 对于稀疏格，在 `ema_update` 后额外用 `λ_shrink` 执行软阈值萎缩：
 ```python
 def sparse_ema_update(C_sparse, N, m, z_sum, count, gamma=γ_sparse, lambda_s=λ_shrink):

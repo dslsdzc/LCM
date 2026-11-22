@@ -1636,6 +1636,9 @@ class LCMInferEngine:
         self.max_seq_len = self.cfg['max_seq_len']
         self.n_heads = self.cfg['n_heads']
         self.n_lattices = self.cfg['n_lattices']
+        # R22: the C loop's value-scalar strength must match training
+        # (config alpha_val, default 0.1), not a different inference default.
+        self.alpha_val = float(self.cfg.get('alpha_val', 0.1))
 
         # liblcm.so is built with -march=native → references libmvec symbols
         # (e.g. _ZGVbN4v_logf); preload libm with RTLD_GLOBAL so the engine
@@ -1849,15 +1852,6 @@ class LCMInferEngine:
     def _ptr(self, arr):
         return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
 
-    def _normalise_codebook_scale(self, z):
-        """Scale z to match codebook entry norms so distance ≈ semantics."""
-        hrq = self.hrq_C.reshape(-1, self.d)
-        cb_mean_norm = float(np.sqrt(np.mean(np.sum(hrq ** 2, axis=-1))))
-        z_norm = float(np.linalg.norm(z))
-        if z_norm > 1e-8:
-            z = z * (cb_mean_norm / z_norm)
-        return z
-
     def cognitive_step(self, z, use_safety=True):
         """One cognitive refinement through the canonical v3 loop.
 
@@ -1870,7 +1864,7 @@ class LCMInferEngine:
         return z_q
 
     def cognitive_loop(self, z, conv_tol=1e-3, entropy_thresh=0.5,
-                       max_steps=16, use_safety=True, alpha_val=1.0,
+                       max_steps=16, use_safety=True, alpha_val=None,
                        agency_tension_mod=0.0, agency_explore_mod=0.0):
         """Cognitive inference loop (C v3: dynamic DAG + canonical fusion).
 
@@ -1899,7 +1893,18 @@ class LCMInferEngine:
         modulated_max = max_steps + int(round(explore_m * max_steps))
         modulated_max = int(np.clip(modulated_max, 4, 64))
 
-        z = self._normalise_codebook_scale(np.ascontiguousarray(z, dtype=np.float32))
+        if alpha_val is None:
+            alpha_val = getattr(self, 'alpha_val',
+                                float(getattr(self, 'cfg', {}).get(
+                                    'alpha_val', 0.1)))
+
+        # Match training's safe_unit(z): L2 unit sphere, not HRQ codebook
+        # scale. The old codebook-scale normalisation changed the distance
+        # domain for Sparse/LowRank/Binding/Contrast and the DAG trigger.
+        z = np.ascontiguousarray(z, dtype=np.float32)
+        z_norm = float(np.linalg.norm(z))
+        if z_norm > 1e-8:
+            z = z / z_norm
         z_out = np.zeros(self.d, dtype=np.float32)
         gv_n = self.gv_n if use_safety else 0
         dm = self.danger_M  # danger is never skipped (R13)

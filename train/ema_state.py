@@ -19,24 +19,20 @@ enters the optimizer:
 
 Recursion
 ---------
-``N <- gamma*N + count`` and ``m <- gamma*m + z_sum``.  ``N`` is a decayed
-*count*, not ``(1-gamma)*count``: the feature bank cold-start zeroes both
-statistics when it replaces a dead row, and the first assignment must then set
-``C`` to that observation. With the ``(1-gamma)`` form from b.md, a zeroed row
-would come back at ``(1-gamma)*z`` instead. Rows with ``N == 0`` keep their
-existing vector (a row that was never assigned is not evidence that its vector
-is zero). This is what makes the 100-step variance check possible.
+``N <- gamma*N + count`` and ``m <- gamma*m + z_sum``.  ``N`` is an
+un-normalised decayed *count*; it is the canonical form defined in b.md.  The
+feature bank cold-start zeroes both statistics when it replaces a dead row,
+and the first assignment then sets ``C`` to that observation exactly.  A
+``(1-gamma)``-scaled form with ``max(N, 1)`` would instead return
+``(1-gamma)*z`` for a cold row (0.01*z at gamma=0.99); it is not equivalent and
+is explicitly excluded by the spec.  Rows with ``N == 0`` keep their existing
+vector (a row that was never assigned is not evidence that its vector is
+zero). This is what makes the 100-step variance check possible.
 
-The two recursions are the same estimator up to a global factor. If
-``(N_ref, m_ref)`` is b.md's state, ours is
-``(N, m) = (N_ref, m_ref) / (1-gamma)``: both updates are linear and the two
-forms differ by exactly that factor, which cancels in ``m / N``. For a warm row
-(``N >= 1``) the clip is the same in both. For a cold row the first assignment
-gives ``N=count, m=z_sum`` here versus ``(1-gamma)*count, (1-gamma)*z_sum`` in
-b.md; the ratio is ``z_sum/count`` in both, which is the observation itself for
-a single selected row. We keep the un-scaled form so the feature bank's zeroed
-cold start is exact and so an untouched row is not divided by a sub-1 clip.
-``test_decayed_sum_form_matches_bmd_scaled_form`` pins the warm-row equivalence.
+For warm rows (``N >= 1``) the update is a weighted average with effective
+horizon ``1/(1-gamma)``: when ``N ~ 1/(1-gamma)`` it matches
+``gamma*C + (1-gamma)*z``.  The cold-start and dead-reset paths are pinned by
+``test_decayed_sum_form_is_canonical``.
 
 Manifold coordinates are tangent space by construction: ``manifold_forward``
 calls ``exp_map`` on them, so the EMA must not apply ``exp_map`` here. The

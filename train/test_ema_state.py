@@ -232,18 +232,17 @@ def test_binding_ema_uses_value_biased_forward_indices():
     assert float(new_state['key'][0]['N'][0]) == 0.0
 
 
-def test_decayed_sum_form_matches_bmd_scaled_form():
-    """Our N/m are b.md's state divided by (1-gamma); the codebook is the same.
+def test_decayed_sum_form_is_canonical():
+    """The count-based decayed-sum form is the b.md definition.
 
-    For a warm row (N >= 1, both clips are the identity):
-        N_ours = N_ref/(1-gamma),  m_ours = m_ref/(1-gamma)
-    The update is linear, so after an assignment the ratio m/N is identical.
+    Warm row: N <- gamma*N + count, m <- gamma*m + z_sum, C = m/max(N,1).
+    Cold row: the first assignment is the observation itself, not
+    (1-gamma)*observation.
     """
     gamma = 0.9
-    scale = 1.0 - gamma
-    N_ref0 = jnp.array([2.0])
-    m_ref0 = jnp.array([[2.0, 4.0]])
-    state = {'N': N_ref0 / scale, 'm': m_ref0 / scale,
+    N0 = jnp.array([2.0])
+    m0 = jnp.array([[2.0, 4.0]])
+    state = {'N': N0, 'm': m0,
              'last_used': jnp.zeros(1, dtype=jnp.int32)}
     z = jnp.array([[3.0, 5.0]])
     idx = jnp.array([0])
@@ -251,21 +250,33 @@ def test_decayed_sum_form_matches_bmd_scaled_form():
     C_our, state_our = ema_update_sparse(
         jnp.zeros((1, 2)), state, z, idx, gamma, lambda_shrink=0.0)
 
-    N_ref = gamma * N_ref0 + scale * 1.0
-    m_ref = gamma * m_ref0 + scale * z
-    C_ref = m_ref / jnp.clip(N_ref, 1.0)[:, None]
+    N = gamma * N0 + 1.0
+    m = gamma * m0 + z
+    C_ref = m / jnp.clip(N, 1.0)[:, None]
     np.testing.assert_allclose(np.asarray(C_our), np.asarray(C_ref),
                                atol=1e-6)
     np.testing.assert_allclose(np.asarray(state_our['N']),
-                               np.asarray(N_ref / scale), atol=1e-6)
+                               np.asarray(N), atol=1e-6)
 
-    # Cold row: b.md's scaled state is (1-gamma)*[count, z_sum]; the ratio is
-    # the observation, which our N=count>=1 clip makes exact.
+    # Cold row: the canonical form gives the observation exactly. The old
+    # (1-gamma)-scaled formula would give 0.1*z here.
     cold = {'N': jnp.zeros(1), 'm': jnp.zeros((1, 2)),
             'last_used': jnp.zeros(1, dtype=jnp.int32)}
-    C_cold, _ = ema_update_sparse(jnp.zeros((1, 2)), cold, z, idx, gamma,
-                                  lambda_shrink=0.0)
+    C_cold, cold_state = ema_update_sparse(
+        jnp.zeros((1, 2)), cold, z, idx, gamma, lambda_shrink=0.0)
     np.testing.assert_allclose(np.asarray(C_cold), np.asarray(z), atol=1e-7)
+    np.testing.assert_allclose(np.asarray(cold_state['N']), [1.0])
+
+    # Dead reset: N=1, m=C_new; the next assignment is an ordinary warm update.
+    reset = {'N': jnp.ones(1), 'm': jnp.array([[7.0, 9.0]]),
+             'last_used': jnp.zeros(1, dtype=jnp.int32)}
+    C_reset, reset_state = ema_update_sparse(
+        jnp.zeros((1, 2)), reset, z, jnp.array([0]), gamma,
+        lambda_shrink=0.0)
+    C_expect = (gamma * jnp.array([[7.0, 9.0]]) + z) / (gamma * 1.0 + 1.0)
+    np.testing.assert_allclose(np.asarray(C_reset), np.asarray(C_expect),
+                               atol=1e-6)
+    assert float(reset_state['N'][0]) > 1.0
 
 
 def test_last_used_only_moves_for_selected_rows():

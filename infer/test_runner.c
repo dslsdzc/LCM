@@ -2258,6 +2258,213 @@ static void test_dag_dynamic_threshold(void) {
     CHECK(dag.n_nodes == 0, "θ=0 disables every lattice");
 }
 
+static void test_dag_all_activation_masks(void) {
+    t10_prepare();
+    float z[LCM_D] = {0};
+    z[0] = 0.12f;
+
+    int bad = 0;
+    int tested = 0;
+    for (int mask = 0; mask < 128; mask++) {
+        tested++;
+        for (int li = 0; li < LCM_MAX_LATTICES; li++) {
+            int on = li < T7_NLAT ? ((mask >> li) & 1)
+                                  : ((mask >> T7_NLAT) & 1);
+            t10_mem.mean_recent_d_min[li] = 0.0f;
+            t10_mem.trigger_theta[li] = on ? 1.0f : 0.0f;
+            t10_mem.trigger_initial[li] = on ? 1e10f : 0.0f;
+        }
+
+        dag_t dag;
+        int n_cand = build_dag_v3(z, &t10_mem, &dag);
+        int expect_ret = 0;
+        for (int li = 0; li < T7_NLAT; li++) expect_ret += (mask >> li) & 1;
+        int expect_self = (mask >> T7_NLAT) & 1;
+
+        int seen[LCM_MAX_LATTICES] = {0};
+        op_node_t* ret_nodes[LCM_MAX_LATTICES];
+        int n_ret = 0;
+        int n_self = 0, n_bind = 0, n_unbind = 0;
+        op_node_t* bind_node = NULL;
+        op_node_t* unbind_node = NULL;
+
+        if (n_cand != T7_NLAT + 1) {
+            printf("[MASK %d] n_cand=%d\n", mask, n_cand);
+            bad++;
+        }
+        for (int i = 0; i < dag.n_nodes; i++) {
+            op_node_t* node = &dag.nodes[i];
+            if (node->op_type == OP_RETRIEVE_SINGLE) {
+                int li = node->lattice_id;
+                if (li < 0 || li >= T7_NLAT) {
+                    printf("[MASK %d] illegal retrieve lattice %d\n", mask, li);
+                    bad++;
+                } else {
+                    seen[li]++;
+                    ret_nodes[n_ret++] = node;
+                }
+            } else if (node->op_type == OP_SELF_CHECK) {
+                n_self++;
+                if (node->lattice_id != LATTICE_SELF) {
+                    printf("[MASK %d] self node has lattice %d\n",
+                           mask, node->lattice_id);
+                    bad++;
+                }
+            } else if (node->op_type == OP_HRR_BIND) {
+                n_bind++;
+                bind_node = node;
+            } else if (node->op_type == OP_HRR_UNBIND) {
+                n_unbind++;
+                unbind_node = node;
+            }
+        }
+
+        if (n_ret != expect_ret || n_self != expect_self) {
+            printf("[MASK %d] retrieve %d/%d self %d/%d\n", mask,
+                   n_ret, expect_ret, n_self, expect_self);
+            bad++;
+        }
+        for (int li = 0; li < T7_NLAT; li++) {
+            int want = (mask >> li) & 1;
+            if (seen[li] != want) {
+                printf("[MASK %d] lattice %d seen=%d want=%d\n",
+                       mask, li, seen[li], want);
+                bad++;
+            }
+        }
+        if (n_bind != (expect_ret > 0 ? 1 : 0)
+            || n_unbind != (expect_ret > 0 ? 1 : 0)) {
+            printf("[MASK %d] bind=%d unbind=%d ret=%d\n",
+                   mask, n_bind, n_unbind, expect_ret);
+            bad++;
+        }
+
+        if (bind_node) {
+            if (bind_node->n_inputs != expect_ret) {
+                printf("[MASK %d] bind inputs=%d want=%d\n",
+                       mask, bind_node->n_inputs, expect_ret);
+                bad++;
+            }
+            for (int i = 0; i < bind_node->n_inputs; i++) {
+                int found = 0;
+                for (int r = 0; r < n_ret; r++)
+                    if (bind_node->inputs[i]
+                        == (const float*)ret_nodes[r]->output) found = 1;
+                if (!found) {
+                    printf("[MASK %d] bind input %d is not a retrieve output\n",
+                           mask, i);
+                    bad++;
+                }
+            }
+        }
+        if (unbind_node) {
+            if (!bind_node
+                || unbind_node->inputs[0]
+                   != (const float*)bind_node->output
+                || unbind_node->inputs[1]
+                   != (const float*)ret_nodes[0]->output) {
+                printf("[MASK %d] unbind wiring is wrong\n", mask);
+                bad++;
+            }
+        }
+
+        int hi = t10_find_node(&dag, OP_RETRIEVE_SINGLE, LATTICE_HRQ);
+        int si = t10_find_node(&dag, OP_RETRIEVE_SINGLE, LATTICE_SPARSE);
+        if (si >= 0) {
+            if (hi >= 0) {
+                if (dag.nodes[si].n_inputs != 2
+                    || dag.nodes[si].inputs[1]
+                       != (const float*)dag.nodes[hi].output) {
+                    printf("[MASK %d] Sparse LFQ edge missing\n", mask);
+                    bad++;
+                }
+            } else if (dag.nodes[si].n_inputs != 1
+                       || dag.nodes[si].inputs[1] != NULL) {
+                printf("[MASK %d] Sparse LFQ not disabled without HRQ\n",
+                       mask);
+                bad++;
+            }
+        }
+
+        vec_t outputs[LCM_MAX_LATTICES];
+        vec_t selected_rows[LCM_MAX_LATTICES];
+        float confidences[LCM_MAX_LATTICES];
+        float selected_values[LCM_MAX_LATTICES];
+        int active[LCM_MAX_LATTICES];
+        memset(outputs, 0, sizeof(outputs));
+        memset(selected_rows, 0, sizeof(selected_rows));
+        memset(confidences, 0, sizeof(confidences));
+        memset(selected_values, 0, sizeof(selected_values));
+        memset(active, 0, sizeof(active));
+        if (!execute_dag_v3(&dag, &t10_mem, 0.0f, outputs, confidences,
+                            active, selected_rows, selected_values)) {
+            printf("[MASK %d] execute_dag_v3 failed\n", mask);
+            bad++;
+            continue;
+        }
+        for (int li = 0; li < T7_NLAT; li++) {
+            int want = (mask >> li) & 1;
+            if (active[li] != want) {
+                printf("[MASK %d] execute active[%d]=%d want=%d\n",
+                       mask, li, active[li], want);
+                bad++;
+            }
+            if (want) {
+                for (int j = 0; j < LCM_D; j++)
+                    if (!isfinite(outputs[li][j])) {
+                        printf("[MASK %d] non-finite output lattice %d\n",
+                               mask, li);
+                        bad++;
+                        break;
+                    }
+            }
+        }
+        if (active[LATTICE_SELF] != expect_self) {
+            printf("[MASK %d] self active=%d want=%d\n",
+                   mask, active[LATTICE_SELF], expect_self);
+            bad++;
+        }
+
+        float soft[LCM_MAX_LATTICES];
+        for (int i = 0; i < LCM_MAX_LATTICES; i++) soft[i] = 1.0f;
+        vec_t z_next;
+        const float* self_out = expect_self ? outputs[LATTICE_SELF] : NULL;
+        int fr = lcm_fuse_canonical(
+            (const float*)outputs, T7_NLAT, LCM_D, soft, active,
+            t10_mem.fusion.alpha, t10_mem.fusion.ln_scale,
+            t10_mem.fusion.ln_bias, self_out, 0.1f, z_next);
+        if (expect_ret == 0 && expect_self) {
+            /* Self is not a routed lattice. The loop handles self-only with
+             * its own layer_norm(self_bias·z_self) fallback; normal fusion
+             * must not silently treat it as a seventh distance-fused item.
+             * test_loop_v3_self_only covers that fallback. */
+            if (fr != -1) {
+                printf("[MASK %d] self-only entered normal fusion\n", mask);
+                bad++;
+            }
+        } else if (expect_ret == 0) {
+            if (fr != -1) {
+                printf("[MASK %d] empty active set fusion did not return -1\n",
+                       mask);
+                bad++;
+            }
+        } else {
+            if (fr != 0) {
+                printf("[MASK %d] fusion failed\n", mask);
+                bad++;
+            }
+            for (int j = 0; j < LCM_D; j++)
+                if (!isfinite(z_next[j])) {
+                    printf("[MASK %d] non-finite fused z\n", mask);
+                    bad++;
+                    break;
+                }
+        }
+    }
+    CHECK(tested == 128 && bad == 0,
+          "all 128 activation masks: DAG/execute/fusion invariants");
+}
+
 static void test_dag_sparse_depends_on_hrq(void) {
     t10_prepare();
     float z[LCM_D] = {0};
@@ -2750,6 +2957,7 @@ int main(void) {
     test_fusion_l2_weights();
     test_dag_dynamic_threshold();
     test_dag_sparse_depends_on_hrq();
+    test_dag_all_activation_masks();
     test_dag_bind_all_upstream();
     test_dag_n_lattices_seven();
     test_loop_v3_graceful_and_hard();
