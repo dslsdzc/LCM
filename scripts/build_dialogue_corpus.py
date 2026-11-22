@@ -92,6 +92,9 @@ def main() -> int:
     p.add_argument("--n", type=int, default=1200)
     p.add_argument("--seed", type=int, default=20261121)
     p.add_argument("--tokenizer", default="/home/DslsDZC/LCM/data/tokenizer.json")
+    p.add_argument("--tokenizer-id", default="bpe30k")
+    p.add_argument("--model-vocab-size", type=int, default=30000)
+    p.add_argument("--separator", default="[EOS]")
     p.add_argument("--data-root", default="/home/DslsDZC/data/lcm")
     p.add_argument("--name", default="dialogue")
     args = p.parse_args()
@@ -106,9 +109,9 @@ def main() -> int:
 
     spec = resolve_tokenizer_spec(
         path=args.tokenizer,
-        document_separator="[EOS]",
-        model_vocab_size=30000,
-        tokenizer_id="bpe30k",
+        document_separator=args.separator,
+        model_vocab_size=args.model_vocab_size,
+        tokenizer_id=args.tokenizer_id,
     )
     data_path = out / f"{args.name}.dat"
     shape_path = out / f"{args.name}_shape.json"
