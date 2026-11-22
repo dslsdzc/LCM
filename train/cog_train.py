@@ -1261,7 +1261,7 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
               full_verify=True, allow_missing_self=False,
               self_awareness=True, verifier=None,
               causal_subject=None, tokenizer_path=None, on_step=None,
-              overfit_one_batch=False):
+              overfit_one_batch=False, init_params=None):
     """Run dual-channel cognitive training (Stage 2).
 
     Dual channels from cognitive state z_q:
@@ -1313,6 +1313,10 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
             Design §6.3's "single-batch overfit" check (last-10 mean < 0.8 ×
             first-10 mean) is only meaningful when the target does not change
             every step. Default False is the normal streaming path.
+        init_params: optional research hook. A full parameter tree with the
+            same shapes as ``init_cog_params``; used for coverage-based
+            codebook initialisation. It is not a checkpoint migration: the
+            passed tree is the initial model, and EMA buffers are rebuilt.
     """
     from train.data import WikiDataIter
     from tqdm import tqdm
@@ -1343,6 +1347,11 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     params, self_state = init_cog_params(
         cfg, init_rng, qwen_ckpt=qwen_ckpt, resume=resume,
         allow_missing_self=allow_missing_self)
+    if init_params is not None:
+        # Research hook: pre-initialised codebooks (e.g. FPS coverage) with
+        # the same shapes as init_cog_params. Buffers are re-derived from this
+        # tree below; no old checkpoint is migrated.
+        params = jax.tree_util.tree_map(jnp.asarray, init_params)
     (ema_state, feature_bank, contrast_bank, contrast_last_used,
      start_step) = load_cog_buffers(
         resume, params, cfg, allow_missing_self=allow_missing_self)
