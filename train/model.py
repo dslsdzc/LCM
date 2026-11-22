@@ -48,7 +48,8 @@ def init_all_params(cfg: LCMConfig, rng):
     # Lattices
     params['hrq'] = init_hrq_params(keys[2], d, cfg.M_top, cfg.M_fine, cfg.n_hrq_layers)
     params['sparse'] = init_sparse_params(keys[3], d, cfg.M_sparse)
-    params['lowrank'] = init_lowrank_params(keys[4], d, cfg.M_lr, cfg.ranks)
+    params['lowrank'] = init_lowrank_params(
+        keys[4], d, cfg.M_lr, cfg.ranks, r_max=cfg.r_max)
     params['manifold'] = init_manifold_params(keys[5], d, cfg.M_man, cfg.t_dim)
     params['binding'] = init_binding_params(keys[6], d, cfg.M_bind, cfg.n_bind_layers, cfg.r_max)
     params['contrast'] = init_contrast_params(keys[7], d, cfg.M_contrast, cfg.n_contrast_layers)

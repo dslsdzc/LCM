@@ -507,12 +507,15 @@ def sparse_ema_update(params, z_sum, count, N, m, gamma=0.99, lambda_s=1e-4):
 
 # ── 4.3 Low-Rank Lattice (Λ_lowrank) ────────────────────────────────────────
 
-def init_lowrank_params(rng, d, M_lr, ranks):
+def init_lowrank_params(rng, d, M_lr, ranks, r_max=None):
     keys = jax.random.split(rng, 1 + len(ranks))
-    r_max = max(ranks)
+    # The shared basis width is the configured r_max, not merely max(ranks):
+    # Binding reuses the full basis and may need a wider projection than the
+    # low-rank lattice's current residual ranks.
+    basis_r = max(max(ranks), int(r_max or 0))
     params = {
-        'A_V': jax.random.normal(keys[0], (d, r_max)) * 0.02,
-        'W_V': jax.random.normal(keys[0], (r_max, r_max)) * 0.01,
+        'A_V': jax.random.normal(keys[0], (d, basis_r)) * 0.02,
+        'W_V': jax.random.normal(keys[0], (basis_r, basis_r)) * 0.01,
     }
     params['U'] = []
     for l, r in enumerate(ranks):
