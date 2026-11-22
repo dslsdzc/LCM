@@ -22,10 +22,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 
-from train.checkpoint import load_checkpoint  # noqa: E402
+from train.checkpoint import load_cog_state  # noqa: E402
+from train.cog_train import (  # noqa: E402
+    RunIdentity, resolve_dataset_identity, save_cog_checkpoint,
+)
 from train.config import LCMConfig  # noqa: E402
 from train.data import WikiDataIter  # noqa: E402
 from train.encoder import encoder_forward  # noqa: E402
@@ -80,14 +84,17 @@ def main() -> int:
     p.add_argument("--samples", type=int, default=1000)
     p.add_argument("--batches", type=int, default=100)
     p.add_argument("--seq", type=int, default=64)
+    p.add_argument("--save", default="",
+                   help="Optional output directory for a calibrated v2 checkpoint")
     args = p.parse_args()
 
     ckpt = Path(args.checkpoint)
     with open(ckpt / "config.json") as f:
         cfg = LCMConfig(**{k: v for k, v in json.load(f).items()
                            if k in LCMConfig.__dataclass_fields__})
-    params, *_ = load_checkpoint(str(ckpt), cfg=cfg, load_opt=False,
-                                 allow_missing_aux=True)
+    state = load_cog_state(str(ckpt), require_buffers=False)
+    params = jax.tree_util.tree_map(jnp.asarray, state["params"])
+    self_state = state.get("self_state")
 
     it = WikiDataIter(args.data, args.shape, args.spans, B=1, N=args.seq)
     zs = []
@@ -160,6 +167,15 @@ def main() -> int:
         cfg, params, args.data, args.shape, args.spans,
         seq_len=args.seq, batches=args.batches)
     print(json.dumps(report["per_lattice"], indent=1))
+
+    if args.save:
+        spec, meta = resolve_dataset_identity(
+            args.data, args.shape, args.spans, full_verify=True)
+        save_cog_checkpoint(
+            params, args.save, int(state["step"]),
+            run_identity=RunIdentity(spec, meta), train_cfg=cfg,
+            self_state=self_state, allow_missing_buffers=True)
+        print(f"[calib] saved calibrated checkpoint -> {args.save}")
     return 0
 
 
