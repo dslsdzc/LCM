@@ -78,6 +78,8 @@ def main() -> int:
     p.add_argument("--spans", default="/home/DslsDZC/data/tmp/opencode/conformance_corpus/conformance_docs.npy")
     p.add_argument("--init-lowrank", action="store_true",
                    help="Also FPS-initialise the LowRank per-layer codebooks")
+    p.add_argument("--freeze-codebooks", action="store_true",
+                   help="Keep binding/lowrank out of optimizer and EMA")
     args = p.parse_args()
 
     cfg = dataclasses.replace(LCMConfig(), r_max=args.r_max)
@@ -151,7 +153,8 @@ def main() -> int:
         log_every=max(1, args.steps // 4), save_every=1000,
         data_path=args.data, shape_path=args.shape, spans_path=args.spans,
         joint=True, self_awareness=False, overfit_one_batch=False,
-        init_params=params)
+        init_params=params,
+        freeze_lattices=("binding", "lowrank") if args.freeze_codebooks else ())
     return 0
 
 

@@ -694,7 +694,8 @@ def make_optimizer(cfg):
     )
 
 
-def make_train_step(cfg, optimizer, joint=False, return_grads=False):
+def make_train_step(cfg, optimizer, joint=False, return_grads=False,
+                    freeze_lattices=()):
     """Create jitted training step with dual-channel output + self-lattice.
 
     The sequence is split at ``cog_context_frac``. z is computed from the
@@ -758,6 +759,16 @@ def make_train_step(cfg, optimizer, joint=False, return_grads=False):
         # and frozen groups are closed over as constants inside loss_fn, so no
         # gradient (or AdamW moment, or weight-decay step) reaches them.
         trainable_params, ema_params, frozen_params = partition_params(params)
+        for name in freeze_lattices:
+            # Coverage-preserving research switch: keep a whole lattice subtree
+            # out of both the optimizer and the EMA writer.
+            if name in trainable_params:
+                del trainable_params[name]
+            if name in ema_params:
+                del ema_params[name]
+            if name in params:
+                frozen_params = dict(frozen_params)
+                frozen_params[name] = params[name]
 
         def loss_fn(p_trainable):
             p = merge_params(p_trainable, ema_params, frozen_params)
@@ -1261,7 +1272,7 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
               full_verify=True, allow_missing_self=False,
               self_awareness=True, verifier=None,
               causal_subject=None, tokenizer_path=None, on_step=None,
-              overfit_one_batch=False, init_params=None):
+              overfit_one_batch=False, init_params=None, freeze_lattices=()):
     """Run dual-channel cognitive training (Stage 2).
 
     Dual channels from cognitive state z_q:
@@ -1380,6 +1391,8 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     # must not even allocate Adam moments. Filtering `qwen` alone was not
     # enough: AdamW's decoupled weight decay moves zero-gradient leaves too.
     trainable_params, _, _ = partition_params(params)
+    for name in freeze_lattices:
+        trainable_params.pop(name, None)
     opt_state = optimizer.init(trainable_params)
 
     # 6. Sampling must consume the same dataset identity.
@@ -1389,7 +1402,8 @@ def train_cog(cfg, output_dir, steps=50000, lr=3e-4, batch_size=1,
     if overfit_one_batch:
         print("[COG] smoke: reusing one fixed batch for every step "
               "(single-batch overfit check)")
-    train_step = make_train_step(cfg, optimizer, joint=joint)
+    train_step = make_train_step(cfg, optimizer, joint=joint,
+                                 freeze_lattices=freeze_lattices)
 
     # ── Self-observation stack (R16 / e.md §1) ──────────────────────────
     # The external VerifierProcess is deliberately not created here: training
