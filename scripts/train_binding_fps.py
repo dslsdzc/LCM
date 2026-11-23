@@ -41,8 +41,10 @@ def _unit(x: np.ndarray) -> np.ndarray:
 
 
 def _fps(x: np.ndarray, m: int, seed: int) -> np.ndarray:
-    rng = np.random.default_rng(seed)
-    first = int(rng.integers(len(x)))
+    # A random first point can be a near-zero residual. Under direction-based
+    # selection that row becomes a universal attractor; start from the
+    # largest-norm point instead.
+    first = int(np.argmax(np.linalg.norm(x, axis=1)))
     idx = [first]
     d = np.sum((x - x[first]) ** 2, axis=1)
     for _ in range(1, m):
@@ -52,14 +54,37 @@ def _fps(x: np.ndarray, m: int, seed: int) -> np.ndarray:
     return x[idx]
 
 
-def _residual_rows(q: np.ndarray, m: int, layers: int, seed: int):
+def _fill_repeat(rows: np.ndarray, m: int) -> np.ndarray:
+    """Repeat the selected rows to the codebook size.
+
+    Do not fill with extra query samples: a full FPS cover leaves a zero
+    residual for the next layer, and extra query rows repeat the same effect
+    under Euclidean selection.
+    """
+    return np.concatenate([rows] * int(np.ceil(m / len(rows))), axis=0)[:m]
+
+
+def _residual_rows(q: np.ndarray, m: int, layers: int, seed: int,
+                   distinct: int | None = None, cosine: bool = True):
+    """Per-layer residual coverage with a bounded distinct-row budget.
+
+    ``distinct`` caps how many *different* rows a layer may install. A layer
+    that installs every query direction leaves the next layer with an
+    all-zero residual (observed on calibrated binding.bind layers 1/2).
+    """
     rows, r = [], q
+    n_distinct = int(m if distinct is None else min(m, distinct))
     for layer in range(layers):
-        layer_rows = _fps(r, m, seed + layer)
-        rows.append(layer_rows)
-        idx = np.argmin(
-            np.sum((_unit(r)[:, None, :] - _unit(layer_rows)[None, :, :]) ** 2,
-                   axis=-1), axis=1)
+        layer_rows = _fps(r, n_distinct, seed + layer)
+        if cosine:
+            idx = np.argmin(
+                np.sum((_unit(r)[:, None, :] - _unit(layer_rows)[None, :, :]) ** 2,
+                       axis=-1), axis=1)
+        else:
+            idx = np.argmin(
+                np.sum((r[:, None, :] - layer_rows[None, :, :]) ** 2,
+                       axis=-1), axis=1)
+        rows.append(_fill_repeat(layer_rows, m) if n_distinct < m else layer_rows)
         r = r - layer_rows[idx]
     return rows
 
@@ -78,6 +103,9 @@ def main() -> int:
     p.add_argument("--spans", default="/home/DslsDZC/data/tmp/opencode/conformance_corpus/conformance_docs.npy")
     p.add_argument("--init-lowrank", action="store_true",
                    help="Also FPS-initialise the LowRank per-layer codebooks")
+    p.add_argument("--init-contrast", action="store_true",
+                   help="FPS-initialise the Contrast per-family/per-layer "
+                        "codebooks with a bounded distinct-row budget")
     p.add_argument("--freeze-codebooks", action="store_true",
                    help="Keep binding/lowrank out of optimizer and EMA")
     args = p.parse_args()
@@ -100,8 +128,12 @@ def main() -> int:
     q_key = z @ (V @ np.asarray(params["binding"]["A_k"])).T
     q_val = z @ (V @ np.asarray(params["binding"]["A_v"])).T
     n_layers = len(params["binding"]["key_cb"])
-    key_rows = _residual_rows(q_key, cfg.M_bind, n_layers, 11)
-    val_rows = _residual_rows(q_val, cfg.M_bind, n_layers, 22)
+    # Budget half the rows per layer so the next layer still has a residual.
+    bind_distinct = max(1, int(cfg.M_bind) // 2)
+    key_rows = _residual_rows(q_key, cfg.M_bind, n_layers, 11,
+                              distinct=bind_distinct)
+    val_rows = _residual_rows(q_val, cfg.M_bind, n_layers, 22,
+                              distinct=bind_distinct)
 
     # b_raw samples from the same per-layer key/value rows.
     b_raw = []
@@ -120,7 +152,8 @@ def main() -> int:
                     n=cfg.d_model)
         b_raw.append(acc)
     bind_rows = _residual_rows(np.stack(b_raw).astype(np.float32),
-                               cfg.M_bind, n_layers, 33)
+                               cfg.M_bind, n_layers, 33,
+                               distinct=bind_distinct)
 
     for family, rows in (("key", key_rows), ("val", val_rows),
                          ("bind", bind_rows)):
@@ -130,6 +163,22 @@ def main() -> int:
                 cfg.d_model, dtype=jnp.float32)
     print(f"[fps] initialised {n_layers} binding layers from {args.samples} "
           f"samples, r_max={args.r_max}")
+
+    if args.init_contrast:
+        n_ct = len(params["contrast"]["C_a"])
+        # contrast_forward selects by raw Euclidean distance (no direction
+        # normalisation), so calibrate in that same domain.
+        ct_distinct = max(1, (3 * int(cfg.M_contrast)) // 4)
+        for family, seed in (("a", 55), ("b", 66)):
+            rows = _residual_rows(
+                z, cfg.M_contrast, n_ct, seed,
+                distinct=ct_distinct, cosine=False)
+            for layer in range(n_ct):
+                entry = params["contrast"][f"C_{family}"][layer]
+                entry["A"] = jnp.asarray(rows[layer])
+                entry["W"] = jnp.eye(cfg.d_model, dtype=jnp.float32)
+        print(f"[fps] initialised {n_ct} contrast layers x2 families from "
+              f"{args.samples} samples")
 
     if args.init_lowrank:
         M_lr = int(params["lowrank"]["U"][0].shape[0])

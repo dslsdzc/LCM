@@ -19,7 +19,7 @@ smoke 运行 HEAD：`f6b2e4c`（value consistency 实际索引、安全门 z_cur
 | 设备 | CPU（`JAX_PLATFORMS=cpu`；GTX 1650 4GB 不参与） |
 | smoke 运行 HEAD | `f6b2e4c`（value consistency 实际索引、安全门 z_cur/z_next、D-9 诊断与文档修订） |
 | 总耗时 | 152.3s |
-| C 参考 | `make -C infer clean && make -C infer test`（249 PASS） |
+| C 参考 | `make -C infer clean && make -C infer test`（251 PASS） |
 
 ## 2. 配置
 
@@ -137,6 +137,37 @@ sparse/self 无 trainable 子树，用 N/m 判据；manifold/binding 同时有 `
 Streaming verdict：**FAIL**；batches=100，B=1。
 Training probe（固定单 batch，secondary）：**FAIL**。
 Ruling 51 的 streaming probe 仍低于 10%：这不是“码本没更新”，而是路由/码本在 100 步内高度集中。正式验收需要更多步数、B≥4 或路由探索；本次如实记为 unresolved（D-9），不调低阈值。只读诊断（`train/research_d9_probe.py`）进一步显示 Binding 与 Self 的选择输入无关、LowRank 每层只有 2 个吸引子；见 `docs/d9-codebook-utilization-research-plan.md`。
+
+### 5.1.1 Post-training FPS 校准的严格逐层复核（2026-11-23）
+
+`scripts/calibrate_coverage.py` 把每个码本替换成最终 encoder query 的 FPS 覆盖行，并导出 `checkpoints_calibrated`。官方 streaming probe 若按 **family mean** 判定会得到全绿；按 D-9 原文“每个码本 ≥10%”逐层判定则**不通过**。`_streaming_utilization_probe` 已改为用 `min_fraction` 判定，family mean 仅作诊断。
+
+| 晶格 | mean | 最低层 | 阈值 | verdict |
+|---|---:|---:|---:|---|
+| hrq（仅 top） | 16.99% | 16.99% | 10% | PASS |
+| sparse | 15.04% | 15.04% | 10% | PASS |
+| lowrank | 16.54% | 12.89% | 10% | PASS |
+| manifold | 9.96% | 9.96% | 10% | **FAIL（边缘）** |
+| binding | 13.28% | **0.195%**（bind 层 1/2 各 1/512，恒定） | 10% | **FAIL** |
+| contrast | 12.11% | **6.84%**（a1 7.03%，b1/b2 7.81%） | 10% | **FAIL** |
+| route | 100% | 100% | 10% | PASS |
+| self | 32.81% | 32.81% | 10% | PASS |
+
+根因不在 FPS 的随机初始点，而在 `calibrate_coverage.py::_residual_rows` 的逐层全覆盖：
+
+1. bind 的真实 query `b_raw` 在 1000 个窗口里只有 436 个唯一值；
+2. 第一层 FPS 选了 512 行，覆盖了全部 436 个唯一值，`r - rr[idx]` 的残差**全为零**；
+3. 第二、三层在零残差上继续 FPS，只能安装零行；`_selection_query(normalize_selection=True)` 下零行成为所有 query 的最近行，于是层 1/2 恒定选中 1 行。
+
+因此 **post-training FPS calibration 不能作为官方 memory construction 步骤**：它只把 family mean 抬过线，没有修复 residual VQ 的层间分工，反而把 bind 层 1/2 变成死码本。它也不应集成进 `train_cog` 的 finalization/export。修复必须回到 residual VQ 的逐层覆盖策略（按真实 forward 残差链校准，且第一层不能吃掉全部残差），或在 ≤100 步训练中加入 usage 辅助目标；不能通过改阈值或只改 FPS 初始点解决。
+
+**分层预算的边界实验（2026-11-23）**：
+
+- 对 binding 每层只安装 256 个 distinct FPS 行（其余重复填充），post-hoc 校准后 `binding` 每个 family/layer 的 `min_fraction` 为 **13.67%**，逐层 PASS。随机 query 填充或全量 FPS 都会让下一层残差归零，重复填充是关键。
+- 对 contrast 每层安装 384 个 distinct 行（欧氏域，与 `contrast_forward` 一致），`a1/b1` 仍在 **8.6%–10.7%** 波动，官方 100-batch 采样下 `min_fraction` 不到 10%。原因是 contrast 深层残差 query 只有约 50–84 个有效簇：要让两层都达到 52 行，需要约 104 个互异簇，当前 encoder/100 步模型提供不了。增加 distinct 行到 448 反而更差（a1 9.57%、b1 9.18%）。
+- 把同样的分层预算 FPS 放进 **初始化 + 100 步训练**（`scripts/train_binding_fps.py --init-contrast --freeze-codebooks`，B=8）后，最终 checkpoint 的逐层利用率更差：HRQ 0.78%、Sparse 2.93%、LowRank min 7.03%、Manifold 4.88%、Binding min 1.56%、Contrast min 0.20%。encoder 在 100 步内漂移，初始化码本与最终 query 分布不再匹配；冻结码本放大了这个问题。
+
+结论：在当前架构与 100 步 budget 下，post-hoc 校准和初始化都无法让**所有 residual 层**稳定达到 10%。Binding 可以，Contrast 深层受 query 簇数限制，不能靠换行/加 distinct 行解决。若坚持 per-layer D-9，需要改 residual 链或训练期 usage 目标；否则只能如实保留 per-layer caveat，并用 per-lattice mean 作为官方判据。
 
 ### 5.2 码本方差（final/initial ≥ 0.5）
 
@@ -281,7 +312,16 @@ gvalue/danger are structural placeholders built from fixed anchors and a bank of
 | engine fusion | 六格 + distance | 1e-5 | PASS |
 | 判别性 | Poincaré≠Euclidean、相对 gap、binding 投影、NaN 不可假通过 | — | PASS |
 
-C `test_runner` 249 PASS；`nm` 含 `lcm_infer_loop_v3`/`hrq_forward_v31`。Manifest per-tensor sha256 由 `train/c_load.py` 校验；`test_c_load.py::test_manifest_tensor_sha256_rejects_tampered_payload` 和 `test_manifest_missing_sha256_is_rejected` 覆盖篡改/缺 hash。
+C `test_runner` 251 PASS；`nm` 含 `lcm_infer_loop_v3`/`hrq_forward_v31`。Manifest per-tensor sha256 由 `train/c_load.py` 校验；`test_c_load.py::test_manifest_tensor_sha256_rejects_tampered_payload` 和 `test_manifest_missing_sha256_is_rejected` 覆盖篡改/缺 hash。
+
+### 10.1 校准 checkpoint 的 C↔JAX 端到端复核
+
+同一个 `checkpoints_calibrated`、同一个 unit-normalized 输入 `z`：
+
+- **单步组件**：JAX `six_lattice_step(training=False)` 与 C v3 loop 第一步的 `z_next` 在随机输入上 `max_abs = 8.0e-7`，融合权重一致；`route.C/W`、`fusion.alpha/ln_*`、`self.C`、HRQ/Sparse 码本逐张量 `maxdiff = 0`。
+- **组合**：用 JAX 计算每步六个 lattice 输出，再按 C trace 的 active/fallback 权重、`self` active 标志和同一个 LayerNorm 融合，可以复现 C 的每步 `z_next` 到 `5.7e-6`（4 步 × 3 个随机输入）。这说明 C 与 JAX 的分歧来自 C 的动态 DAG 调度（`build_dag_v3` 的 threshold/active 集、路由选中 lattice 不活跃时的 active-set 均匀回退），不是校准 checkpoint 的组件数值错误；JAX 训练路径没有模拟该推理期调度。
+- **C 引擎**：加载校准 checkpoint 后 6 个随机 unit 输入、`max_steps=4` 均 `ret=0`，输出有限、无 alert；8 个中性 prompt × 8 token 的 `use_safety=False` 生成没有 abort。另观察到一次 12-token 生成在第 7 个 token 因 danger 触发 `ret=-2`；严格三法则下中性输入被 abort 属于已记录的预期安全语义，不作为 conformance pass。
+- **语言**：校准前后（`checkpoints_fps_frozen` 与 `checkpoints_calibrated`）在同一 12-token prompt 上都只产出 100 步模型的低质量 token 串；这符合 D-7（100 步 smoke 不证明语言能力），不能作为校准有效的语言证据。校准的接受与否只能由 D-9 逐层判据决定，而该判据当前 FAIL。
 
 ## 11. 自观测 5% 开销
 

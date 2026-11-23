@@ -551,15 +551,22 @@ def _streaming_utilization_probe(cfg, params, data, shape, spans, seq_len,
                  "contrast", "route", "self"):
         if name in util:
             fraction = util[name]["mean_fraction"]
+            min_fraction = util[name]["min_fraction"]
         else:
             families = [v for k, v in util.items()
                         if k.startswith(name + ".")]
             fraction = (float(np.mean([f["mean_fraction"] for f in families]))
                         if families else None)
+            min_fraction = (float(np.min([f["min_fraction"] for f in families]))
+                            if families else None)
+        # D-9 says every codebook (i.e. every layer of a multi-layer lattice)
+        # must reach 10%. A family mean hides a dead layer: calibrated
+        # binding averaged 13.3% while bind layers 1/2 selected one row each.
         per_lattice[name] = {
             "fraction": fraction,
+            "min_fraction": min_fraction,
             "threshold": 0.10,
-            "pass": bool(fraction is not None and fraction >= 0.10),
+            "pass": bool(min_fraction is not None and min_fraction >= 0.10),
         }
     return {
         "batches": int(batches),
@@ -567,8 +574,9 @@ def _streaming_utilization_probe(cfg, params, data, shape, spans, seq_len,
         "per_lattice": per_lattice,
         "pass": bool(all(v["pass"] for v in per_lattice.values())),
         "note": ("Ruling 51: final parameters, 100 different corpus windows, "
-                 "inference path. This is the utilisation verdict; the "
-                 "fixed-single-batch training probe is secondary."),
+                 "inference path. Pass uses the minimum per-layer fraction; "
+                 "the family mean is diagnostic only. HRQ tracks the top "
+                 "codebook; fine-layer selections are not tracked."),
     }
 
 
