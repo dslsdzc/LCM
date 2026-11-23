@@ -330,7 +330,7 @@ def hrq_forward(params, z, tau_fallback=0.1, value_scalars=None, alpha_val=0.0,
     # the continuous pointer and the selected code both get c_top added before
     # log_map (design R18, b.md §4.1).
     def fine_residual(r, fine_params, top):
-        cont, quant = [], []
+        cont, quant, idxs = [], [], []
         for fb in fine_params:
             C_fb_P = exp_map(fb['A'] @ fb['W'])
             vr_sims = poincare_similarity(r[:, None, :], C_fb_P[None, :, :]).squeeze(-1)
@@ -342,23 +342,26 @@ def hrq_forward(params, z, tau_fallback=0.1, value_scalars=None, alpha_val=0.0,
                 scale_f = lax.stop_gradient(
                     jnp.mean(vr_sims, axis=-1, keepdims=True)) + 1e-6
                 fine_scores = vr_sims - alpha_val * jnp.tanh(v_f)[None, :] * scale_f
-                c_fb = C_fb_P[fine_scores.argmin(axis=-1)]
+                idx = fine_scores.argmin(axis=-1)
+                c_fb = C_fb_P[idx]
                 # Forward ≡ 0; gives v_fine a gradient through the argmin.
                 # Negate because ste_relax's softmax is higher=better while the
                 # similarity score is lower=better.
                 c_fb = c_fb + ste_relax(-fine_scores, C_fb_P)
             else:
-                c_fb = C_fb_P[vr_sims.argmin(axis=-1)]
+                idx = vr_sims.argmin(axis=-1)
+                c_fb = C_fb_P[idx]
             cont.append(log_map(mobius_add(top, r)))
             quant.append(log_map(mobius_add(top, c_fb)))
+            idxs.append(idx)
             r = mobius_add(r, -c_fb)
-        return r, cont, quant
+        return r, cont, quant, idxs
 
     # Hard branch: routed prototype (with the soft backward proxy).
-    r_hard, cont_hard, quant_hard = fine_residual(
+    r_hard, cont_hard, quant_hard, idx_hard = fine_residual(
         mobius_add(z_P, -c_top_route), params['fine'], c_top_route)
     # Fallback branch: top-k softmax-weighted prototype blend.
-    r_soft, cont_soft, quant_soft = fine_residual(
+    r_soft, cont_soft, quant_soft, idx_soft = fine_residual(
         mobius_add(z_P, -c_top_w), params['fine'], c_top_w)
 
     o_hard = log_map(mobius_add(c_top_route, r_hard))
@@ -378,6 +381,11 @@ def hrq_forward(params, z, tau_fallback=0.1, value_scalars=None, alpha_val=0.0,
         'cont': [z] + [_pick(a, b) for a, b in zip(cont_hard, cont_soft)],
         'quant': [top_quant] + [
             _pick(a, b) for a, b in zip(quant_hard, quant_soft)],
+        # Fine-layer selections for D-9's per-codebook coverage. The hard and
+        # fallback branches select different rows; report the branch that ran.
+        'fine_idx': [
+            jnp.where(use_fallback, soft_idx, hard_idx)
+            for hard_idx, soft_idx in zip(idx_hard, idx_soft)],
     }
     return o_hrq, top_idx, top_sim, vq_pairs
 

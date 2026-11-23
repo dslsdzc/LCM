@@ -146,6 +146,8 @@ def run_probe(checkpoint: Path, data: str, shape: str, spans: str,
         str(checkpoint), cfg=cfg, load_opt=False, allow_missing_aux=True)
 
     M_top = int(np.asarray(params["hrq"]["top"]["A"]).shape[0])
+    M_fine = (int(np.asarray(params["hrq"]["fine"][0]["A"]).shape[0])
+              if params["hrq"]["fine"] else None)
     M_sparse = int(np.asarray(params["sparse"]["C"]).shape[0])
     M_lr = int(np.asarray(params["lowrank"]["U"][0]).shape[0])
     M_man = int(np.asarray(params["manifold"]["C"]).shape[0])
@@ -185,6 +187,8 @@ def run_probe(checkpoint: Path, data: str, shape: str, spans: str,
             lambda a: np.asarray(a), jax.device_get(fn(z)))
 
         track("hrq", 0, aux["hrq_idx"], M_top)
+        for layer, idx in enumerate(aux.get("hrq_fine_idx", [])):
+            track("hrq", 1 + layer, idx, M_fine)
         sidx = np.asarray(aux["sparse_idx"])
         track("sparse", 0, np.where(sidx > 0, sidx - 1, -1), M_sparse)
         for layer, idx in enumerate(aux["lowrank_aux"]["indices"]):

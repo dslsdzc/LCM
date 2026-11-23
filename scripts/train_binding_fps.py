@@ -37,7 +37,7 @@ from train.lattices import normalize_fft  # noqa: E402
 
 
 def _unit(x: np.ndarray) -> np.ndarray:
-    return x / (np.linalg.norm(x, axis=-1, keepdims=True) + 1e-9)
+    return x / (np.linalg.norm(x, axis=-1, keepdims=True) + 1e-8)
 
 
 def _fps(x: np.ndarray, m: int, seed: int) -> np.ndarray:
@@ -89,6 +89,30 @@ def _residual_rows(q: np.ndarray, m: int, layers: int, seed: int,
     return rows
 
 
+def _residual_vq_chain_np(codebooks, r, cosine=True):
+    """Numpy mirror of ``train.lattices._residual_vq_chain``.
+
+    The quantised forward value is the raw selected row ``C[idx]``; the next
+    residual is ``r - C[idx]``. This is what ``binding_forward`` binds.
+    """
+    quantised, inputs, indices = [], [], []
+    for cb in codebooks:
+        C = np.asarray(cb["A"] @ cb["W"])
+        inputs.append(r)
+        if cosine:
+            r_sel, C_sel = _unit(r), _unit(C)
+        else:
+            r_sel, C_sel = r, C
+        idx = np.argmin(
+            np.sum((r_sel[:, None, :] - C_sel[None, :, :]) ** 2,
+                   axis=-1), axis=1)
+        z_q = C[idx]
+        quantised.append(z_q)
+        indices.append(idx)
+        r = r - z_q
+    return quantised, inputs, indices
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--output", default="/home/DslsDZC/LCM/checkpoints_binding_fps")
@@ -135,32 +159,34 @@ def main() -> int:
     val_rows = _residual_rows(q_val, cfg.M_bind, n_layers, 22,
                               distinct=bind_distinct)
 
-    # b_raw samples from the same per-layer key/value rows.
-    b_raw = []
-    for zi in z:
-        ks = [key_rows[l][np.argmin(
-            np.sum((_unit(zi)[None, :] - _unit(key_rows[l])) ** 2, axis=1))]
-            for l in range(n_layers)]
-        vs = [val_rows[l][np.argmin(
-            np.sum((_unit(zi)[None, :] - _unit(val_rows[l])) ** 2, axis=1))]
-            for l in range(n_layers)]
-        acc = np.zeros(cfg.d_model, dtype=np.float32)
-        for a in ks:
-            for b in vs:
-                acc += np.fft.irfft(
-                    _unit(np.fft.rfft(a)) * _unit(np.fft.rfft(b)),
-                    n=cfg.d_model)
-        b_raw.append(acc)
-    bind_rows = _residual_rows(np.stack(b_raw).astype(np.float32),
-                               cfg.M_bind, n_layers, 33,
-                               distinct=bind_distinct)
-
-    for family, rows in (("key", key_rows), ("val", val_rows),
-                         ("bind", bind_rows)):
+    # Install key/val first, then run the *real* projected residual chain.
+    # Selecting rows from raw z (the old prototype) does not reproduce the
+    # tensor binding_forward actually binds.
+    for family, rows in (("key", key_rows), ("val", val_rows)):
         for layer in range(n_layers):
-            params["binding"][f"{family}_cb"][layer]["A"] = jnp.asarray(rows[layer])
+            params["binding"][f"{family}_cb"][layer]["A"] = jnp.asarray(
+                rows[layer])
             params["binding"][f"{family}_cb"][layer]["W"] = jnp.eye(
                 cfg.d_model, dtype=jnp.float32)
+
+    k_q, _k_inputs, _k_idx = _residual_vq_chain_np(
+        params["binding"]["key_cb"], q_key, cosine=True)
+    v_q, _v_inputs, _v_idx = _residual_vq_chain_np(
+        params["binding"]["val_cb"], q_val, cosine=True)
+    b_raw = np.zeros((len(z), cfg.d_model), dtype=np.float32)
+    for a in k_q:
+        for b in v_q:
+            for i in range(len(z)):
+                b_raw[i] += np.fft.irfft(
+                    _unit(np.fft.rfft(a[i])) * _unit(np.fft.rfft(b[i])),
+                    n=cfg.d_model)
+    bind_rows = _residual_rows(b_raw, cfg.M_bind, n_layers, 33,
+                               distinct=bind_distinct)
+    for layer in range(n_layers):
+        params["binding"]["bind_cb"][layer]["A"] = jnp.asarray(
+            bind_rows[layer])
+        params["binding"]["bind_cb"][layer]["W"] = jnp.eye(
+            cfg.d_model, dtype=jnp.float32)
     print(f"[fps] initialised {n_layers} binding layers from {args.samples} "
           f"samples, r_max={args.r_max}")
 

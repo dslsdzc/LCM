@@ -515,6 +515,8 @@ def _streaming_utilization_probe(cfg, params, data, shape, spans, seq_len,
 
     fn = jax.jit(forward)
     M_top = int(np.asarray(params["hrq"]["top"]["A"]).shape[0])
+    M_fine = (int(np.asarray(params["hrq"]["fine"][0]["A"]).shape[0])
+              if params["hrq"]["fine"] else None)
     M_sparse = int(np.asarray(params["sparse"]["C"]).shape[0])
     M_lr = int(np.asarray(params["lowrank"]["U"][0]).shape[0])
     M_man = int(np.asarray(params["manifold"]["C"]).shape[0])
@@ -529,6 +531,8 @@ def _streaming_utilization_probe(cfg, params, data, shape, spans, seq_len,
         aux = jax.tree_util.tree_map(
             lambda a: np.asarray(a), jax.device_get(fn(z)))
         tracker.add("hrq", 0, aux["hrq_idx"], M_top)
+        for layer, idx in enumerate(aux.get("hrq_fine_idx", [])):
+            tracker.add("hrq", 1 + layer, idx, M_fine)
         # Sparse index 0 is zero_vec in the inference path; codebook row r is
         # index r+1. Convert to a zero-based codebook row and skip zero.
         sidx = np.asarray(aux["sparse_idx"])
@@ -575,8 +579,8 @@ def _streaming_utilization_probe(cfg, params, data, shape, spans, seq_len,
         "pass": bool(all(v["pass"] for v in per_lattice.values())),
         "note": ("Ruling 51: final parameters, 100 different corpus windows, "
                  "inference path. Pass uses the minimum per-layer fraction; "
-                 "the family mean is diagnostic only. HRQ tracks the top "
-                 "codebook; fine-layer selections are not tracked."),
+                 "the family mean is diagnostic only. HRQ tracks top plus "
+                 "every fine layer."),
     }
 
 

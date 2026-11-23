@@ -96,6 +96,20 @@ Contrast 的 feature bank / usage clock 可能让选择集中；Self 已归入 H
 - 用户已确认：**开 D-9 研究任务**，不降低阈值。
 - 本计划只建立诊断工具和实验顺序；没有修改训练行为，也没有声称 D-9 通过。
 
+## 8. 2026-11-23 审查修正与当前证据
+
+审查发现旧版校准的 `b_raw` 没有模拟真实前向（用原始 `z` 选 key/val 行、忽略投影和逐层残差）。修正后：
+
+- `b_raw` 用 `q_key = z @ (V @ A_k)^T`、`q_val = z @ (V @ A_v)^T`，先跑真实 residual VQ 得到每层 `C[idx]`，再做 9 对 HRR bind；
+- Manifold 在 R6 域 `exp_map(safe_unit(z))` 校准，`C = log_map(z_P)`；
+- LowRank 的残差用实际 `C = U @ V^T`；
+- Contrast 用与 `contrast_forward` 一致的欧氏域；
+- 每层使用 bounded distinct 行 + 重复填充，避免第一层吃光残差。
+
+`checkpoints_calibrated_fixed5`（samples=1500，binding distinct=256，contrast distinct=320）在官方 streaming probe 与独立 `research_d9_probe` 上逐层全过：HRQ min 17.58%、Sparse 17.19%、LowRank 17.19%、Manifold 17.58%、Binding 12.89%、Contrast 11.13%、Route 100%、Self 37.50%，0 个 <10% 层。HRQ fine 层已纳入统计。
+
+这仍然只是 **post-hoc 码本替换**，不是训练得到的记忆；不能据此声称 conformance complete 或语义质量。原始 100 步训练路径仍 FAIL；`FPS 初始化 + 100 步训练` 也因 encoder 漂移更差。下一步应审查 post-hoc 校准能否被接受为官方 memory construction，并补 C 动态 DAG 端到端验证与 `safe_unit` 数值边界测试。
+
 ## 7. 复现命令
 
 ```bash

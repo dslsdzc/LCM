@@ -145,6 +145,9 @@ def six_lattice_step(z, params, cfg, *, training=True, rng=None, gvalue=None,
         'z_route': z_route,
         'route_idx': route_idx,
         'hrq_idx': hrq_idx,
+        # Fine-layer selections (layer 0 is the top codebook above). D-9 needs
+        # every actual codebook, not only HRQ top.
+        'hrq_fine_idx': hrq_vq.get('fine_idx', []),
         'hrq_top_sim': hrq_top_sim,
         # R18: per-layer log_map-space continuous/quantised pairs for HRQ's
         # codebook and commitment terms (top + every fine layer).

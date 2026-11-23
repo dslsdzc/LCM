@@ -33,17 +33,19 @@ from train.cog_train import (  # noqa: E402
 from train.config import LCMConfig  # noqa: E402
 from train.data import WikiDataIter  # noqa: E402
 from train.encoder import encoder_forward  # noqa: E402
-from train.hyp import safe_unit  # noqa: E402
+from train.hyp import exp_map, log_map, safe_unit  # noqa: E402
 from train.smoke_conformance import _streaming_utilization_probe  # noqa: E402
 
 
 def _unit(x):
-    return x / (np.linalg.norm(x, axis=-1, keepdims=True) + 1e-9)
+    return x / (np.linalg.norm(x, axis=-1, keepdims=True) + 1e-8)
 
 
 def _fps(x, m, seed):
-    rng = np.random.default_rng(seed)
-    first = int(rng.integers(len(x)))
+    # A random first point can be a near-zero residual. Under direction-based
+    # selection that row becomes a universal attractor; start from the
+    # largest-norm point instead.
+    first = int(np.argmax(np.linalg.norm(x, axis=1)))
     idx = [first]
     d = np.sum((x - x[first]) ** 2, axis=1)
     for _ in range(1, m):
@@ -53,11 +55,26 @@ def _fps(x, m, seed):
     return x[idx]
 
 
-def _residual_rows(q, m, layers, seed, cosine=True):
+def _fill_repeat(rows, m):
+    """Repeat the selected rows to the codebook size.
+
+    Filling with extra query samples re-covers every direction and leaves a
+    zero residual for the next layer; repeats keep the budget visible.
+    """
+    return np.concatenate([rows] * int(np.ceil(m / len(rows))), axis=0)[:m]
+
+
+def _residual_rows(q, m, layers, seed, cosine=True, distinct=0):
+    """Per-layer residual coverage, optionally with a distinct-row budget.
+
+    ``distinct > 0`` caps how many *different* rows a layer installs; the
+    remaining rows are repeats. Without a budget, a layer can consume every
+    query direction and make the next layer's residual identically zero.
+    """
     rows, r = [], q
+    n_distinct = int(m if distinct <= 0 else min(m, distinct))
     for layer in range(layers):
-        rr = _fps(r, m, seed + layer)
-        rows.append(rr)
+        rr = _fps(r, n_distinct, seed + layer)
         if cosine:
             idx = np.argmin(
                 np.sum((_unit(r)[:, None, :] - _unit(rr)[None, :, :]) ** 2,
@@ -66,8 +83,34 @@ def _residual_rows(q, m, layers, seed, cosine=True):
             idx = np.argmin(
                 np.sum((r[:, None, :] - rr[None, :, :]) ** 2, axis=-1),
                 axis=1)
+        rows.append(_fill_repeat(rr, m) if n_distinct < m else rr)
         r = r - rr[idx]
     return rows
+
+
+def _residual_vq_chain_np(codebooks, r, cosine=True):
+    """Numpy mirror of ``train.lattices._residual_vq_chain``.
+
+    Returns per-layer ``(quantised_rows, residual_inputs, indices)``. The
+    forward quantised value is the raw selected row ``C[idx]``, not the
+    residual query; ``binding_forward`` feeds these rows into HRR bind.
+    """
+    quantised, inputs, indices = [], [], []
+    for cb in codebooks:
+        C = np.asarray(cb["A"] @ cb["W"])
+        inputs.append(r)
+        if cosine:
+            r_sel, C_sel = _unit(r), _unit(C)
+        else:
+            r_sel, C_sel = r, C
+        idx = np.argmin(
+            np.sum((r_sel[:, None, :] - C_sel[None, :, :]) ** 2,
+                   axis=-1), axis=1)
+        z_q = C[idx]
+        quantised.append(z_q)
+        indices.append(idx)
+        r = r - z_q
+    return quantised, inputs, indices
 
 
 def _install_simvq(entry, rows, d):
@@ -84,6 +127,10 @@ def main() -> int:
     p.add_argument("--samples", type=int, default=1000)
     p.add_argument("--batches", type=int, default=100)
     p.add_argument("--seq", type=int, default=64)
+    p.add_argument("--bind-distinct", type=int, default=0,
+                   help="Distinct rows per Binding layer (0 = full M)")
+    p.add_argument("--contrast-distinct", type=int, default=0,
+                   help="Distinct rows per Contrast layer (0 = full M)")
     p.add_argument("--save", default="",
                    help="Optional output directory for a calibrated v2 checkpoint")
     args = p.parse_args()
@@ -118,50 +165,73 @@ def main() -> int:
     params["sparse"]["C"] = jnp.asarray(
         _fps(z, int(cfg.M_sparse), 501))
 
-    # Contrast: per-family, per-layer residual coverage.
+    # Manifold: retrieval runs in the R6 domain z_P = exp_map(safe_unit(z)),
+    # while the stored codebook C is tangent-space and is pushed to the ball
+    # by exp_map(C). Calibrating on raw z (the old behaviour) put the rows in
+    # the wrong domain. FPS on z_P, then store log_map(z_P) in C.
+    z_P = np.asarray(exp_map(jnp.asarray(safe_unit(z))))
+    man_rows = _fps(z_P, int(cfg.M_man), 601)
+    params["manifold"]["C"] = jnp.asarray(log_map(jnp.asarray(man_rows)))
+
+    # Contrast: per-family, per-layer residual coverage. contrast_forward
+    # selects by raw Euclidean distance (no direction normalisation), so the
+    # calibration must use the same domain.
     for family in ("a", "b"):
         rows = _residual_rows(z, int(cfg.M_contrast),
                               len(params["contrast"][f"C_{family}"]),
-                              201 if family == "a" else 221)
+                              201 if family == "a" else 221,
+                              cosine=False,
+                              distinct=args.contrast_distinct)
         for layer, entry in enumerate(params["contrast"][f"C_{family}"]):
             _install_simvq(entry, rows[layer], d)
 
-    # LowRank: per-layer residual coverage projected back through V.
+    # LowRank: per-layer residual coverage projected back through V. The
+    # installed codebook is C = U @ V^T, not the FPS rows themselves; the
+    # residual update must use the row the forward actually selects.
     V = np.asarray(params["lowrank"]["A_V"] @ params["lowrank"]["W_V"])
     r = z
     for layer, rank in enumerate(cfg.ranks):
         rows = _fps(r, int(cfg.M_lr), 301 + layer)
         Vs = V[:, :rank]
         U = rows @ Vs @ np.linalg.pinv(Vs.T @ Vs)
+        C_rows = U @ Vs.T
         params["lowrank"]["U"][layer] = jnp.asarray(U)
-        idx = np.argmin(np.sum((r[:, None, :] - rows[None, :, :]) ** 2,
+        idx = np.argmin(np.sum((r[:, None, :] - C_rows[None, :, :]) ** 2,
                                axis=-1), axis=1)
-        r = r - rows[idx]
+        r = r - C_rows[idx]
 
-    # Binding: key/val residual coverage; bind from the resulting HRR samples.
+    # Binding: key/val residual coverage; bind from the *real* forward
+    # chain. The old prototype selected key/val rows from raw z and ignored
+    # the residual update, so its b_raw was not the tensor binding_forward
+    # actually binds.
     qk = z @ (V @ np.asarray(params["binding"]["A_k"])).T
     qv = z @ (V @ np.asarray(params["binding"]["A_v"])).T
-    keys = _residual_rows(qk, int(cfg.M_bind), 3, 401)
-    vals = _residual_rows(qv, int(cfg.M_bind), 3, 421)
-    b_raw = []
-    for zi in z:
-        ks = [keys[l][np.argmin(
-            np.sum((_unit(zi)[None, :] - _unit(keys[l])) ** 2, axis=1))]
-            for l in range(3)]
-        vs = [vals[l][np.argmin(
-            np.sum((_unit(zi)[None, :] - _unit(vals[l])) ** 2, axis=1))]
-            for l in range(3)]
-        acc = np.zeros(d, dtype=np.float32)
-        for a in ks:
-            for b in vs:
-                acc += np.fft.irfft(
-                    _unit(np.fft.rfft(a)) * _unit(np.fft.rfft(b)), n=d)
-        b_raw.append(acc)
-    binds = _residual_rows(np.stack(b_raw).astype(np.float32),
-                           int(cfg.M_bind), 3, 441)
-    for family, rows in (("key", keys), ("val", vals), ("bind", binds)):
-        for layer, entry in enumerate(params["binding"][f"{family}_cb"]):
-            _install_simvq(entry, rows[layer], d)
+    n_bind = len(params["binding"]["key_cb"])
+    keys = _residual_rows(qk, int(cfg.M_bind), n_bind, 401,
+                          distinct=args.bind_distinct)
+    vals = _residual_rows(qv, int(cfg.M_bind), n_bind, 421,
+                          distinct=args.bind_distinct)
+    for layer in range(n_bind):
+        _install_simvq(params["binding"]["key_cb"][layer], keys[layer], d)
+        _install_simvq(params["binding"]["val_cb"][layer], vals[layer], d)
+
+    # Run the installed key/val codebooks through the same residual chain as
+    # binding_forward, then bind every (key layer, value layer) pair.
+    k_q, _k_inputs, _k_idx = _residual_vq_chain_np(
+        params["binding"]["key_cb"], qk, cosine=True)
+    v_q, _v_inputs, _v_idx = _residual_vq_chain_np(
+        params["binding"]["val_cb"], qv, cosine=True)
+    b_raw = np.zeros((len(z), d), dtype=np.float32)
+    for a in k_q:
+        for b in v_q:
+            for i in range(len(z)):
+                b_raw[i] += np.fft.irfft(
+                    _unit(np.fft.rfft(a[i])) * _unit(np.fft.rfft(b[i])),
+                    n=d)
+    binds = _residual_rows(b_raw, int(cfg.M_bind), n_bind, 441,
+                           distinct=args.bind_distinct)
+    for layer, entry in enumerate(params["binding"]["bind_cb"]):
+        _install_simvq(entry, binds[layer], d)
 
     report = _streaming_utilization_probe(
         cfg, params, args.data, args.shape, args.spans,
