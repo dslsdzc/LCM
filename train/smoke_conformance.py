@@ -783,6 +783,77 @@ def _exported_danger_pattern_probe(final_dir):
                 "pass": False}
 
 
+def _real_entropy_probe(final_dir):
+    """Entropy gate on the C v3 trace's active-node fusion weights.
+
+    c.md §4.3 defines H_norm over the fusion weights of the *active* nodes at
+    inference time. The training Gumbel soft mask is a different object; using
+    it as the real-mask verdict (the old smoke probe) measured training
+    exploration noise, not the inference gate.
+    """
+    import ctypes
+    import json
+    import math
+    from pathlib import Path
+
+    import lcm
+
+    try:
+        with open(Path(final_dir) / "config.json") as f:
+            ckpt_d = int(json.load(f)["d_model"])
+        so_path = Path(__file__).resolve().parent.parent / "infer" / "liblcm.so"
+        probe_lib = ctypes.CDLL(str(so_path))
+        probe_lib.lcm_dim.restype = ctypes.c_int
+        if int(probe_lib.lcm_dim()) != ckpt_d:
+            return {
+                "available": False,
+                "error": (f"C inference lib is d={int(probe_lib.lcm_dim())}, "
+                          f"checkpoint is d={ckpt_d}; real-mask probe skipped"),
+                "pass": False,
+            }
+        engine = lcm.LCMInferEngine(str(final_dir))
+        for i in range(min(8, int(engine.danger_M))):
+            z = np.asarray(engine.danger_n[i], dtype=np.float32)
+            engine._alerts.clear()
+            engine._last_loop_ret = 0
+            engine.cognitive_loop(z, max_steps=4, use_safety=False)
+            trace = engine.get_trace_v3()
+            if not trace:
+                continue
+            last = trace[-1]
+            w = np.asarray(last["weights"][:6], dtype=np.float64)
+            active = np.asarray(last["active"][:6], dtype=np.int64)
+            n_active = int(active.sum())
+            if n_active == 0:
+                continue
+            if n_active == 1:
+                h_norm = 0.0
+            else:
+                s = float(w.sum())
+                if s <= 0.0:
+                    continue
+                p = w[w > 0.0] / s
+                h_norm = float(
+                    -(p * np.log(p)).sum() / math.log(n_active))
+            return {
+                "available": True,
+                "source": "C v3 trace: active-node fusion weights",
+                "H_norm": h_norm,
+                "n_active": n_active,
+                "weights": w.tolist(),
+                "active": active.tolist(),
+                "steps": len(trace),
+                "ret": int(engine._last_loop_ret),
+                "pass": bool(h_norm < 0.5),
+            }
+        return {"available": True, "source": "C v3 trace: active-node "
+                "fusion weights", "error": "no step with an active node",
+                "pass": False}
+    except Exception as exc:  # pragma: no cover - diagnostic
+        return {"available": False, "error": f"{type(exc).__name__}: {exc}",
+                "pass": False}
+
+
 def _real_safety_probe(final_dir):
     """Real v2 checkpoint -> real C v3 loop -> abort/no-token/alert/trace.
 
@@ -1568,21 +1639,24 @@ def run_smoke(*, steps, data, shape, spans, output,
             "training_convergence_threshold": float(cfg.entropy_threshold),
             "real_mask_required": True,
         }
+        real_probe = _real_entropy_probe(final_dir)
+        entropy_report.update({
+            "real_mask": real_probe,
+            "real_mask_H_norm": real_probe.get("H_norm"),
+            "real_mask_n_active": real_probe.get("n_active"),
+            "real_mask_passes_0.5": bool(real_probe.get("pass", False)),
+            "real_mask_source": real_probe.get("source"),
+        })
+        # Training Gumbel soft masks stay as diagnostics only. They are not
+        # the inference-time fusion weights the gate is defined on.
         if soft_masks:
             real_mask = jnp.asarray(soft_masks[-1][None, :])
-            _, w_real, _ = fuse_lattices_with_aux(
+            _, w_train, _ = fuse_lattices_with_aux(
                 outs, real_mask, fp["fusion"])
-            h_real, n_real = _normalised_entropy(_np(w_real))
+            h_train, n_train = _normalised_entropy(_np(w_train))
             entropy_report.update({
-                "real_mask_H_norm": h_real,
-                "real_mask_n_active": n_real,
-                "real_mask_passes_0.5": bool(h_real < 0.5),
-            })
-        else:
-            entropy_report.update({
-                "real_mask_H_norm": None,
-                "real_mask_passes_0.5": False,
-                "real_mask_error": "no soft_mask recorded",
+                "training_softmask_H_norm": h_train,
+                "training_softmask_n_active": n_train,
             })
         entropy_report["pass"] = bool(
             entropy_report["peaked_passes_0.5"]

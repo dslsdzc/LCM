@@ -286,8 +286,11 @@ EMA 总结果：PASS
 
 - crafted peaked：0.0396 → PASS
 - crafted uniform：1.0000 → 不通过=PASS
-- **真实训练 mask**：H_norm=0.5652 → **FAIL**（阈值 0.5）
-- 总 pass：**FAIL**；JAX 训练门按归一化 0.5 解释。
+- 旧版 **真实训练 mask**：H_norm=0.5652 → **FAIL（旧口径错误）**
+- 修正后 **C v3 active-node fusion weights**：`fps_frozen` H_norm=0.0（n_active=4），`fixed5` H_norm=0.0（n_active=5）→ **PASS**
+- 总 pass：修正后 PASS；训练 Gumbel soft mask 仅保留为诊断，不再是 verdict。
+
+2026-11-23 修正说明：`c.md §4.3` 的熵门定义为推理期 active 节点的归一化融合权重；旧 smoke 却取训练最后一步的 Gumbel soft mask（`soft_masks[-1]`），测到的是训练探索噪声。`_real_entropy_probe(final_dir)` 现在加载导出 checkpoint、跑 C v3 loop、从 `get_trace_v3()` 的 `weights/active` 计算 `H_norm`。旧 20/22 中的 `entropy_gate` FAIL 是旧口径，不应作为当前 verdict。
 
 ### 8.4 Feature bank（synthetic policy probe）
 
@@ -454,3 +457,45 @@ JAX_PLATFORMS=cpu /home/DslsDZC/LCM/be/bin/python train/smoke_conformance.py \
 | persistence | PASS |
 
 artifact：`checkpoints/conformance_smoke_final2/smoke_report.json`、`smoke_report.md`、`step_000100/`（149 MB，不提交）。
+
+> 上表是旧 100-step run 的历史 verdict。`entropy_gate` 的 FAIL 来自旧训练 soft-mask 口径；修正后的 C-trace 探针在 `fps_frozen` 与 `fixed5` 上均 PASS（§8.3）。D-9 的 FAIL 仍是训练 checkpoint 的 verdict；`fixed5` 的 post-hoc 校准逐层 PASS 见 §5.1.1。
+
+## 16. 三层审查结论（2026-11-23）
+
+### 16.1 组件审查
+
+| 项目 | 证据 | 结论 |
+|---|---|---|
+| 六格 + Self + Route 单步 parity | `train/test_parity_lattices.py`（连续 1e-4、离散 idx 精确） | PASS |
+| HRQ top/fine 选择与 R18 pairs | `test_hrq_routing.py` + `test_vq_losses.py` | PASS |
+| 校准 numpy helper vs JAX residual VQ | `test_calibration_forward.py`（idx 精确、quantised <1e-5） | PASS |
+| `safe_unit` 极小范数边界 | `test_safe_unit_boundary.py`（0–1.0 范数，C/JAX <2e-7 相对差） | PASS |
+| C 引擎单测 | `infer/test_runner` | **251 PASS** |
+| 聚焦 Python 批 | parity + C loop + C load + safe_unit + calibration | **55 passed** |
+
+组件审查还修掉了一个真实的近 tie：LowRank value-bias 在某个输入上两行分数只差 `1.8e-7`，C 的 float32 累加选 187、JAX 选 111，融合差 0.5。`lattice_pick_row` 的 selection 累加改为 double 后，500 输入 DAG 重建 0 失败。
+
+### 16.2 组合审查
+
+| 项目 | 证据 | 结论 |
+|---|---|---|
+| C v3 DAG 重建 | `scripts/validate_c_dag_parity.py --inputs 500 --seed 777`：5 种 active mask、`max_abs=1.171e-5`、0 失败 | PASS（覆盖的 mask） |
+| all-zero / identity / self-only | v3 `active` flags + 跳过 LayerNorm 的 identity 语义 | PASS |
+| C loop 稳定性 | 100 随机输入：`fps_frozen` 91/100 ret=0、9 abort；`fixed5` 92/100、8 abort；输出有限 | PASS（稳定性） |
+| 熵门真实 mask | C v3 trace active-node weights：`fps_frozen` H_norm=0.0 (n=4)，`fixed5` H_norm=0.0 (n=5) | PASS |
+| C 引擎生成 abort | 8 中性 prompt × 8 token、3 × 12 token，0 abort | PASS（样本内） |
+
+仍未覆盖的边界：fallback uniform（路由 argmax lattice inactive、其他 active）在 C 单测 `v3 canonical fusion falls back to uniform for an active set` 中验证，但 Python DAG 500 输入没有自然触发；单格 HRQ/Sparse/Binding/Contrast active mask 也没有自然触发。因此组合结论是“**覆盖到的分支 PASS**”，不是“所有调度组合穷尽”。
+
+### 16.3 最终语义性质审查
+
+| 性质 | 证据 | 结论 |
+|---|---|---|
+| D-9 逐层利用率 | `fixed5` 官方 streaming probe + 独立 `research_d9_probe`：0 个 <10% 层 | PASS（post-hoc） |
+| 校准前后被动语义损失 | 20 batch passive CE：`fps_frozen` 9.9657，`fixed5` 10.0230（+0.057，约 0.6%） | 轻微退化，未崩溃 |
+| 语言能力 | 12-token prompt 仍为 100 步模型低质量 token 串 | **NOT PROVEN（D-7）** |
+| 安全语义 | 中性输入 `use_safety=True` 按严格三法则 abort；`use_safety=False` 样本内 0 abort | 预期行为；非语义安全证明 |
+| 训练得到的 D-9 | 原始 100-step checkpoint 仍 FAIL；FPS 初始化+100 步更差 | **FAIL** |
+| Conformance 完成声明 | post-hoc 校准不是训练；语义接受未完成 | **NO** |
+
+**最终判断**：组件与覆盖到的组合分支通过；`fixed5` 的逐层 D-9 利用率通过；但“训练出的记忆满足 D-9”仍未通过，post-hoc 校准的语义接受未完成，语言能力未证明。因此不能声称整体 conformance complete。

@@ -64,7 +64,7 @@
 | F-3 | EMA/frozen 参数留在 AdamW，weight decay 会改动它们 | R3 | **fixed** | `partition_params` + `set_to_zero` 语义（优化器只见 trainable）；`test_param_groups.py` 的 round-trip/隔离测试。`danger.C/C_normal` 在 frozen 组 |
 | F-4 | gvalue `pos==neg` placeholder，C 端直接禁用检查 | R6/R13 | **fixed（结构）；语义 accepted-deferred** | `make_global_value_vectors` 给出互不相同的 R6 锚点；`save_cog_checkpoint` 导出两半；`lcm.py::validate_safety_codebooks` 拒绝相等占位；`GValueCodebook.verify_integrity`。真实训练出的语义锚点留到正式重训 |
 | F-5 | LowRank/Contrast/Binding export 只取第一层/第一块 | R10 | **fixed** | manifest v2 全层导出；`test_export.py`、`test_c_load.py`、`test_parity_lattices.py` |
-| F-6 | `entropy_threshold=2.0` 使熵门几乎恒过 | R9/R17 | **fixed** | `train/config.py` 改为归一化阈值 0.5；`make_train_step` 用 `H/ln(n_active)`；C v3 同样是归一化 0.5；smoke 的 `entropy_gate.pass` 包含真实 mask，crafted peaked/uniform 与真实值都记录 |
+| F-6 | `entropy_threshold=2.0` 使熵门几乎恒过 | R9/R17 | **fixed** | `train/config.py` 改为归一化阈值 0.5；`make_train_step` 用 `H/ln(n_active)`；C v3 同样是归一化 0.5；smoke 的 `entropy_gate.pass` 包含真实 mask，crafted peaked/uniform 与真实值都记录。**2026-11-23 修正**：旧 smoke 取训练 Gumbel soft mask，口径错误；改为 `_real_entropy_probe(final_dir)` 从 C v3 trace 的 active-node fusion weights 计算，`fps_frozen`/`fixed5` 均 H_norm=0.0 PASS |
 | F-7 | 多个默认值与规范不一致 | R17 | **fixed** | `max_inference_steps=16`、`max_retrievals_per_step=128`、`tau_contrast=0.1`、`tau_val=0.05`、`consistency_threshold=0.4`；C `LCM_CONSISTENCY_THRESHOLD=0.4`，`value_consistency=clip(cos,0,1)` |
 
 ---
@@ -125,7 +125,7 @@
 | D-10 | manifest 的 `params.*` pickle 项没有逐 tensor sha256（C loader 只读 `.bin`） | 训练 params 的 C 侧完整性由 pickle schema/`load_cog_state` 负责，不是 C 张量 | C 端只接受 flat float32 `.bin`；pickle 项在 `_read_tensor` 直接拒绝。若未来导出 pickle 索引，需要单独的签名层 |
 | D-11 | R21 value-biased NCE 在训练路径不可用 | 训练状态没有 gvalue，`compute_contrast_loss` 只走普通 InfoNCE | **deferred**：不伪造 gvalue。普通 InfoNCE 的采样/温度/feature bank 已 fixed；调用方显式提供 gvalue 时才运行 value-biased 变体 |
 | D-12 | R14 SelfActivationState 未接入生产训练 | `train/self_activation.py` 状态机库有测试，但 `ema_update_self` 的写入不受它门控；C identity core 未 mprotect | **deferred / accepted deviation**：本 pass 不接线；代码注释与 §4 R14 已标注 |
-| D-13 | DAG trigger 距离与检索域不同 | HRQ/contrast 的触发筛选用欧氏最小距离，真正检索在 Poincaré 域；跨 lattice 距离不可直接比较 | 已在 `infer/loops_v3.c::build_dag_v3` 注释中记录；阈值按 lattice 各自维护。**已补 v3 active trace**：`lcm_get_trace_v3_flat` 导出每步各 lattice `active`；`scripts/validate_c_dag_parity.py` 在 40 个输入、5 种 mask 上重建 C 融合，最大误差 9.5e-6、0 失败。`safe_unit` 的加性 eps 已在 C 的 `unit_copy`/`v3_unit_copy` 与 JAX 对齐，并有 `test_safe_unit_boundary.py` |
+| D-13 | DAG trigger 距离与检索域不同 | HRQ/contrast 的触发筛选用欧氏最小距离，真正检索在 Poincaré 域；跨 lattice 距离不可直接比较 | 已在 `infer/loops_v3.c::build_dag_v3` 注释中记录；阈值按 lattice 各自维护。**已补 v3 active trace**：`lcm_get_trace_v3_flat` 导出每步各 lattice `active`；`scripts/validate_c_dag_parity.py` 在 500 个输入、5 种 mask 上重建 C 融合，最大误差 1.17e-5、0 失败。`safe_unit` 的加性 eps 已在 C 的 `unit_copy`/`v3_unit_copy` 与 JAX 对齐，并有 `test_safe_unit_boundary.py`。LowRank value-bias 的 selection 累加改为 double，消除了 1.8e-7 近 tie 导致的 C/JAX 选行翻转 |
 | D-14 | `train/causal_student_train.py` / `train/eval_lattice_storage.py` 已从 retired generic-codebook 路径移植到 `cog_loop_scan(z, params, cfg)` | 旧 `student.pkl` 若没有 `route`/`fusion` 参数会明确报错，不再静默或 `NotImplementedError`；该 standalone trainer 仍是单一 AdamW 树，不实现 R3 的 EMA/分组 | 需要旧 checkpoint 时重新训练/导出 canonical 六格参数；canonical 训练请用 `train_cog`。新 checkpoint 带 route/fusion/self/value_scalars |
 
 ---

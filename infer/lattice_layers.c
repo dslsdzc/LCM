@@ -31,30 +31,34 @@ int lattice_pick_row(const float* r, int M, const float* value,
     vec_t row;
 
     if (value != NULL && alpha_val > 0.0f) {
-        float d2[LCM_MAX_M];
-        float sum = 0.0f;
+        /* Accumulate in double: near-ties in the bias score can be separated
+         * by ~1e-7, below float32 reduction noise. A float32 accumulator
+         * flips the selected row relative to JAX's reduction order. */
+        double d2[LCM_MAX_M];
+        double sum = 0.0;
         for (int j = 0; j < M; j++) {
             row_fn(ctx, j, row);
-            d2[j] = 0.0f;
+            d2[j] = 0.0;
             for (int i = 0; i < LCM_D; i++) {
-                float diff = r[i] - row[i];
+                double diff = (double)r[i] - (double)row[i];
                 d2[j] += diff * diff;
             }
             sum += d2[j];
         }
-        float avg = sum / (float)M;
-        float best_score = -INFINITY;
+        double avg = sum / (double)M;
+        double best_score = -INFINITY;
         for (int j = 0; j < M; j++) {
-            float score = -d2[j] + alpha_val * tanhf(value[j]) * avg;
+            double score = -d2[j]
+                + (double)alpha_val * (double)tanhf(value[j]) * avg;
             if (score > best_score) { best_score = score; best = j; }
         }
     } else {
-        float best_d2 = INFINITY;
+        double best_d2 = INFINITY;
         for (int j = 0; j < M; j++) {
             row_fn(ctx, j, row);
-            float d2 = 0.0f;
+            double d2 = 0.0;
             for (int i = 0; i < LCM_D; i++) {
-                float diff = r[i] - row[i];
+                double diff = (double)r[i] - (double)row[i];
                 d2 += diff * diff;
             }
             if (d2 < best_d2) { best_d2 = d2; best = j; }
