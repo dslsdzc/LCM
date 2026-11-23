@@ -543,6 +543,12 @@ int lcm_retrieval_count_v3(const lcm_memory_v3* mem, const int* active);
  * loop has run). Thread-local, like lcm_get_trace. */
 int lcm_get_trace_v3(inference_trace_v3_t* out);
 
+/* Flat export of the last v3 trace, including per-lattice active flags.
+ * Layout per step: 7 weights, 7 confidences, 7 active flags, D z_next,
+ * step, has_conflict. Returns the number of steps, or -1 if the buffer is
+ * too small. `buf == NULL` returns the step count. */
+int lcm_get_trace_v3_flat(float* buf, int capacity_floats);
+
 /* Write a v3 trace as JSON. Creates parent directories; returns 0 on
  * success, -1 on failure. */
 int save_trace_v3_to_file(const inference_trace_v3_t* trace,

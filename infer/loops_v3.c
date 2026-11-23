@@ -90,7 +90,8 @@ static void v3_unit_copy(const float* x, float* out) {
     float n2 = 0.0f;
     for (int i = 0; i < LCM_D; i++) n2 += x[i] * x[i];
     float n = sqrtf(n2);
-    float s = n > 1e-8f ? 1.0f / n : 0.0f;
+    /* JAX safe_unit uses norm + 1e-8, including for tiny non-zero inputs. */
+    float s = 1.0f / (n + 1e-8f);
     for (int i = 0; i < LCM_D; i++) out[i] = x[i] * s;
 }
 
@@ -650,6 +651,38 @@ int lcm_get_trace_v3(inference_trace_v3_t* out) {
     if (!out) return _last_trace_v3.n_steps;
     *out = _last_trace_v3;
     return out->n_steps;
+}
+
+int lcm_get_trace_v3_flat(float* buf, int capacity_floats) {
+    int per_step = 3 * LCM_MAX_LATTICES + LCM_D + 2;
+    int n = _last_trace_v3.n_steps;
+    if (!buf) return n;
+    if (capacity_floats < n * per_step) return -1;
+    int pos = 0;
+    for (int s = 0; s < n; s++) {
+        const step_trace_v3_t* st = &_last_trace_v3.steps[s];
+        for (int i = 0; i < LCM_MAX_LATTICES; i++)
+            buf[pos++] = st->weights[i];
+        for (int i = 0; i < LCM_MAX_LATTICES; i++)
+            buf[pos++] = st->confidences[i];
+        /* A lattice is active if any DAG node for it was activated. HRR
+         * bind/unbind nodes use lattice_id == LCM_MAX_LATTICES and are not
+         * lattices; ignore them here. */
+        int active[LCM_MAX_LATTICES] = {0};
+        for (int nidx = 0; nidx < st->n_nodes; nidx++) {
+            int li = st->nodes[nidx].lattice_id;
+            if (li >= 0 && li < LCM_MAX_LATTICES
+                && st->nodes[nidx].activated)
+                active[li] = 1;
+        }
+        for (int i = 0; i < LCM_MAX_LATTICES; i++)
+            buf[pos++] = (float)active[i];
+        memcpy(&buf[pos], st->z_next, sizeof(vec_t));
+        pos += LCM_D;
+        buf[pos++] = (float)st->step;
+        buf[pos++] = st->has_conflict ? 1.0f : 0.0f;
+    }
+    return n;
 }
 
 static const char* v3_op_name(int op) {

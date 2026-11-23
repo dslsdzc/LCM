@@ -349,10 +349,12 @@ C `test_runner` 251 PASS；`nm` 含 `lcm_infer_loop_v3`/`hrq_forward_v31`。Mani
 修正后的 `checkpoints_calibrated_fixed5`：
 
 - 单步组件 parity：`max_abs = 9.5e-7`，融合权重一致；route/fusion/self/HRQ/Sparse 张量逐项 `maxdiff = 0`。
-- 用 C trace 的调度复现 JAX 输出：多数步 `1e-6 – 2e-6`。但发现一个 **all-zero-route 边界**：C 的 trace 显示该步融合权重全零，JAX 侧按“无 routed lattice、无 self”的 identity 回退重建时与 C 的 `z_next` 仍差 `2.37e-2`（cos `0.999994`）。这说明 `lcm_get_trace` 暴露的 v1 weights 在该边界不足以还原 active-set/fallback 的完整语义，需要导出 v3 DAG 节点 `activated` 标志才能定论；这是整体执行语义的未关闭缺口，不能用一个随机输入的单步 parity 覆盖。
-- C 引擎：`fixed5` 的 8 个中性 prompt × 8 token `use_safety=False` 生成 0 abort；3 个 12-token prompt 也 0 abort。`max_steps=4` 时有一个随机输入未收敛（返回非零），属于 graceful budget，不是硬限 abort，但需要单列。
+- 新增 `lcm_get_trace_v3_flat` / `LCMInferEngine.get_trace_v3()`，导出每步 7 个 `active` 标志（来自 v3 DAG 节点的 `activated`），不再只依赖 v1 weights。
+- `scripts/validate_c_dag_parity.py`：40 个随机输入、5 种 active mask（全激活、全不激活、Manifold-only、Self-only、Manifold+Self），最大 `max_abs = 9.5e-6`，0 个失败步。此前的 `2.37e-2` all-zero-route 差异是重建脚本错误地对 C 的 identity 回退再做了 LayerNorm；按 C 的语义跳过 LayerNorm 后误差为 0。
+- `safe_unit` 边界已统一：JAX 是 `x/(||x||+1e-8)`；C 的 `safe_unit_c` 本来就是加性 eps，但 `lattice_layers.c::unit_copy` 和 `loops_v3.c::v3_unit_copy` 使用阈值分支，极小非零向量会与 JAX 选出不同行。两处已改为加性 eps，新增 `train/test_safe_unit_boundary.py` 覆盖 `0 / 1e-12 / 1e-9 / 1e-7 / 1e-3 / 1.0` 范数，C/JAX 最大相对差 <2e-7。
+- C 引擎：`fixed5` 的 8 个中性 prompt × 8 token `use_safety=False` 生成 0 abort；3 个 12-token prompt 也 0 abort。
+- 100 个随机 unit 输入的 C loop（`max_steps=4`, `use_safety=False`）：校准前 `91/100 ret=0`、9 次 `ret=-2`；`fixed5` 为 `92/100 ret=0`、8 次 `ret=-2`。两者输出均有限、norm 均值约 14.1/14.6。末步 active mask 分布发生变化（`fixed5` 的无激活步更多：34 vs 12），说明校准确实改变了推理调度；这不是语义质量证明，但未出现数值失稳或 abort 率上升。
 - 语言：`fixed5` 与校准前一样只产出 100 步模型的低质量 token 串；符合 D-7，不能作为校准有效证据。
-- `safe_unit` 的极小非零向量边界（JAX `norm+1e-8` vs C `unit_copy` 阈值除法）尚未补 parity 测试，是已知缺口。
 
 ## 11. 自观测 5% 开销
 

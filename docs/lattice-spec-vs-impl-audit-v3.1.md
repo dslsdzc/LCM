@@ -125,7 +125,7 @@
 | D-10 | manifest 的 `params.*` pickle 项没有逐 tensor sha256（C loader 只读 `.bin`） | 训练 params 的 C 侧完整性由 pickle schema/`load_cog_state` 负责，不是 C 张量 | C 端只接受 flat float32 `.bin`；pickle 项在 `_read_tensor` 直接拒绝。若未来导出 pickle 索引，需要单独的签名层 |
 | D-11 | R21 value-biased NCE 在训练路径不可用 | 训练状态没有 gvalue，`compute_contrast_loss` 只走普通 InfoNCE | **deferred**：不伪造 gvalue。普通 InfoNCE 的采样/温度/feature bank 已 fixed；调用方显式提供 gvalue 时才运行 value-biased 变体 |
 | D-12 | R14 SelfActivationState 未接入生产训练 | `train/self_activation.py` 状态机库有测试，但 `ema_update_self` 的写入不受它门控；C identity core 未 mprotect | **deferred / accepted deviation**：本 pass 不接线；代码注释与 §4 R14 已标注 |
-| D-13 | DAG trigger 距离与检索域不同 | HRQ/contrast 的触发筛选用欧氏最小距离，真正检索在 Poincaré 域；跨 lattice 距离不可直接比较 | 已在 `infer/loops_v3.c::build_dag_v3` 注释中记录；阈值按 lattice 各自维护 |
+| D-13 | DAG trigger 距离与检索域不同 | HRQ/contrast 的触发筛选用欧氏最小距离，真正检索在 Poincaré 域；跨 lattice 距离不可直接比较 | 已在 `infer/loops_v3.c::build_dag_v3` 注释中记录；阈值按 lattice 各自维护。**已补 v3 active trace**：`lcm_get_trace_v3_flat` 导出每步各 lattice `active`；`scripts/validate_c_dag_parity.py` 在 40 个输入、5 种 mask 上重建 C 融合，最大误差 9.5e-6、0 失败。`safe_unit` 的加性 eps 已在 C 的 `unit_copy`/`v3_unit_copy` 与 JAX 对齐，并有 `test_safe_unit_boundary.py` |
 | D-14 | `train/causal_student_train.py` / `train/eval_lattice_storage.py` 已从 retired generic-codebook 路径移植到 `cog_loop_scan(z, params, cfg)` | 旧 `student.pkl` 若没有 `route`/`fusion` 参数会明确报错，不再静默或 `NotImplementedError`；该 standalone trainer 仍是单一 AdamW 树，不实现 R3 的 EMA/分组 | 需要旧 checkpoint 时重新训练/导出 canonical 六格参数；canonical 训练请用 `train_cog`。新 checkpoint 带 route/fusion/self/value_scalars |
 
 ---

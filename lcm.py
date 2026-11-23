@@ -1655,6 +1655,9 @@ class LCMInferEngine:
         self.lib.lcm_get_trace.restype = ctypes.c_int
         self.lib.lcm_get_trace.argtypes = [
             ctypes.POINTER(ctypes.c_float), ctypes.c_int]
+        self.lib.lcm_get_trace_v3_flat.restype = ctypes.c_int
+        self.lib.lcm_get_trace_v3_flat.argtypes = [
+            ctypes.POINTER(ctypes.c_float), ctypes.c_int]
 
         print(f"[INFER] Loading checkpoint from {checkpoint_dir}...")
         self.encoder = load_encoder(
@@ -1999,6 +2002,35 @@ class LCMInferEngine:
                 'confidences': arr[s, 7:14].copy(),
                 'z_next': arr[s, 14:14 + d].copy(),
                 'has_conflict': bool(arr[s, 14 + d + 1]),
+            })
+        return traces
+
+    def get_trace_v3(self):
+        """v3 trace including per-lattice DAG active flags.
+
+        The v1 flat trace only carries fusion weights; a zero-weight step
+        cannot distinguish "no lattice active" (identity fallback) from
+        "routed lattice inactive but another active set" (uniform fallback).
+        """
+        d = self.d
+        n_lat = 7
+        per_step = 3 * n_lat + d + 2
+        n = self.lib.lcm_get_trace_v3_flat(None, 0)
+        if n <= 0:
+            return None
+        buf = (ctypes.c_float * (n * per_step))()
+        self.lib.lcm_get_trace_v3_flat(buf, n * per_step)
+        arr = np.frombuffer(buf, dtype=np.float32).reshape(n, per_step)
+        traces = []
+        for s in range(n):
+            base = 3 * n_lat
+            traces.append({
+                'step': int(arr[s, base + d]),
+                'weights': arr[s, :n_lat].copy(),
+                'confidences': arr[s, n_lat:2 * n_lat].copy(),
+                'active': arr[s, 2 * n_lat:3 * n_lat].astype(np.int32),
+                'z_next': arr[s, base:base + d].copy(),
+                'has_conflict': bool(arr[s, base + d + 1]),
             })
         return traces
 

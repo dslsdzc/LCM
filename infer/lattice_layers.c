@@ -198,7 +198,10 @@ static void unit_copy(const float* x, float* out) {
     double n2 = 0.0;
     for (int i = 0; i < LCM_D; i++) n2 += (double)x[i] * (double)x[i];
     float n = (float)sqrt(n2);
-    float s = n > 1e-12f ? 1.0f / n : 0.0f;
+    /* Additive eps, matching JAX safe_unit(x) = x / (||x|| + 1e-8).
+     * A threshold branch (n > eps ? 1/n : 0) makes tiny-but-nonzero
+     * vectors select a different row in C than in JAX. */
+    float s = 1.0f / (n + 1e-8f);
     for (int i = 0; i < LCM_D; i++) out[i] = x[i] * s;
 }
 
